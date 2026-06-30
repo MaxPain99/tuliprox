@@ -21,7 +21,73 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build-frontend:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Read workspace version
+        id: version
+        run: |
+          VERSION="$(awk '
+            /^\[workspace\.package\]/ { in_ws=1; next }
+            /^\[/ { in_ws=0 }
+            in_ws && /^version = / {
+              gsub(/^version = "/, "")
+              gsub(/".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install trunk + wasm-bindgen-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk,wasm-bindgen-cli
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: frontend-wasm32
+          cache-targets: "true"
+
+      - name: Build frontend (trunk)
+        working-directory: frontend
+        run: trunk build --release
+
+      - name: Stage web assets
+        run: |
+          set -euo pipefail
+          mkdir -p web
+          # Trunk's default output dir is frontend/dist; adjust below if your
+          # fork's frontend/Trunk.toml sets a different `dist` path.
+          if [[ -d frontend/dist ]]; then
+            cp -r frontend/dist/. web/
+          else
+            echo "::error::frontend/dist not found — check Trunk.toml 'dist' setting"
+            exit 1
+          fi
+          ls -la web/
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: web-panel
+          path: web/
+          retention-days: 1
+          if-no-files-found: error
+
   build-all:
+    needs: build-frontend
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -81,6 +147,12 @@ jobs:
       - name: Build
         run: cross build --release --locked --target ${{ matrix.target }}
 
+      - name: Download frontend (web panel)
+        uses: actions/download-artifact@v6
+        with:
+          name: web-panel
+          path: web
+
       - name: Prepare artifacts dir
         run: mkdir -p artifacts
 
@@ -92,6 +164,7 @@ jobs:
           STAGE="dist/${BIN}-v${{ steps.version.outputs.value }}-${{ matrix.target }}"
           mkdir -p "${STAGE}"
           cp "target/${{ matrix.target }}/release/${BIN}" "${STAGE}/"
+          cp -r web "${STAGE}/web"
           [[ -f LICENSE ]] && cp LICENSE "${STAGE}/" || true
           [[ -f README.md ]] && cp README.md "${STAGE}/" || true
           tar -C dist -czf "artifacts/${BIN}-v${{ steps.version.outputs.value }}-${{ matrix.target }}.tar.gz" "$(basename "${STAGE}")"
@@ -104,6 +177,7 @@ jobs:
           STAGE="dist/tuliprox-v${{ steps.version.outputs.value }}-${{ matrix.target }}"
           mkdir -p "${STAGE}"
           cp "target/${{ matrix.target }}/release/${BIN}" "${STAGE}/"
+          cp -r web "${STAGE}/web"
           [[ -f LICENSE ]] && cp LICENSE "${STAGE}/" || true
           [[ -f README.md ]] && cp README.md "${STAGE}/" || true
           cd dist && zip -r "../artifacts/tuliprox-v${{ steps.version.outputs.value }}-${{ matrix.target }}.zip" "$(basename "${STAGE}")"
