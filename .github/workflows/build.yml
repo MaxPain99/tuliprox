@@ -35,8 +35,11 @@ jobs:
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             archive: tar.gz
-          - target: x86_64-pc-windows-gnu
-            archive: zip
+          # x86_64-pc-windows-gnu temporarily disabled: upstream source fails to
+          # cross-compile for Windows (memmap2::Advice is unix-only, winapi
+          # GetDiskFreeSpaceExW arg types mismatch, Sampler holds a non-Send
+          # raw handle across an .await in tokio::spawn). Re-enable once fixed
+          # upstream or in a fork patch we're allowed to apply.
 
     steps:
       - name: Checkout
@@ -78,6 +81,9 @@ jobs:
       - name: Build
         run: cross build --release --locked --target ${{ matrix.target }}
 
+      - name: Prepare artifacts dir
+        run: mkdir -p artifacts
+
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
@@ -101,11 +107,6 @@ jobs:
           [[ -f LICENSE ]] && cp LICENSE "${STAGE}/" || true
           [[ -f README.md ]] && cp README.md "${STAGE}/" || true
           cd dist && zip -r "../artifacts/tuliprox-v${{ steps.version.outputs.value }}-${{ matrix.target }}.zip" "$(basename "${STAGE}")"
-
-      - name: Prepare artifacts dir
-        if: always()
-        run: mkdir -p artifacts
-        shell: bash
 
       - name: Checksums
         run: |
@@ -167,7 +168,8 @@ jobs:
           | \`tuliprox-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz\` | ARM64 Linux, glibc |
           | \`tuliprox-v${VERSION}-x86_64-unknown-linux-musl.tar.gz\` | amd64 Linux, static musl |
           | \`tuliprox-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz\` | amd64 Linux, glibc |
-          | \`tuliprox-v${VERSION}-x86_64-pc-windows-gnu.zip\` | Windows x64 (MinGW) |
+
+          Windows bundle is temporarily unavailable — upstream source currently fails to cross-compile for \`x86_64-pc-windows-gnu\`.
 
           \`.sha256\` checksum sidecars are included for every archive.
           EOF
