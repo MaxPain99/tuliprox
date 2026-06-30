@@ -1,0 +1,188 @@
+# Multi-platform build — plain build from source (no patches/overlay).
+# Builds tuliprox for several targets and publishes the bundles to GitHub Releases.
+name: Build
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/build.yml"
+
+concurrency:
+  group: build-all-platforms
+  cancel-in-progress: true
+
+jobs:
+  build-all:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - target: x86_64-pc-windows-gnu
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Read workspace version
+        id: version
+        run: |
+          VERSION="$(awk '
+            /^\[workspace\.package\]/ { in_ws=1; next }
+            /^\[/ { in_ws=0 }
+            in_ws && /^version = / {
+              gsub(/^version = "/, "")
+              gsub(/".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building ${{ matrix.target }} for v${VERSION}"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-targets: "true"
+
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          set -euo pipefail
+          BIN="tuliprox"
+          STAGE="dist/${BIN}-v${{ steps.version.outputs.value }}-${{ matrix.target }}"
+          mkdir -p "${STAGE}"
+          cp "target/${{ matrix.target }}/release/${BIN}" "${STAGE}/"
+          [[ -f LICENSE ]] && cp LICENSE "${STAGE}/" || true
+          [[ -f README.md ]] && cp README.md "${STAGE}/" || true
+          tar -C dist -czf "artifacts/${BIN}-v${{ steps.version.outputs.value }}-${{ matrix.target }}.tar.gz" "$(basename "${STAGE}")"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        run: |
+          set -euo pipefail
+          BIN="tuliprox.exe"
+          STAGE="dist/tuliprox-v${{ steps.version.outputs.value }}-${{ matrix.target }}"
+          mkdir -p "${STAGE}"
+          cp "target/${{ matrix.target }}/release/${BIN}" "${STAGE}/"
+          [[ -f LICENSE ]] && cp LICENSE "${STAGE}/" || true
+          [[ -f README.md ]] && cp README.md "${STAGE}/" || true
+          cd dist && zip -r "../artifacts/tuliprox-v${{ steps.version.outputs.value }}-${{ matrix.target }}.zip" "$(basename "${STAGE}")"
+
+      - name: Prepare artifacts dir
+        if: always()
+        run: mkdir -p artifacts
+        shell: bash
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: tuliprox-${{ matrix.target }}-v${{ steps.version.outputs.value }}-${{ github.sha }}
+          path: artifacts/*
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    needs: build-all
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Read workspace version
+        id: version
+        run: |
+          VERSION="$(awk '
+            /^\[workspace\.package\]/ { in_ws=1; next }
+            /^\[/ { in_ws=0 }
+            in_ws && /^version = / {
+              gsub(/^version = "/, "")
+              gsub(/".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.value }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          TITLE="tuliprox ${VERSION} — all platforms"
+          cat > release-notes.md <<EOF
+          Build of tuliprox v${VERSION} for multiple platforms.
+
+          | File | Use |
+          |------|-----|
+          | \`tuliprox-v${VERSION}-aarch64-unknown-linux-musl.tar.gz\` | ARM64 Linux, static musl |
+          | \`tuliprox-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz\` | ARM64 Linux, glibc |
+          | \`tuliprox-v${VERSION}-x86_64-unknown-linux-musl.tar.gz\` | amd64 Linux, static musl |
+          | \`tuliprox-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz\` | amd64 Linux, glibc |
+          | \`tuliprox-v${VERSION}-x86_64-pc-windows-gnu.zip\` | Windows x64 (MinGW) |
+
+          \`.sha256\` checksum sidecars are included for every archive.
+          EOF
+
+          if gh release view "${TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists — uploading/updating assets"
+            gh release upload "${TAG}" artifacts/* --repo "${GH_REPO}" --clobber
+            gh release edit "${TAG}" --repo "${GH_REPO}" --title "${TITLE}" --notes-file release-notes.md --latest
+          else
+            echo "Creating release ${TAG}"
+            gh release create "${TAG}" artifacts/* \
+              --repo "${GH_REPO}" \
+              --title "${TITLE}" \
+              --notes-file release-notes.md \
+              --latest
+          fi
+
+          echo "Release URL: https://github.com/${GH_REPO}/releases/tag/${TAG}"
