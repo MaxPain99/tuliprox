@@ -45,7 +45,7 @@ jobs:
 
       - name: Build frontend
         run: |
-          chmod +x ./bin/build_fe.sh
+          chmod +x ./bin/build_docs.sh ./bin/build_fe.sh
           ./bin/build_fe.sh release
 
       - name: Build release binary (musl)
@@ -58,8 +58,16 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           OUT="tuliprox-${TAG}-x86_64-unknown-linux-musl"
           mkdir -p "dist/${OUT}"
+
+          # Бинарь
           cp target/x86_64-unknown-linux-musl/release/tuliprox "dist/${OUT}/"
+
+          # Web-панель — trunk кладёт результат в frontend/dist/
+          cp -r frontend/dist "dist/${OUT}/web"
+
           tar -C dist -czf "${OUT}.tar.gz" "${OUT}"
+          echo "Archive contents:"
+          tar -tzf "${OUT}.tar.gz"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
