@@ -268,9 +268,31 @@ index b09c5da..de33997 100644
                      )
                      .await
                      .into_response()
+diff --git a/backend/src/api/endpoints/v1_api_playlist.rs b/backend/src/api/endpoints/v1_api_playlist.rs
+index a532d02..8335ed7 100644
+--- a/backend/src/api/endpoints/v1_api_playlist.rs
++++ b/backend/src/api/endpoints/v1_api_playlist.rs
+@@ -17,7 +17,7 @@ use crate::{
+                 ApiStreamRequest,
+             },
+         },
+-        model::AppState,
++        model::{AppState, UserApiRequest},
+     },
+     auth::{create_access_token, permission_layer, verify_access_token},
+     model::{
+@@ -566,7 +566,7 @@ async fn playlist_webplayer_stream(
+     );
+     let user = Arc::new(create_api_proxy_user(&app_state));
+ 
+-    m3u_api_stream_loaded(user, target, &fingerprint, &req_headers, &app_state, pli, input, None, None)
++    m3u_api_stream_loaded(user, target, &fingerprint, &req_headers, &app_state, pli, input, None, None, None, &UserApiRequest::default())
+         .await
+         .into_response()
+ }
 diff --git a/backend/src/utils/m3u_archive.rs b/backend/src/utils/m3u_archive.rs
 new file mode 100755
-index 0000000..c272ebf
+index 0000000..1444787
 --- /dev/null
 +++ b/backend/src/utils/m3u_archive.rs
 @@ -0,0 +1,545 @@
@@ -760,7 +782,7 @@ index 0000000..c272ebf
 +mod tests {
 +    use super::*;
 +    use shared::model::{LiveStreamProperties, PlaylistItemType};
-+    use shared::utils::intern::Intern;
++    use shared::utils::Internable;
 +
 +    #[test]
 +    fn archive_playback_query_detects_utc_lutc() {
@@ -804,14 +826,14 @@ index 0000000..c272ebf
 +            t_catchup_source: None,
 +            t_catchup_mode: None,
 +            source_ordinal: 0,
-+            additional_properties: Some(StreamProperties::Live(LiveStreamProperties {
++            additional_properties: Some(StreamProperties::Live(Box::new(LiveStreamProperties {
 +                catchup: Some(CatchupProperties {
 +                    catchup_type: Some("flussonic".intern()),
 +                    days: Some("3".intern()),
 +                    ..CatchupProperties::default()
 +                }),
 +                ..LiveStreamProperties::default()
-+            })),
++            }))),
 +            input_stream_id: "".intern(),
 +        };
 +        let attrs = catchup_attrs_from_item(&item);
