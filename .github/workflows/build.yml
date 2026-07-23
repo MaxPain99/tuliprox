@@ -29,7 +29,7 @@ jobs:
       - name: Install Rust tools for frontend
         uses: taiki-e/install-action@v2
         with:
-          tool: trunk,wasm-bindgen-cli
+          tool: trunk,wasm-bindgen-cli,mdbook
 
       - name: Install wasm32 target
         run: rustup target add wasm32-unknown-unknown
@@ -37,12 +37,20 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Install wasm tools
+        run: |
+          chmod +x ./bin/install_wasm_tools.sh
+          WASM_TOOLS_BIN="$(./bin/install_wasm_tools.sh 128)"
+          echo "${WASM_TOOLS_BIN}" >> "$GITHUB_PATH"
+
       - name: Build frontend
         run: |
           chmod +x ./bin/build_fe.sh
           ./bin/build_fe.sh release
 
       - name: Build release binary (musl)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Package artifact
@@ -51,7 +59,6 @@ jobs:
           OUT="tuliprox-${TAG}-x86_64-unknown-linux-musl"
           mkdir -p "dist/${OUT}"
           cp target/x86_64-unknown-linux-musl/release/tuliprox "dist/${OUT}/"
-          cp -r config "dist/${OUT}/" 2>/dev/null || true
           tar -C dist -czf "${OUT}.tar.gz" "${OUT}"
 
       - name: Upload artifact
