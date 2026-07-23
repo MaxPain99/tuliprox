@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-musl:
+    name: Build x86_64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust (stable) with musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install Rust tools for frontend
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk,wasm-bindgen-cli
+
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build frontend
+        run: |
+          chmod +x ./bin/build_fe.sh
+          ./bin/build_fe.sh release
+
+      - name: Build release binary (musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Package artifact
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          OUT="tuliprox-${TAG}-x86_64-unknown-linux-musl"
+          mkdir -p "dist/${OUT}"
+          cp target/x86_64-unknown-linux-musl/release/tuliprox "dist/${OUT}/"
+          cp -r config "dist/${OUT}/" 2>/dev/null || true
+          tar -C dist -czf "${OUT}.tar.gz" "${OUT}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuliprox-x86_64-unknown-linux-musl
+          path: "*.tar.gz"
+
+  release:
+    name: Publish GitHub Release
+    needs: build-musl
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tuliprox-x86_64-unknown-linux-musl
+          path: artifacts
+
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --clobber --repo "$GH_REPO"
+          else
+            gh release create "$TAG" artifacts/* \
+              --repo "$GH_REPO" \
+              --title "$TAG" \
+              --notes "Release ${TAG}"
+          fi
