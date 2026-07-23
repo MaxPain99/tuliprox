@@ -5,9 +5,9 @@
 # TiviMate шлёт ?utc=&lutc= на proxy URL (не m3u-catchup token).
 # Строит provider URL: .../archive-{start}-{duration}.m3u8 (+ timeshift_abs fallback).
 # Экспорт M3U: catchup-type=flussonic, catchup-source=?utc={utc}&lutc={lutc}.
-# Применять поверх upstream/develop; m3u-catchup-compat не обязателен.
 # =============================================================================
 #
+diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
 index b09c5da..de33997 100644
 --- a/backend/src/api/endpoints/m3u_api.rs
 +++ b/backend/src/api/endpoints/m3u_api.rs
@@ -268,6 +268,557 @@ index b09c5da..de33997 100644
                      )
                      .await
                      .into_response()
+diff --git a/backend/src/utils/m3u_archive.rs b/backend/src/utils/m3u_archive.rs
+new file mode 100755
+index 0000000..c272ebf
+--- /dev/null
++++ b/backend/src/utils/m3u_archive.rs
+@@ -0,0 +1,545 @@
++//! Classic M3U archive playback (TiviMate `?utc=&lutc=` on live proxy URL).
++
++use std::collections::BTreeMap;
++
++use shared::model::{CatchupProperties, M3uPlaylistItem, StreamProperties};
++
++const M3U_ARCHIVE_QUERY_KEYS: &[&str] = &[
++    "utc",
++    "utcstart",
++    "utctostart",
++    "lutc",
++    "offset",
++    "start",
++    "end",
++    "duration",
++    "catchup",
++    "archive",
++    "archive_end",
++    "timeshift",
++    "timenow",
++    "utcend",
++];
++
++fn m3u_archive_attr<'a>(attrs: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
++    attrs
++        .iter()
++        .find(|(k, _)| k.eq_ignore_ascii_case(key))
++        .map(|(_, v)| v.as_str())
++        .filter(|v| !v.is_empty())
++}
++
++fn m3u_archive_query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
++    let key_lc = key.to_ascii_lowercase();
++    for pair in query.split('&') {
++        let mut parts = pair.splitn(2, '=');
++        if parts.next()?.eq_ignore_ascii_case(&key_lc) {
++            return parts.next().filter(|v| !v.is_empty());
++        }
++    }
++    None
++}
++
++fn m3u_archive_query_has_key(query: &str, key: &str) -> bool {
++    m3u_archive_query_value(query, key).is_some()
++}
++
++fn merge_url_query(base: &str, query: &str) -> String {
++    let q = query.trim_start_matches('?');
++    if q.is_empty() {
++        return base.to_string();
++    }
++    if base.contains('?') {
++        format!("{base}&{q}")
++    } else {
++        format!("{base}?{q}")
++    }
++}
++
++fn canonicalize_m3u_catchup_type(raw: &str) -> String {
++    match raw.trim().to_ascii_lowercase().as_str() {
++        "fs" | "flussonic-hls" | "flussonic-ts" => "flussonic".to_string(),
++        "flussonic" => "flussonic".to_string(),
++        "append" | "query" => "append".to_string(),
++        other if !other.is_empty() => other.to_string(),
++        _ => "shift".to_string(),
++    }
++}
++
++fn canonicalize_m3u_archive_attrs(attrs: &mut BTreeMap<String, String>) {
++    let ct_key = attrs
++        .keys()
++        .find(|k| k.eq_ignore_ascii_case("catchup-type"))
++        .cloned();
++    if let Some(key) = ct_key {
++        let raw = attrs.get(&key).cloned().unwrap_or_default();
++        let canon = canonicalize_m3u_catchup_type(&raw);
++        attrs.insert("catchup-type".to_string(), canon);
++        if key != "catchup-type" {
++            attrs.remove(&key);
++        }
++    } else if let Some(mode) = attrs.get("catchup").cloned() {
++        attrs.insert("catchup-type".to_string(), canonicalize_m3u_catchup_type(&mode));
++    }
++    if attrs.keys().any(|k| k.eq_ignore_ascii_case("catchup-days")) {
++        attrs.retain(|k, _| !k.eq_ignore_ascii_case("timeshift"));
++    }
++    if let (Some(ct), Some(cm)) = (
++        attrs.get("catchup-type").map(|s| s.as_str()),
++        attrs.get("catchup").map(|s| s.as_str()),
++    ) {
++        if ct.eq_ignore_ascii_case(cm) {
++            attrs.remove("catchup");
++        }
++    }
++    if m3u_archive_attr(attrs, "catchup-days").is_some()
++        && m3u_archive_attr(attrs, "catchup-type").is_none()
++        && m3u_archive_attr(attrs, "catchup").is_none()
++    {
++        attrs.insert("catchup-type".to_string(), "append".to_string());
++    }
++}
++
++fn merge_catchup_properties_into_attrs(attrs: &mut BTreeMap<String, String>, catchup: &CatchupProperties) {
++    if let Some(mode) = catchup.mode.as_ref().filter(|v| !v.is_empty()) {
++        attrs.entry("catchup".to_string()).or_insert_with(|| mode.to_string());
++    }
++    if let Some(days) = catchup.days.as_ref().filter(|v| !v.is_empty()) {
++        attrs.entry("catchup-days".to_string()).or_insert_with(|| days.to_string());
++    }
++    if let Some(source) = catchup.source.as_ref().filter(|v| !v.is_empty()) {
++        attrs.entry("catchup-source".to_string()).or_insert_with(|| source.to_string());
++    }
++    if let Some(time) = catchup.time.as_ref().filter(|v| !v.is_empty()) {
++        attrs.entry("catchup-time".to_string()).or_insert_with(|| time.to_string());
++    }
++    if let Some(correction) = catchup.correction.as_ref().filter(|v| !v.is_empty()) {
++        attrs
++            .entry("catchup-correction".to_string())
++            .or_insert_with(|| correction.to_string());
++    }
++    if let Some(ct) = catchup.catchup_type.as_ref().filter(|v| !v.is_empty()) {
++        attrs.entry("catchup-type".to_string()).or_insert_with(|| ct.to_string());
++    }
++    for extra in &catchup.extra_attributes {
++        if !extra.name.is_empty() && !extra.value.is_empty() {
++            attrs
++                .entry(extra.name.to_string())
++                .or_insert_with(|| extra.value.to_string());
++        }
++    }
++}
++
++/// Build catchup EXTINF attrs from playlist item (develop has no m3u_archive_attrs field).
++pub fn catchup_attrs_from_item(item: &M3uPlaylistItem) -> BTreeMap<String, String> {
++    let mut attrs = BTreeMap::new();
++    let days = item.time_shift.as_ref().trim();
++    if !days.is_empty() {
++        attrs.insert("catchup-days".to_string(), days.to_string());
++    }
++    if let Some(mode) = item.t_catchup_mode.as_ref().filter(|v| !v.is_empty()) {
++        let mode_s = mode.to_string();
++        attrs.insert("catchup-type".to_string(), mode_s.clone());
++        attrs.insert("catchup".to_string(), mode_s);
++    }
++    if let Some(source) = item.t_catchup_source.as_ref().filter(|v| !v.is_empty()) {
++        attrs.insert("catchup-source".to_string(), source.to_string());
++    }
++    if let Some(StreamProperties::Live(live)) = item.additional_properties.as_ref() {
++        if let Some(catchup) = live.catchup.as_ref() {
++            merge_catchup_properties_into_attrs(&mut attrs, catchup);
++        }
++    }
++    canonicalize_m3u_archive_attrs(&mut attrs);
++    let is_flussonic = attrs
++        .get("catchup-type")
++        .or_else(|| attrs.get("catchup"))
++        .is_some_and(|t| {
++            matches!(
++                t.to_ascii_lowercase().as_str(),
++                "flussonic" | "flussonic-hls" | "flussonic-ts" | "fs"
++            )
++        });
++    if is_flussonic {
++        attrs
++            .entry("catchup-type".to_string())
++            .or_insert_with(|| "flussonic".to_string());
++        attrs
++            .entry("catchup".to_string())
++            .or_insert_with(|| "flussonic".to_string());
++        if !attrs.contains_key("catchup-source") {
++            attrs.insert("catchup-source".to_string(), "?utc={utc}&lutc={lutc}".to_string());
++        }
++    }
++    attrs
++}
++
++/// True when the client request targets catchup/archive playback (not plain live).
++pub fn is_m3u_archive_playback_query(query: Option<&str>) -> bool {
++    let Some(query) = query.filter(|q| !q.is_empty()) else {
++        return false;
++    };
++    query.split('&').any(|pair| {
++        let key = pair.split('=').next().unwrap_or("").to_ascii_lowercase();
++        M3U_ARCHIVE_QUERY_KEYS.iter().any(|k| key == *k)
++    })
++}
++
++pub fn normalize_m3u_archive_client_query(query: &str) -> String {
++    let q = query.trim().trim_start_matches('?');
++    if q.is_empty() {
++        return String::new();
++    }
++    if m3u_archive_query_has_key(q, "utc") {
++        return q.to_string();
++    }
++    let Some(utc) = m3u_archive_query_value(q, "utcstart")
++        .or_else(|| m3u_archive_query_value(q, "start"))
++    else {
++        return q.to_string();
++    };
++    let mut out = vec![format!("utc={utc}")];
++    if let Some(lutc) = m3u_archive_query_value(q, "lutc")
++        .or_else(|| m3u_archive_query_value(q, "end"))
++        .or_else(|| m3u_archive_query_value(q, "utcend"))
++    {
++        out.push(format!("lutc={lutc}"));
++    } else if let Some(offset) = m3u_archive_query_value(q, "offset") {
++        out.push(format!("offset={offset}"));
++    }
++    if let Some(timeshift) = m3u_archive_query_value(q, "timeshift") {
++        out.push(format!("timeshift={timeshift}"));
++    }
++    out.join("&")
++}
++
++#[derive(Default, Clone)]
++struct M3uArchivePlaybackTimes {
++    utc: Option<String>,
++    lutc: Option<String>,
++    start: Option<String>,
++    end: Option<String>,
++    duration: Option<String>,
++    offset: Option<String>,
++    timeshift: Option<String>,
++    timenow: Option<String>,
++    archive: Option<String>,
++    archive_end: Option<String>,
++}
++
++fn parse_m3u_archive_playback_times(query: &str) -> M3uArchivePlaybackTimes {
++    let q = query.trim().trim_start_matches('?');
++    M3uArchivePlaybackTimes {
++        utc: m3u_archive_query_value(q, "utc").map(str::to_string),
++        lutc: m3u_archive_query_value(q, "lutc").map(str::to_string),
++        start: m3u_archive_query_value(q, "start")
++            .or_else(|| m3u_archive_query_value(q, "utcstart"))
++            .map(str::to_string),
++        end: m3u_archive_query_value(q, "end")
++            .or_else(|| m3u_archive_query_value(q, "utcend"))
++            .map(str::to_string),
++        duration: m3u_archive_query_value(q, "duration").map(str::to_string),
++        offset: m3u_archive_query_value(q, "offset").map(str::to_string),
++        timeshift: m3u_archive_query_value(q, "timeshift").map(str::to_string),
++        timenow: m3u_archive_query_value(q, "timenow").map(str::to_string),
++        archive: m3u_archive_query_value(q, "archive").map(str::to_string),
++        archive_end: m3u_archive_query_value(q, "archive_end").map(str::to_string),
++    }
++}
++
++impl M3uArchivePlaybackTimes {
++    fn start_unix(&self) -> Option<&str> {
++        self.utc
++            .as_deref()
++            .or(self.start.as_deref())
++            .or(self.timeshift.as_deref())
++            .or(self.archive.as_deref())
++    }
++
++    fn end_unix(&self) -> Option<&str> {
++        self.lutc
++            .as_deref()
++            .or(self.end.as_deref())
++            .or(self.timenow.as_deref())
++            .or(self.archive_end.as_deref())
++    }
++
++    fn duration_seconds(&self, attrs: &BTreeMap<String, String>) -> String {
++        if let Some(d) = self.duration.as_deref().filter(|v| !v.is_empty()) {
++            return d.to_string();
++        }
++        if let (Some(start), Some(end)) = (self.start_unix(), self.end_unix()) {
++            if let (Ok(s), Ok(e)) = (start.parse::<i64>(), end.parse::<i64>()) {
++                if e > s {
++                    return (e - s).to_string();
++                }
++            }
++        }
++        if let Some(days) = m3u_archive_attr(attrs, "catchup-days").and_then(|d| d.parse::<u64>().ok()) {
++            return (days.saturating_mul(86_400)).to_string();
++        }
++        "14400".to_string()
++    }
++}
++
++fn m3u_effective_catchup_type(attrs: &BTreeMap<String, String>) -> String {
++    if let Some(raw) = m3u_archive_attr(attrs, "catchup-type")
++        .or_else(|| m3u_archive_attr(attrs, "catchup"))
++    {
++        return canonicalize_m3u_catchup_type(raw);
++    }
++    if m3u_archive_attr(attrs, "catchup-days").is_some() {
++        return "append".to_string();
++    }
++    canonicalize_m3u_catchup_type("shift")
++}
++
++fn substitute_catchup_template(template: &str, times: &M3uArchivePlaybackTimes, duration: &str) -> String {
++    let start = times.start_unix().unwrap_or("");
++    let end = times.end_unix().unwrap_or("");
++    let offset = times.offset.as_deref().unwrap_or("0");
++    let mut out = template.to_string();
++    for (from, to) in [
++        ("{utc}", start),
++        ("${utc}", start),
++        ("{start}", start),
++        ("${start}", start),
++        ("{lutc}", end),
++        ("{end}", end),
++        ("${end}", end),
++        ("{utcend}", end),
++        ("{duration}", duration),
++        ("${duration}", duration),
++        ("{offset}", offset),
++        ("${offset}", offset),
++        ("${timestamp}", start),
++    ] {
++        out = out.replace(from, to);
++    }
++    out
++}
++
++fn set_url_path(url: &str, new_path: &str) -> Option<String> {
++    let mut parsed = url::Url::parse(url).ok()?;
++    parsed.set_path(new_path);
++    Some(parsed.to_string())
++}
++
++fn flussonic_hls_archive_path(provider_url: &str, start: &str, duration: &str) -> Option<String> {
++    let path = url::Url::parse(provider_url).ok()?.path().to_string();
++    let new_path = if let Some((parent, _file)) = path.rsplit_once('/') {
++        format!("{parent}/archive-{start}-{duration}.m3u8")
++    } else {
++        format!("/archive-{start}-{duration}.m3u8")
++    };
++    set_url_path(provider_url, &new_path)
++}
++
++fn flussonic_timeshift_rel_path(provider_url: &str, offset: &str) -> Option<String> {
++    let ago = offset.trim_start_matches('-').trim_start_matches('+');
++    if ago.is_empty() {
++        return None;
++    }
++    let parsed = url::Url::parse(provider_url).ok()?;
++    let path = parsed.path();
++    let new_path = if let Some((parent, _)) = path.rsplit_once('/') {
++        format!("{parent}/timeshift_rel-{ago}.m3u8")
++    } else {
++        format!("/timeshift_rel-{ago}.m3u8")
++    };
++    set_url_path(provider_url, &new_path)
++}
++
++fn flussonic_timeshift_abs_path(provider_url: &str, start: &str) -> Option<String> {
++    let parsed = url::Url::parse(provider_url).ok()?;
++    let path = parsed.path();
++    let new_path = if path.ends_with(".ts") || path.contains("/mpegts") {
++        if let Some((parent, _)) = path.rsplit_once('/') {
++            format!("{parent}/timeshift_abs-{start}.ts")
++        } else {
++            format!("/timeshift_abs-{start}.ts")
++        }
++    } else if let Some((parent, _)) = path.rsplit_once('/') {
++        format!("{parent}/timeshift_abs-{start}.m3u8")
++    } else {
++        format!("/timeshift_abs-{start}.m3u8")
++    };
++    set_url_path(provider_url, &new_path)
++}
++
++fn build_catchup_source_url(
++    provider_url: &str,
++    source_template: &str,
++    times: &M3uArchivePlaybackTimes,
++    duration: &str,
++) -> String {
++    let substituted = substitute_catchup_template(source_template.trim(), times, duration);
++    if substituted.starts_with("http://") || substituted.starts_with("https://") {
++        return substituted;
++    }
++    let fragment = substituted.trim_start_matches('?');
++    merge_url_query(provider_url, fragment)
++}
++
++/// Build provider archive URL for shift / append / flussonic / timeshift types.
++pub fn build_m3u_archive_provider_url(
++    provider_url: &str,
++    client_query: &str,
++    attrs: &BTreeMap<String, String>,
++) -> String {
++    let client_query = normalize_m3u_archive_client_query(client_query);
++    if client_query.is_empty() {
++        return provider_url.to_string();
++    }
++    let times = parse_m3u_archive_playback_times(&client_query);
++    let duration = times.duration_seconds(attrs);
++    let catchup_type = m3u_effective_catchup_type(attrs);
++
++    if let Some(source) = m3u_archive_attr(attrs, "catchup-source") {
++        let mode = catchup_type.as_str();
++        if mode == "append" || mode == "default" || source.starts_with("http://") || source.starts_with("https://") {
++            return build_catchup_source_url(provider_url, source, &times, &duration);
++        }
++        if source.starts_with('?') || source.contains('=') {
++            return build_catchup_source_url(provider_url, source, &times, &duration);
++        }
++    }
++
++    match catchup_type.as_str() {
++        "flussonic" | "flussonic-hls" | "fs" => {
++            if let Some(start) = times.start_unix() {
++                if let Some(url) = flussonic_hls_archive_path(provider_url, start, &duration) {
++                    return url;
++                }
++                if let Some(url) = flussonic_timeshift_abs_path(provider_url, start) {
++                    return url;
++                }
++            }
++            if let Some(offset) = times.offset.as_deref() {
++                if let Some(url) = flussonic_timeshift_rel_path(provider_url, offset) {
++                    return url;
++                }
++            }
++            merge_url_query(provider_url, &client_query)
++        }
++        "flussonic-ts" => {
++            if let Some(start) = times.start_unix() {
++                if let Some(url) = flussonic_timeshift_abs_path(provider_url, start) {
++                    return url;
++                }
++            }
++            merge_url_query(provider_url, &client_query)
++        }
++        "append" | "shift" | "archive" | "timeshift" | "default" => {
++            merge_url_query(provider_url, &client_query)
++        }
++        _ => merge_url_query(provider_url, &client_query),
++    }
++}
++
++/// Unix start time for EPG during archive playback (Flussonic path or `utc` query).
++pub fn m3u_archive_epg_reference_ts(stream_url: &str) -> Option<i64> {
++    let Ok(parsed) = url::Url::parse(stream_url) else {
++        return None;
++    };
++    let path = parsed.path();
++    if let Some(rest) = path.split("/archive-").nth(1) {
++        if let Some(start) = rest.split('-').next() {
++            if let Ok(ts) = start.parse::<i64>() {
++                return Some(ts);
++            }
++        }
++    }
++    if let Some(rest) = path.split("/timeshift_abs-").nth(1) {
++        let start = rest.trim_end_matches(".ts").trim_end_matches(".m3u8");
++        if let Ok(ts) = start.parse::<i64>() {
++            return Some(ts);
++        }
++    }
++    let query = parsed.query().unwrap_or("");
++    if query.is_empty() {
++        return None;
++    }
++    parse_m3u_archive_playback_times(query)
++        .start_unix()
++        .and_then(|s| s.parse::<i64>().ok())
++}
++
++/// Alias used by m3u_api session discriminator.
++pub fn archive_epg_reference_from_query(client_query: &str) -> Option<i64> {
++    m3u_archive_epg_reference_from_query(client_query)
++}
++
++pub fn m3u_archive_epg_reference_from_query(client_query: &str) -> Option<i64> {
++    let q = normalize_m3u_archive_client_query(client_query);
++    if q.is_empty() {
++        return None;
++    }
++    parse_m3u_archive_playback_times(&q)
++        .start_unix()
++        .and_then(|s| s.parse::<i64>().ok())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use shared::model::{LiveStreamProperties, PlaylistItemType};
++    use shared::utils::intern::Intern;
++
++    #[test]
++    fn archive_playback_query_detects_utc_lutc() {
++        assert!(is_m3u_archive_playback_query(Some("utc=1&lutc=2")));
++        assert!(!is_m3u_archive_playback_query(Some("token=abc")));
++    }
++
++    #[test]
++    fn flussonic_hls_archive_url() {
++        let mut attrs = BTreeMap::new();
++        attrs.insert("catchup-type".to_string(), "flussonic".to_string());
++        let url = build_m3u_archive_provider_url(
++            "http://cdn.example/live/ch.m3u8",
++            "utc=1700000000&lutc=1700003600",
++            &attrs,
++        );
++        assert!(url.contains("/archive-1700000000-3600.m3u8"));
++    }
++
++    #[test]
++    fn catchup_attrs_from_flussonic_item() {
++        let item = M3uPlaylistItem {
++            virtual_id: 1,
++            provider_id: "p".intern(),
++            name: "ch".intern(),
++            chno: 0,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "TV".intern(),
++            title: "Channel".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "".intern(),
++            rec: "".intern(),
++            url: "http://example/live/1.m3u8".intern(),
++            epg_channel_id: None,
++            input_name: "in".intern(),
++            item_type: PlaylistItemType::Live,
++            t_stream_url: "".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: Some(StreamProperties::Live(LiveStreamProperties {
++                catchup: Some(CatchupProperties {
++                    catchup_type: Some("flussonic".intern()),
++                    days: Some("3".intern()),
++                    ..CatchupProperties::default()
++                }),
++                ..LiveStreamProperties::default()
++            })),
++            input_stream_id: "".intern(),
++        };
++        let attrs = catchup_attrs_from_item(&item);
++        assert_eq!(attrs.get("catchup-type").map(String::as_str), Some("flussonic"));
++        assert!(attrs.get("catchup-source").is_some());
++    }
++}
 diff --git a/backend/src/utils/m3u_catchup.rs b/backend/src/utils/m3u_catchup.rs
 index c766443..ceba1b4 100644
 --- a/backend/src/utils/m3u_catchup.rs
