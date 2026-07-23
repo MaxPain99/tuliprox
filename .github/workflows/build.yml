@@ -62,7 +62,7 @@ jobs:
           echo "${WASM_TOOLS_BIN}" >> "$GITHUB_PATH"
 
       - name: Test Flussonic archive module
-        run: cargo test -p backend m3u_archive --locked
+        run: cargo test -p tuliprox m3u_archive --locked
 
       - name: Build frontend
         run: |
