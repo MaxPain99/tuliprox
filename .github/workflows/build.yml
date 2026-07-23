@@ -19,6 +19,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4.2.2
 
+      - name: Apply Flussonic / TiviMate archive patch
+        run: |
+          set -euo pipefail
+          PATCH="patches/m3u-flussonic-tivimate.patch"
+          if [[ ! -f "${PATCH}" ]]; then
+            echo "::error::Missing ${PATCH} — commit the patch on develop before tagging." >&2
+            exit 1
+          fi
+          # Strip optional banner (# lines before first diff --git)
+          sed -n '/^diff --git /,$p' "${PATCH}" | git apply --check -
+          sed -n '/^diff --git /,$p' "${PATCH}" | git apply -
+          test -f backend/src/utils/m3u_archive.rs
+          grep -q 'is_m3u_archive_playback_query' backend/src/api/endpoints/m3u_api.rs
+          echo "Flussonic patch applied OK"
+
       - name: Install musl tools
         run: |
           sudo apt-get update
@@ -45,6 +60,9 @@ jobs:
           chmod +x ./bin/install_wasm_tools.sh
           WASM_TOOLS_BIN="$(./bin/install_wasm_tools.sh 128)"
           echo "${WASM_TOOLS_BIN}" >> "$GITHUB_PATH"
+
+      - name: Test Flussonic archive module
+        run: cargo test -p backend m3u_archive --locked
 
       - name: Build frontend
         run: |
@@ -103,5 +121,5 @@ jobs:
             gh release create "$TAG" artifacts/* \
               --repo "$GH_REPO" \
               --title "$TAG" \
-              --notes "Release ${TAG}"
+              --notes "Release ${TAG} (Flussonic archive / TiviMate patch included)"
           fi
