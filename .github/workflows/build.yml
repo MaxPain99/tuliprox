@@ -22,17 +22,8 @@ jobs:
       - name: Apply Flussonic / TiviMate archive patch
         run: |
           set -euo pipefail
-          PATCH="patches/m3u-flussonic-tivimate.patch"
-          if [[ ! -f "${PATCH}" ]]; then
-            echo "::error::Missing ${PATCH} — commit the patch on develop before tagging." >&2
-            exit 1
-          fi
-          # Strip optional banner (# lines before first diff --git)
-          sed -n '/^diff --git /,$p' "${PATCH}" | git apply --check -
-          sed -n '/^diff --git /,$p' "${PATCH}" | git apply -
-          test -f backend/src/utils/m3u_archive.rs
-          grep -q 'is_m3u_archive_playback_query' backend/src/api/endpoints/m3u_api.rs
-          echo "Flussonic patch applied OK"
+          chmod +x scripts/apply-maxpain-flussonic.sh
+          ./scripts/apply-maxpain-flussonic.sh .
 
       - name: Install musl tools
         run: |
