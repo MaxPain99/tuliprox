@@ -1,1027 +1,1174 @@
 # =============================================================================
 # [BitTV fork] m3u-flussonic-tivimate.patch
 # -----------------------------------------------------------------------------
-# Flussonic archive для TiviMate (Android) на MaxPain/tuliprox develop (v3.3.74+).
-# TiviMate шлёт ?utc=&lutc= на proxy URL (не m3u-catchup token).
-# Строит provider URL: .../archive-{start}-{duration}.m3u8 (+ timeshift_abs fallback).
-# Экспорт M3U: catchup-type=flussonic, catchup-source=?utc={utc}&lutc={lutc}.
+# Dual catchup support without conflicts:
+#   1) flussonic (TiviMate path rewrite): .../{id}/index.m3u8 -> .../{id}/archive-{utc}-{duration}.m3u8
+#   2) shift / Smart IPTV: ?utc=&lutc= even without tuliprox-catchup / v0 / v1
+#
+# Apply on MaxPain99/tuliprox develop (clean tree):
+#   cd /path/to/tuliprox
+#   git apply --whitespace=nowarn patches/m3u-flussonic-tivimate.patch
+#   # or:  patch -p1 < patches/m3u-flussonic-tivimate.patch
+#
+# Then rebuild and refresh the user M3U playlist.
 # =============================================================================
 #
-diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
-index b09c5da..de33997 100644
---- a/backend/src/api/endpoints/m3u_api.rs
-+++ b/backend/src/api/endpoints/m3u_api.rs
-@@ -20,9 +20,13 @@ use crate::{
-         model::{AppState, UserApiRequest, UserApiRequestQueryOrBody},
-     },
-     auth::{check_network_access_only, resolve_api_user_context, ApiUserAuthError, Fingerprint},
--    model::{ConfigTarget, ProxyUserCredentials},
-+    model::{ConfigInput, ConfigTarget, ProxyUserCredentials},
-     repository::{m3u_get_item_for_stream_id, m3u_load_rewrite_playlist, storage_const},
--    utils::{debug_if_enabled, decode_m3u_catchup_token, has_m3u_catchup_marker, resolve_m3u_catchup_url, M3uCatchupToken, PROVIDER_SCHEME_PREFIX},
-+    utils::{
-+        archive_epg_reference_from_query, build_m3u_archive_provider_url, catchup_attrs_from_item,
-+        debug_if_enabled, decode_m3u_catchup_token, has_m3u_catchup_marker, is_m3u_archive_playback_query,
-+        resolve_m3u_catchup_url, M3uCatchupToken, PROVIDER_SCHEME_PREFIX,
-+    },
- };
- use axum::response::IntoResponse;
- use bytes::Bytes;
-@@ -31,8 +35,8 @@ use log::{debug, error};
- use shared::error::TuliproxError;
- use shared::{
-     model::{
--        ConnectFailureReason, FieldGetAccessor, PlaylistEntry, PlaylistItemType, TargetType, UserConnectionPermission,
--        XtreamCluster,
-+        ConnectFailureReason, FieldGetAccessor, M3uPlaylistItem, PlaylistEntry, PlaylistItemType, TargetType,
-+        UserConnectionPermission, XtreamCluster,
-     },
-     utils::{concat_path, extract_extension_from_url, sanitize_sensitive_info},
-     defaults::{HLS_EXT}
-@@ -123,6 +127,75 @@ async fn m3u_api_post(
-     m3u_api(user, target, &app_state, &api_req.content_type).await.into_response()
- }
- 
-+fn m3u_archive_query_from_request(
-+    request_query: Option<&str>,
-+    api_req: &UserApiRequest,
-+) -> Option<String> {
-+    if let Some(q) = request_query.filter(|q| !q.is_empty()) {
-+        if is_m3u_archive_playback_query(Some(q)) {
-+            return Some(q.to_string());
-+        }
-+    }
-+    let mut pairs = Vec::new();
-+    if !api_req.start.is_empty() {
-+        pairs.push(format!("start={}", api_req.start));
-+    }
-+    if !api_req.end.is_empty() {
-+        pairs.push(format!("end={}", api_req.end));
-+    }
-+    if !api_req.duration.is_empty() {
-+        pairs.push(format!("duration={}", api_req.duration));
-+    }
-+    if pairs.is_empty() {
-+        return None;
-+    }
-+    let q = pairs.join("&");
-+    is_m3u_archive_playback_query(Some(&q)).then_some(q)
-+}
-+
-+fn m3u_catchup_session_discriminator(
-+    archive_discriminator: Option<&str>,
-+    raw_query: Option<&str>,
-+    api_req: &UserApiRequest,
-+    stream_url: &str,
-+) -> String {
-+    let base = archive_discriminator.unwrap_or("live");
-+    let synthetic = m3u_archive_query_from_request(raw_query, api_req);
-+    let utc = synthetic
-+        .as_deref()
-+        .and_then(archive_epg_reference_from_query)
-+        .or_else(|| raw_query.and_then(archive_epg_reference_from_query))
-+        .or_else(|| m3u_archive_epg_reference_ts(stream_url));
-+    if let Some(utc) = utc {
-+        return format!("{base}|{utc}");
-+    }
-+    base.to_string()
-+}
-+
-+fn resolve_classic_m3u_archive(
-+    mut pli: M3uPlaylistItem,
-+    input: &ConfigInput,
-+    raw_query: Option<&str>,
-+    api_req: &UserApiRequest,
-+) -> Result<(M3uPlaylistItem, String), TuliproxError> {
-+    let Some(archive_query) = m3u_archive_query_from_request(raw_query, api_req) else {
-+        return Err(TuliproxError::RepositoryM3u(
-+            "not a classic archive query".to_string(),
-+        ));
-+    };
-+    let attrs = catchup_attrs_from_item(&pli);
-+    if attrs.is_empty() {
-+        return Err(TuliproxError::RepositoryM3u(
-+            "M3U archive metadata missing (reload playlist)".to_string(),
-+        ));
-+    }
-+    let source_url = resolve_effective_source_url(&pli, input)?;
-+    let archive_url = build_m3u_archive_provider_url(source_url.as_ref(), &archive_query, &attrs);
-+    pli.item_type = PlaylistItemType::Catchup;
-+    pli.url = archive_url.into();
-+    Ok((pli, "classic".to_string()))
-+}
-+
- #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
- pub(in crate::api) async fn m3u_api_stream_loaded(
-     user: Arc<ProxyUserCredentials>,
-@@ -134,6 +207,8 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
-     input: Arc<crate::model::ConfigInput>,
-     stream_ext: Option<&str>,
-     archive_discriminator: Option<&str>,
-+    raw_query: Option<&str>,
-+    api_req: &UserApiRequest,
- ) -> impl IntoResponse + Send {
-     let target_name = &target.name;
-     if !target.has_output(TargetType::M3u) {
-@@ -249,11 +324,17 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
-     let extracted_ext = extract_extension_from_url(&pli.url).unwrap_or_default();
-     let extension = stream_ext.unwrap_or(extracted_ext);
-     let session_key = if pli.item_type == PlaylistItemType::Catchup {
-+        let catchup_discriminator = m3u_catchup_session_discriminator(
-+            archive_discriminator.as_deref(),
-+            raw_query,
-+            api_req,
-+            pli.url.as_ref(),
-+        );
-         create_m3u_catchup_session_key(
-             fingerprint,
-             &user.username,
-             virtual_id,
--            archive_discriminator.unwrap_or("live"),
-+            &catchup_discriminator,
-         )
-     } else {
-         create_playback_session_fingerprint(fingerprint, &user.username, virtual_id, pli.item_type, Some(extension))
-@@ -333,7 +414,7 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
-             .await
-             .into_response();
-         }
--        if pli.item_type == PlaylistItemType::Catchup {
-+        if pli.item_type == PlaylistItemType::Catchup || archive_discriminator.is_some() {
-             pli.url.clone()
-         } else {
-             session.stream_url.clone()
-@@ -405,17 +486,25 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
-     };
- 
-     if let Some(response) = redirect_response(app_state, &redirect_params).await {
--        return response.into_response();
-+        if archive_discriminator.is_none() {
-+            return response.into_response();
-+        }
-     }
- 
-+    let is_archive_playback =
-+        pli.item_type == PlaylistItemType::Catchup || archive_discriminator.is_some();
-+    let archive_reference = is_archive_playback
-+        .then(|| {
-+            m3u_archive_epg_reference_ts(session_url.as_ref())
-+                .or_else(|| raw_query.and_then(archive_epg_reference_from_query))
-+        })
-+        .flatten();
-+    let hls_url = if is_archive_playback {
-+        session_url.as_ref()
-+    } else {
-+        pli.url.as_ref()
-+    };
-     let is_session_request = is_session_based_playback(pli.item_type, Some(extension));
--    // The archive/catchup EPG reference timestamp is parsed from the request
--    // URL once and shared between the HLS and the non-HLS branch. The HLS
--    // handler threads it into its own manifest construction; the non-HLS
--    // branch attaches it to the StreamChannel so the frontend's stream_epg
--    // request can centre its EPG window on the archive timestamp instead of
--    // falling back to `now`.
--    let archive_reference = m3u_archive_epg_reference_ts(&pli.url);
-     // Reverse proxy mode — only route genuine HLS into the HLS handler, not DASH
-     if is_session_request && extension == shared::defaults::HLS_EXT {
-         let Some(stream_identity) = HlsEntryStreamIdentity::from_playlist_item(&pli) else {
-@@ -432,7 +521,7 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
-             &user,
-             &target,
-             user_session.as_ref(),
--            &pli.url,
-+            hls_url,
-             archive_reference,
-             stream_identity,
-             &input,
-@@ -445,6 +534,13 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
-         .into_response();
-     }
- 
-+    let mut stream_channel = pli.to_stream_channel(target.id);
-+    if is_archive_playback {
-+        stream_channel.item_type = PlaylistItemType::Catchup;
-+        stream_channel.cluster = XtreamCluster::Live;
-+        stream_channel.epg_reference_ts = archive_reference;
-+    }
-+
-     let pinned_provider =
-         user_session.as_ref().filter(|_| pli.item_type.requires_provider_affinity()).map(|session| &session.provider);
- 
-@@ -453,7 +549,7 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
-         app_state,
-         &session_key,
-         Some(request_class),
--        pli.to_stream_channel(target.id).with_epg_reference_ts(archive_reference),
-+        stream_channel,
-         &session_url,
-         pinned_provider,
-         req_headers,
-@@ -514,6 +610,7 @@ async fn m3u_api_stream(
-     app_state: &Arc<AppState>,
-     stream_req: ApiStreamRequest<'_>,
-     raw_query: Option<&str>,
-+    api_req: &UserApiRequest,
- ) -> impl IntoResponse + Send {
-     let _user_guard = app_state.app_config.file_locks.write_lock_str(&user.username).await;
- 
-@@ -554,6 +651,16 @@ async fn m3u_api_stream(
-                 return axum::http::StatusCode::BAD_REQUEST.into_response();
-             }
-         }
-+    } else if is_m3u_archive_playback_query(raw_query)
-+        || m3u_archive_query_from_request(raw_query, api_req).is_some()
-+    {
-+        match resolve_classic_m3u_archive(pli, &input, raw_query, api_req) {
-+            Ok((item, discriminator)) => (item, Some(discriminator)),
-+            Err(err) => {
-+                debug!("Failed to resolve classic M3U archive: {}", sanitize_sensitive_info(&err.to_string()));
-+                return axum::http::StatusCode::BAD_REQUEST.into_response();
-+            }
-+        }
-     } else {
-         (pli, None)
-     };
-@@ -567,6 +674,8 @@ async fn m3u_api_stream(
-         input,
-         stream_ext,
-         archive_discriminator.as_deref(),
-+        raw_query,
-+        api_req,
-     )
-     .await
-     .into_response()
-@@ -634,6 +743,8 @@ async fn m3u_api_catchup(
-         input,
-         None,
-         Some(&archive_discriminator),
-+        raw_query.as_deref(),
-+        &UserApiRequest::default(),
-     )
-     .await
-     .into_response()
-@@ -736,6 +847,7 @@ macro_rules! create_m3u_api_stream {
-                         &app_state,
-                         stream_req,
-                         raw_query.as_deref(),
-+                        &api_req,
-                     )
-                     .await
-                     .into_response()
-diff --git a/backend/src/api/endpoints/v1_api_playlist.rs b/backend/src/api/endpoints/v1_api_playlist.rs
-index a532d02..8335ed7 100644
---- a/backend/src/api/endpoints/v1_api_playlist.rs
-+++ b/backend/src/api/endpoints/v1_api_playlist.rs
-@@ -17,7 +17,7 @@ use crate::{
-                 ApiStreamRequest,
-             },
-         },
--        model::AppState,
-+        model::{AppState, UserApiRequest},
-     },
-     auth::{create_access_token, permission_layer, verify_access_token},
-     model::{
-@@ -566,7 +566,7 @@ async fn playlist_webplayer_stream(
-     );
-     let user = Arc::new(create_api_proxy_user(&app_state));
- 
--    m3u_api_stream_loaded(user, target, &fingerprint, &req_headers, &app_state, pli, input, None, None)
-+    m3u_api_stream_loaded(user, target, &fingerprint, &req_headers, &app_state, pli, input, None, None, None, &UserApiRequest::default())
-         .await
-         .into_response()
- }
 diff --git a/backend/src/utils/m3u_archive.rs b/backend/src/utils/m3u_archive.rs
-new file mode 100755
-index 0000000..1444787
+new file mode 100644
 --- /dev/null
 +++ b/backend/src/utils/m3u_archive.rs
-@@ -0,0 +1,545 @@
-+//! Classic M3U archive playback (TiviMate `?utc=&lutc=` on live proxy URL).
+@@ -0,0 +1,223 @@
++//! Flussonic-compatible M3U archive paths for reverse-proxied playlists.
++//!
++//! TiviMate (`catchup="flussonic"`) rewrites the last path segment of the live URL:
++//!   `.../{id}/index.m3u8` -> `.../{id}/archive-{utc}-{duration}.m3u8`
++//! It does **not** use `catchup-source` and does **not** append `?utc=&lutc=`
++//! (that is the `shift` mode).
 +
-+use std::collections::BTreeMap;
++use url::Url;
 +
-+use shared::model::{CatchupProperties, M3uPlaylistItem, StreamProperties};
++/// Live file name used in proxied Flussonic HLS URLs (`{id}/index.m3u8`).
++pub const FLUSSONIC_PROXY_LIVE_FILE: &str = "index.m3u8";
++/// Live file name used in proxied Flussonic MPEG-TS URLs (`{id}/mpegts`).
++pub const FLUSSONIC_TS_PROXY_LIVE_FILE: &str = "mpegts";
 +
-+const M3U_ARCHIVE_QUERY_KEYS: &[&str] = &[
-+    "utc",
-+    "utcstart",
-+    "utctostart",
-+    "lutc",
-+    "offset",
-+    "start",
-+    "end",
-+    "duration",
-+    "catchup",
-+    "archive",
-+    "archive_end",
-+    "timeshift",
-+    "timenow",
-+    "utcend",
-+];
-+
-+fn m3u_archive_attr<'a>(attrs: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
-+    attrs
-+        .iter()
-+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-+        .map(|(_, v)| v.as_str())
-+        .filter(|v| !v.is_empty())
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum FlussonicArchiveKind {
++    /// `archive-{start}-{duration}.m3u8`
++    ArchiveHls { start: String, duration: String },
++    /// `timeshift_abs-{start}.m3u8` / `.ts`
++    TimeshiftAbs { start: String, extension: String },
++    /// `timeshift_rel-{ago}.m3u8`
++    TimeshiftRel { ago: String },
 +}
 +
-+fn m3u_archive_query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-+    let key_lc = key.to_ascii_lowercase();
-+    for pair in query.split('&') {
-+        let mut parts = pair.splitn(2, '=');
-+        if parts.next()?.eq_ignore_ascii_case(&key_lc) {
-+            return parts.next().filter(|v| !v.is_empty());
++impl FlussonicArchiveKind {
++    pub fn discriminator(&self) -> String {
++        match self {
++            Self::ArchiveHls { start, duration } => format!("archive|{start}|{duration}"),
++            Self::TimeshiftAbs { start, .. } => format!("timeshift_abs|{start}"),
++            Self::TimeshiftRel { ago } => format!("timeshift_rel|{ago}"),
 +        }
 +    }
++
++    pub fn epg_reference_ts(&self) -> Option<i64> {
++        match self {
++            Self::ArchiveHls { start, .. } | Self::TimeshiftAbs { start, .. } => start.parse().ok(),
++            Self::TimeshiftRel { .. } => None,
++        }
++    }
++}
++
++/// Parse a Flussonic archive / timeshift filename from the last URL path segment.
++pub fn parse_flussonic_archive_file(file: &str) -> Option<FlussonicArchiveKind> {
++    let file = file.trim().trim_start_matches('/');
++    if file.is_empty() {
++        return None;
++    }
++
++    if let Some(rest) = file.strip_prefix("archive-") {
++        let rest = rest.trim_end_matches(".m3u8").trim_end_matches(".ts");
++        let mut parts = rest.splitn(2, '-');
++        let start = parts.next()?.trim();
++        let duration = parts.next()?.trim();
++        if start.is_empty() || duration.is_empty() {
++            return None;
++        }
++        if start.parse::<i64>().is_err() {
++            return None;
++        }
++        return Some(FlussonicArchiveKind::ArchiveHls {
++            start: start.to_string(),
++            duration: duration.to_string(),
++        });
++    }
++
++    if let Some(rest) = file.strip_prefix("timeshift_abs-") {
++        let (start, extension) = if let Some(stem) = rest.strip_suffix(".m3u8") {
++            (stem, ".m3u8")
++        } else if let Some(stem) = rest.strip_suffix(".ts") {
++            (stem, ".ts")
++        } else {
++            (rest, ".m3u8")
++        };
++        let start = start.trim();
++        if start.is_empty() || start.parse::<i64>().is_err() {
++            return None;
++        }
++        return Some(FlussonicArchiveKind::TimeshiftAbs {
++            start: start.to_string(),
++            extension: extension.to_string(),
++        });
++    }
++
++    if let Some(rest) = file.strip_prefix("timeshift_rel-") {
++        let ago = rest
++            .trim_end_matches(".m3u8")
++            .trim_end_matches(".ts")
++            .trim_start_matches('-')
++            .trim_start_matches('+')
++            .trim();
++        if ago.is_empty() {
++            return None;
++        }
++        return Some(FlussonicArchiveKind::TimeshiftRel { ago: ago.to_string() });
++    }
++
 +    None
 +}
 +
-+fn m3u_archive_query_has_key(query: &str, key: &str) -> bool {
-+    m3u_archive_query_value(query, key).is_some()
++/// True when the nested path file is a live Flussonic entry (not archive).
++pub fn is_flussonic_live_file(file: &str) -> bool {
++    let file = file.trim().trim_start_matches('/').to_ascii_lowercase();
++    matches!(
++        file.as_str(),
++        "index.m3u8"
++            | "video.m3u8"
++            | "mono.m3u8"
++            | "mpegts"
++            | "index.ts"
++            | "video.ts"
++            | "mono.ts"
++    )
 +}
 +
-+fn merge_url_query(base: &str, query: &str) -> String {
-+    let q = query.trim_start_matches('?');
-+    if q.is_empty() {
-+        return base.to_string();
-+    }
-+    if base.contains('?') {
-+        format!("{base}&{q}")
-+    } else {
-+        format!("{base}?{q}")
-+    }
-+}
-+
-+fn canonicalize_m3u_catchup_type(raw: &str) -> String {
-+    match raw.trim().to_ascii_lowercase().as_str() {
-+        "fs" | "flussonic-hls" | "flussonic-ts" => "flussonic".to_string(),
-+        "flussonic" => "flussonic".to_string(),
-+        "append" | "query" => "append".to_string(),
-+        other if !other.is_empty() => other.to_string(),
-+        _ => "shift".to_string(),
-+    }
-+}
-+
-+fn canonicalize_m3u_archive_attrs(attrs: &mut BTreeMap<String, String>) {
-+    let ct_key = attrs
-+        .keys()
-+        .find(|k| k.eq_ignore_ascii_case("catchup-type"))
-+        .cloned();
-+    if let Some(key) = ct_key {
-+        let raw = attrs.get(&key).cloned().unwrap_or_default();
-+        let canon = canonicalize_m3u_catchup_type(&raw);
-+        attrs.insert("catchup-type".to_string(), canon);
-+        if key != "catchup-type" {
-+            attrs.remove(&key);
-+        }
-+    } else if let Some(mode) = attrs.get("catchup").cloned() {
-+        attrs.insert("catchup-type".to_string(), canonicalize_m3u_catchup_type(&mode));
-+    }
-+    if attrs.keys().any(|k| k.eq_ignore_ascii_case("catchup-days")) {
-+        attrs.retain(|k, _| !k.eq_ignore_ascii_case("timeshift"));
-+    }
-+    if let (Some(ct), Some(cm)) = (
-+        attrs.get("catchup-type").map(|s| s.as_str()),
-+        attrs.get("catchup").map(|s| s.as_str()),
-+    ) {
-+        if ct.eq_ignore_ascii_case(cm) {
-+            attrs.remove("catchup");
-+        }
-+    }
-+    if m3u_archive_attr(attrs, "catchup-days").is_some()
-+        && m3u_archive_attr(attrs, "catchup-type").is_none()
-+        && m3u_archive_attr(attrs, "catchup").is_none()
++fn replace_last_path_segment(url: &str, new_file: &str) -> Option<String> {
++    let mut parsed = Url::parse(url).ok()?;
 +    {
-+        attrs.insert("catchup-type".to_string(), "append".to_string());
-+    }
-+}
-+
-+fn merge_catchup_properties_into_attrs(attrs: &mut BTreeMap<String, String>, catchup: &CatchupProperties) {
-+    if let Some(mode) = catchup.mode.as_ref().filter(|v| !v.is_empty()) {
-+        attrs.entry("catchup".to_string()).or_insert_with(|| mode.to_string());
-+    }
-+    if let Some(days) = catchup.days.as_ref().filter(|v| !v.is_empty()) {
-+        attrs.entry("catchup-days".to_string()).or_insert_with(|| days.to_string());
-+    }
-+    if let Some(source) = catchup.source.as_ref().filter(|v| !v.is_empty()) {
-+        attrs.entry("catchup-source".to_string()).or_insert_with(|| source.to_string());
-+    }
-+    if let Some(time) = catchup.time.as_ref().filter(|v| !v.is_empty()) {
-+        attrs.entry("catchup-time".to_string()).or_insert_with(|| time.to_string());
-+    }
-+    if let Some(correction) = catchup.correction.as_ref().filter(|v| !v.is_empty()) {
-+        attrs
-+            .entry("catchup-correction".to_string())
-+            .or_insert_with(|| correction.to_string());
-+    }
-+    if let Some(ct) = catchup.catchup_type.as_ref().filter(|v| !v.is_empty()) {
-+        attrs.entry("catchup-type".to_string()).or_insert_with(|| ct.to_string());
-+    }
-+    for extra in &catchup.extra_attributes {
-+        if !extra.name.is_empty() && !extra.value.is_empty() {
-+            attrs
-+                .entry(extra.name.to_string())
-+                .or_insert_with(|| extra.value.to_string());
-+        }
-+    }
-+}
-+
-+/// Build catchup EXTINF attrs from playlist item (develop has no m3u_archive_attrs field).
-+pub fn catchup_attrs_from_item(item: &M3uPlaylistItem) -> BTreeMap<String, String> {
-+    let mut attrs = BTreeMap::new();
-+    let days = item.time_shift.as_ref().trim();
-+    if !days.is_empty() {
-+        attrs.insert("catchup-days".to_string(), days.to_string());
-+    }
-+    if let Some(mode) = item.t_catchup_mode.as_ref().filter(|v| !v.is_empty()) {
-+        let mode_s = mode.to_string();
-+        attrs.insert("catchup-type".to_string(), mode_s.clone());
-+        attrs.insert("catchup".to_string(), mode_s);
-+    }
-+    if let Some(source) = item.t_catchup_source.as_ref().filter(|v| !v.is_empty()) {
-+        attrs.insert("catchup-source".to_string(), source.to_string());
-+    }
-+    if let Some(StreamProperties::Live(live)) = item.additional_properties.as_ref() {
-+        if let Some(catchup) = live.catchup.as_ref() {
-+            merge_catchup_properties_into_attrs(&mut attrs, catchup);
-+        }
-+    }
-+    canonicalize_m3u_archive_attrs(&mut attrs);
-+    let is_flussonic = attrs
-+        .get("catchup-type")
-+        .or_else(|| attrs.get("catchup"))
-+        .is_some_and(|t| {
-+            matches!(
-+                t.to_ascii_lowercase().as_str(),
-+                "flussonic" | "flussonic-hls" | "flussonic-ts" | "fs"
-+            )
-+        });
-+    if is_flussonic {
-+        attrs
-+            .entry("catchup-type".to_string())
-+            .or_insert_with(|| "flussonic".to_string());
-+        attrs
-+            .entry("catchup".to_string())
-+            .or_insert_with(|| "flussonic".to_string());
-+        if !attrs.contains_key("catchup-source") {
-+            attrs.insert("catchup-source".to_string(), "?utc={utc}&lutc={lutc}".to_string());
-+        }
-+    }
-+    attrs
-+}
-+
-+/// True when the client request targets catchup/archive playback (not plain live).
-+pub fn is_m3u_archive_playback_query(query: Option<&str>) -> bool {
-+    let Some(query) = query.filter(|q| !q.is_empty()) else {
-+        return false;
-+    };
-+    query.split('&').any(|pair| {
-+        let key = pair.split('=').next().unwrap_or("").to_ascii_lowercase();
-+        M3U_ARCHIVE_QUERY_KEYS.iter().any(|k| key == *k)
-+    })
-+}
-+
-+pub fn normalize_m3u_archive_client_query(query: &str) -> String {
-+    let q = query.trim().trim_start_matches('?');
-+    if q.is_empty() {
-+        return String::new();
-+    }
-+    if m3u_archive_query_has_key(q, "utc") {
-+        return q.to_string();
-+    }
-+    let Some(utc) = m3u_archive_query_value(q, "utcstart")
-+        .or_else(|| m3u_archive_query_value(q, "start"))
-+    else {
-+        return q.to_string();
-+    };
-+    let mut out = vec![format!("utc={utc}")];
-+    if let Some(lutc) = m3u_archive_query_value(q, "lutc")
-+        .or_else(|| m3u_archive_query_value(q, "end"))
-+        .or_else(|| m3u_archive_query_value(q, "utcend"))
-+    {
-+        out.push(format!("lutc={lutc}"));
-+    } else if let Some(offset) = m3u_archive_query_value(q, "offset") {
-+        out.push(format!("offset={offset}"));
-+    }
-+    if let Some(timeshift) = m3u_archive_query_value(q, "timeshift") {
-+        out.push(format!("timeshift={timeshift}"));
-+    }
-+    out.join("&")
-+}
-+
-+#[derive(Default, Clone)]
-+struct M3uArchivePlaybackTimes {
-+    utc: Option<String>,
-+    lutc: Option<String>,
-+    start: Option<String>,
-+    end: Option<String>,
-+    duration: Option<String>,
-+    offset: Option<String>,
-+    timeshift: Option<String>,
-+    timenow: Option<String>,
-+    archive: Option<String>,
-+    archive_end: Option<String>,
-+}
-+
-+fn parse_m3u_archive_playback_times(query: &str) -> M3uArchivePlaybackTimes {
-+    let q = query.trim().trim_start_matches('?');
-+    M3uArchivePlaybackTimes {
-+        utc: m3u_archive_query_value(q, "utc").map(str::to_string),
-+        lutc: m3u_archive_query_value(q, "lutc").map(str::to_string),
-+        start: m3u_archive_query_value(q, "start")
-+            .or_else(|| m3u_archive_query_value(q, "utcstart"))
-+            .map(str::to_string),
-+        end: m3u_archive_query_value(q, "end")
-+            .or_else(|| m3u_archive_query_value(q, "utcend"))
-+            .map(str::to_string),
-+        duration: m3u_archive_query_value(q, "duration").map(str::to_string),
-+        offset: m3u_archive_query_value(q, "offset").map(str::to_string),
-+        timeshift: m3u_archive_query_value(q, "timeshift").map(str::to_string),
-+        timenow: m3u_archive_query_value(q, "timenow").map(str::to_string),
-+        archive: m3u_archive_query_value(q, "archive").map(str::to_string),
-+        archive_end: m3u_archive_query_value(q, "archive_end").map(str::to_string),
-+    }
-+}
-+
-+impl M3uArchivePlaybackTimes {
-+    fn start_unix(&self) -> Option<&str> {
-+        self.utc
-+            .as_deref()
-+            .or(self.start.as_deref())
-+            .or(self.timeshift.as_deref())
-+            .or(self.archive.as_deref())
-+    }
-+
-+    fn end_unix(&self) -> Option<&str> {
-+        self.lutc
-+            .as_deref()
-+            .or(self.end.as_deref())
-+            .or(self.timenow.as_deref())
-+            .or(self.archive_end.as_deref())
-+    }
-+
-+    fn duration_seconds(&self, attrs: &BTreeMap<String, String>) -> String {
-+        if let Some(d) = self.duration.as_deref().filter(|v| !v.is_empty()) {
-+            return d.to_string();
-+        }
-+        if let (Some(start), Some(end)) = (self.start_unix(), self.end_unix()) {
-+            if let (Ok(s), Ok(e)) = (start.parse::<i64>(), end.parse::<i64>()) {
-+                if e > s {
-+                    return (e - s).to_string();
-+                }
-+            }
-+        }
-+        if let Some(days) = m3u_archive_attr(attrs, "catchup-days").and_then(|d| d.parse::<u64>().ok()) {
-+            return (days.saturating_mul(86_400)).to_string();
-+        }
-+        "14400".to_string()
-+    }
-+}
-+
-+fn m3u_effective_catchup_type(attrs: &BTreeMap<String, String>) -> String {
-+    if let Some(raw) = m3u_archive_attr(attrs, "catchup-type")
-+        .or_else(|| m3u_archive_attr(attrs, "catchup"))
-+    {
-+        return canonicalize_m3u_catchup_type(raw);
-+    }
-+    if m3u_archive_attr(attrs, "catchup-days").is_some() {
-+        return "append".to_string();
-+    }
-+    canonicalize_m3u_catchup_type("shift")
-+}
-+
-+fn substitute_catchup_template(template: &str, times: &M3uArchivePlaybackTimes, duration: &str) -> String {
-+    let start = times.start_unix().unwrap_or("");
-+    let end = times.end_unix().unwrap_or("");
-+    let offset = times.offset.as_deref().unwrap_or("0");
-+    let mut out = template.to_string();
-+    for (from, to) in [
-+        ("{utc}", start),
-+        ("${utc}", start),
-+        ("{start}", start),
-+        ("${start}", start),
-+        ("{lutc}", end),
-+        ("{end}", end),
-+        ("${end}", end),
-+        ("{utcend}", end),
-+        ("{duration}", duration),
-+        ("${duration}", duration),
-+        ("{offset}", offset),
-+        ("${offset}", offset),
-+        ("${timestamp}", start),
-+    ] {
-+        out = out.replace(from, to);
-+    }
-+    out
-+}
-+
-+fn set_url_path(url: &str, new_path: &str) -> Option<String> {
-+    let mut parsed = url::Url::parse(url).ok()?;
-+    parsed.set_path(new_path);
-+    Some(parsed.to_string())
-+}
-+
-+fn flussonic_hls_archive_path(provider_url: &str, start: &str, duration: &str) -> Option<String> {
-+    let path = url::Url::parse(provider_url).ok()?.path().to_string();
-+    let new_path = if let Some((parent, _file)) = path.rsplit_once('/') {
-+        format!("{parent}/archive-{start}-{duration}.m3u8")
-+    } else {
-+        format!("/archive-{start}-{duration}.m3u8")
-+    };
-+    set_url_path(provider_url, &new_path)
-+}
-+
-+fn flussonic_timeshift_rel_path(provider_url: &str, offset: &str) -> Option<String> {
-+    let ago = offset.trim_start_matches('-').trim_start_matches('+');
-+    if ago.is_empty() {
-+        return None;
-+    }
-+    let parsed = url::Url::parse(provider_url).ok()?;
-+    let path = parsed.path();
-+    let new_path = if let Some((parent, _)) = path.rsplit_once('/') {
-+        format!("{parent}/timeshift_rel-{ago}.m3u8")
-+    } else {
-+        format!("/timeshift_rel-{ago}.m3u8")
-+    };
-+    set_url_path(provider_url, &new_path)
-+}
-+
-+fn flussonic_timeshift_abs_path(provider_url: &str, start: &str) -> Option<String> {
-+    let parsed = url::Url::parse(provider_url).ok()?;
-+    let path = parsed.path();
-+    let new_path = if path.ends_with(".ts") || path.contains("/mpegts") {
-+        if let Some((parent, _)) = path.rsplit_once('/') {
-+            format!("{parent}/timeshift_abs-{start}.ts")
++        let mut segments: Vec<String> = parsed.path_segments()?.map(ToString::to_string).collect();
++        if segments.is_empty() {
++            segments.push(new_file.to_string());
 +        } else {
-+            format!("/timeshift_abs-{start}.ts")
++            *segments.last_mut()? = new_file.to_string();
 +        }
-+    } else if let Some((parent, _)) = path.rsplit_once('/') {
-+        format!("{parent}/timeshift_abs-{start}.m3u8")
++        parsed.set_path(&format!("/{}", segments.join("/")));
++    }
++    Some(parsed.into())
++}
++
++/// Build the upstream Flussonic archive URL from the provider live URL.
++pub fn build_provider_flussonic_archive_url(
++    provider_live_url: &str,
++    archive: &FlussonicArchiveKind,
++) -> Option<String> {
++    let new_file = match archive {
++        FlussonicArchiveKind::ArchiveHls { start, duration } => {
++            format!("archive-{start}-{duration}.m3u8")
++        }
++        FlussonicArchiveKind::TimeshiftAbs { start, extension } => {
++            format!("timeshift_abs-{start}{extension}")
++        }
++        FlussonicArchiveKind::TimeshiftRel { ago } => format!("timeshift_rel-{ago}.m3u8"),
++    };
++    replace_last_path_segment(provider_live_url, &new_file)
++}
++
++/// Build Flussonic archive spec from a shift-style `utc`/`lutc` query (fallback).
++pub fn flussonic_archive_from_utc_lutc_query(query: &str) -> Option<FlussonicArchiveKind> {
++    let mut utc = None;
++    let mut lutc = None;
++    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
++        if key.eq_ignore_ascii_case("utc") {
++            utc = Some(value.into_owned());
++        } else if key.eq_ignore_ascii_case("lutc") {
++            lutc = Some(value.into_owned());
++        }
++    }
++    let start = utc.filter(|v| !v.is_empty())?;
++    let duration = match (start.parse::<i64>(), lutc.as_deref().and_then(|v| v.parse::<i64>().ok())) {
++        (Ok(s), Some(e)) if e > s => (e - s).to_string(),
++        _ => "14400".to_string(),
++    };
++    Some(FlussonicArchiveKind::ArchiveHls { start, duration })
++}
++
++/// Proxy live file for a Flussonic player mode (`flussonic` / `flussonic-ts`).
++pub fn flussonic_proxy_live_file(player_mode: &str) -> &'static str {
++    if player_mode.eq_ignore_ascii_case("flussonic-ts") {
++        FLUSSONIC_TS_PROXY_LIVE_FILE
 +    } else {
-+        format!("/timeshift_abs-{start}.m3u8")
-+    };
-+    set_url_path(provider_url, &new_path)
-+}
-+
-+fn build_catchup_source_url(
-+    provider_url: &str,
-+    source_template: &str,
-+    times: &M3uArchivePlaybackTimes,
-+    duration: &str,
-+) -> String {
-+    let substituted = substitute_catchup_template(source_template.trim(), times, duration);
-+    if substituted.starts_with("http://") || substituted.starts_with("https://") {
-+        return substituted;
++        FLUSSONIC_PROXY_LIVE_FILE
 +    }
-+    let fragment = substituted.trim_start_matches('?');
-+    merge_url_query(provider_url, fragment)
-+}
-+
-+/// Build provider archive URL for shift / append / flussonic / timeshift types.
-+pub fn build_m3u_archive_provider_url(
-+    provider_url: &str,
-+    client_query: &str,
-+    attrs: &BTreeMap<String, String>,
-+) -> String {
-+    let client_query = normalize_m3u_archive_client_query(client_query);
-+    if client_query.is_empty() {
-+        return provider_url.to_string();
-+    }
-+    let times = parse_m3u_archive_playback_times(&client_query);
-+    let duration = times.duration_seconds(attrs);
-+    let catchup_type = m3u_effective_catchup_type(attrs);
-+
-+    if let Some(source) = m3u_archive_attr(attrs, "catchup-source") {
-+        let mode = catchup_type.as_str();
-+        if mode == "append" || mode == "default" || source.starts_with("http://") || source.starts_with("https://") {
-+            return build_catchup_source_url(provider_url, source, &times, &duration);
-+        }
-+        if source.starts_with('?') || source.contains('=') {
-+            return build_catchup_source_url(provider_url, source, &times, &duration);
-+        }
-+    }
-+
-+    match catchup_type.as_str() {
-+        "flussonic" | "flussonic-hls" | "fs" => {
-+            if let Some(start) = times.start_unix() {
-+                if let Some(url) = flussonic_hls_archive_path(provider_url, start, &duration) {
-+                    return url;
-+                }
-+                if let Some(url) = flussonic_timeshift_abs_path(provider_url, start) {
-+                    return url;
-+                }
-+            }
-+            if let Some(offset) = times.offset.as_deref() {
-+                if let Some(url) = flussonic_timeshift_rel_path(provider_url, offset) {
-+                    return url;
-+                }
-+            }
-+            merge_url_query(provider_url, &client_query)
-+        }
-+        "flussonic-ts" => {
-+            if let Some(start) = times.start_unix() {
-+                if let Some(url) = flussonic_timeshift_abs_path(provider_url, start) {
-+                    return url;
-+                }
-+            }
-+            merge_url_query(provider_url, &client_query)
-+        }
-+        "append" | "shift" | "archive" | "timeshift" | "default" => {
-+            merge_url_query(provider_url, &client_query)
-+        }
-+        _ => merge_url_query(provider_url, &client_query),
-+    }
-+}
-+
-+/// Unix start time for EPG during archive playback (Flussonic path or `utc` query).
-+pub fn m3u_archive_epg_reference_ts(stream_url: &str) -> Option<i64> {
-+    let Ok(parsed) = url::Url::parse(stream_url) else {
-+        return None;
-+    };
-+    let path = parsed.path();
-+    if let Some(rest) = path.split("/archive-").nth(1) {
-+        if let Some(start) = rest.split('-').next() {
-+            if let Ok(ts) = start.parse::<i64>() {
-+                return Some(ts);
-+            }
-+        }
-+    }
-+    if let Some(rest) = path.split("/timeshift_abs-").nth(1) {
-+        let start = rest.trim_end_matches(".ts").trim_end_matches(".m3u8");
-+        if let Ok(ts) = start.parse::<i64>() {
-+            return Some(ts);
-+        }
-+    }
-+    let query = parsed.query().unwrap_or("");
-+    if query.is_empty() {
-+        return None;
-+    }
-+    parse_m3u_archive_playback_times(query)
-+        .start_unix()
-+        .and_then(|s| s.parse::<i64>().ok())
-+}
-+
-+/// Alias used by m3u_api session discriminator.
-+pub fn archive_epg_reference_from_query(client_query: &str) -> Option<i64> {
-+    m3u_archive_epg_reference_from_query(client_query)
-+}
-+
-+pub fn m3u_archive_epg_reference_from_query(client_query: &str) -> Option<i64> {
-+    let q = normalize_m3u_archive_client_query(client_query);
-+    if q.is_empty() {
-+        return None;
-+    }
-+    parse_m3u_archive_playback_times(&q)
-+        .start_unix()
-+        .and_then(|s| s.parse::<i64>().ok())
 +}
 +
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use shared::model::{LiveStreamProperties, PlaylistItemType};
-+    use shared::utils::Internable;
 +
 +    #[test]
-+    fn archive_playback_query_detects_utc_lutc() {
-+        assert!(is_m3u_archive_playback_query(Some("utc=1&lutc=2")));
-+        assert!(!is_m3u_archive_playback_query(Some("token=abc")));
-+    }
-+
-+    #[test]
-+    fn flussonic_hls_archive_url() {
-+        let mut attrs = BTreeMap::new();
-+        attrs.insert("catchup-type".to_string(), "flussonic".to_string());
-+        let url = build_m3u_archive_provider_url(
-+            "http://cdn.example/live/ch.m3u8",
-+            "utc=1700000000&lutc=1700003600",
-+            &attrs,
++    fn parses_archive_hls_file() {
++        let archive = parse_flussonic_archive_file("archive-1700000000-3600.m3u8").unwrap();
++        assert_eq!(
++            archive,
++            FlussonicArchiveKind::ArchiveHls {
++                start: "1700000000".into(),
++                duration: "3600".into(),
++            }
 +        );
-+        assert!(url.contains("/archive-1700000000-3600.m3u8"));
++        assert_eq!(archive.epg_reference_ts(), Some(1_700_000_000));
 +    }
 +
 +    #[test]
-+    fn catchup_attrs_from_flussonic_item() {
-+        let item = M3uPlaylistItem {
-+            virtual_id: 1,
-+            provider_id: "p".intern(),
-+            name: "ch".intern(),
-+            chno: 0,
-+            logo: "".intern(),
-+            logo_small: "".intern(),
-+            group: "TV".intern(),
-+            title: "Channel".intern(),
-+            parent_code: "".intern(),
-+            audio_track: "".intern(),
-+            time_shift: "".intern(),
-+            rec: "".intern(),
-+            url: "http://example/live/1.m3u8".intern(),
-+            epg_channel_id: None,
-+            input_name: "in".intern(),
-+            item_type: PlaylistItemType::Live,
-+            t_stream_url: "".intern(),
-+            t_resource_url: None,
-+            t_catchup_source: None,
-+            t_catchup_mode: None,
-+            source_ordinal: 0,
-+            additional_properties: Some(StreamProperties::Live(Box::new(LiveStreamProperties {
-+                catchup: Some(CatchupProperties {
-+                    catchup_type: Some("flussonic".intern()),
-+                    days: Some("3".intern()),
-+                    ..CatchupProperties::default()
-+                }),
-+                ..LiveStreamProperties::default()
-+            }))),
-+            input_stream_id: "".intern(),
++    fn builds_provider_archive_url() {
++        let archive = FlussonicArchiveKind::ArchiveHls {
++            start: "1700000000".into(),
++            duration: "3600".into(),
 +        };
-+        let attrs = catchup_attrs_from_item(&item);
-+        assert_eq!(attrs.get("catchup-type").map(String::as_str), Some("flussonic"));
-+        assert!(attrs.get("catchup-source").is_some());
++        let url = build_provider_flussonic_archive_url(
++            "http://cdn.example/ch/index.m3u8?token=abc",
++            &archive,
++        )
++        .unwrap();
++        assert_eq!(url, "http://cdn.example/ch/archive-1700000000-3600.m3u8?token=abc");
++    }
++
++    #[test]
++    fn live_files_detected() {
++        assert!(is_flussonic_live_file("index.m3u8"));
++        assert!(is_flussonic_live_file("mpegts"));
++        assert!(!is_flussonic_live_file("archive-1-2.m3u8"));
++    }
++
++    #[test]
++    fn archive_from_utc_lutc_query() {
++        let archive = flussonic_archive_from_utc_lutc_query("utc=1700000000&lutc=1700003600").unwrap();
++        assert_eq!(
++            archive,
++            FlussonicArchiveKind::ArchiveHls {
++                start: "1700000000".into(),
++                duration: "3600".into(),
++            }
++        );
 +    }
 +}
 diff --git a/backend/src/utils/m3u_catchup.rs b/backend/src/utils/m3u_catchup.rs
-index c766443..ceba1b4 100644
 --- a/backend/src/utils/m3u_catchup.rs
 +++ b/backend/src/utils/m3u_catchup.rs
-@@ -13,6 +13,7 @@ const COLLECTOR_PREFIX: &str = "v";
- const SIPTV_APPEND_TEMPLATE: &str = "?utc={utc}&lutc={lutc}";
+@@ -10,9 +10,10 @@
+ pub const M3U_CATCHUP_ROUTE_PREFIX: &str = "m3u-catchup";
+ pub const M3U_CATCHUP_MARKER: &str = "tuliprox-catchup";
+ const COLLECTOR_PREFIX: &str = "v";
+-const SIPTV_APPEND_TEMPLATE: &str = "?utc={utc}&lutc={lutc}";
++const M3U_APPEND_TEMPLATE: &str = "?utc={utc}&lutc={lutc}";
++const M3U_CATCHUP_PARAM_UTC: &str = "utc";
++const M3U_CATCHUP_PARAM_LUTC: &str = "lutc";
  const XC_START_TEMPLATE: &str = "{Y}-{m}-{d}:{H}-{M}-{S}";
- const FLUSSONIC_TEMPLATE: &str = "timeshift_abs-{utc}";
-+const FLUSSONIC_HLS_ARCHIVE_TEMPLATE: &str = "archive-{utc}-{duration}";
+-const FLUSSONIC_TEMPLATE: &str = "timeshift_abs-{utc}";
  
  #[derive(Debug, Clone, PartialEq, Eq)]
  pub struct M3uCatchupRewrite {
-@@ -32,6 +33,30 @@ enum TemplateSegment {
-     Placeholder(String),
- }
- 
-+fn is_flussonic_mode(mode: &str) -> bool {
-+    matches!(
-+        mode.trim().to_ascii_lowercase().as_str(),
-+        "flussonic" | "flussonic-hls" | "flussonic-ts" | "fs"
-+    )
-+}
-+
-+fn is_flussonic_catchup(catchup: &CatchupProperties) -> bool {
-+    catchup
-+        .catchup_type
-+        .as_deref()
-+        .is_some_and(is_flussonic_mode)
-+        || catchup.mode.as_deref().is_some_and(is_flussonic_mode)
-+}
-+
-+fn effective_catchup_mode(catchup: &CatchupProperties) -> &str {
-+    if let Some(ct) = catchup.catchup_type.as_deref().filter(|v| !v.is_empty()) {
-+        if is_flussonic_mode(ct) {
-+            return ct;
-+        }
-+    }
-+    catchup.mode.as_deref().unwrap_or("")
-+}
-+
- fn mode_alias(mode: &str) -> &str {
-     if mode.eq_ignore_ascii_case("append") {
-         "append"
-@@ -41,8 +66,12 @@ fn mode_alias(mode: &str) -> &str {
+@@ -41,8 +42,14 @@
          "shift"
      } else if mode.eq_ignore_ascii_case("xc") {
          "xc"
 -    } else if mode.eq_ignore_ascii_case("fs") {
 -        "fs"
-+    } else if mode.eq_ignore_ascii_case("fs") || mode.eq_ignore_ascii_case("flussonic") {
-+        "flussonic"
-+    } else if mode.eq_ignore_ascii_case("flussonic-hls") {
++    } else if mode.eq_ignore_ascii_case("fs")
++        || mode.eq_ignore_ascii_case("flussonic")
++        || mode.eq_ignore_ascii_case("flussonic-hls")
++    {
++        // Token rewrite is skipped for flussonic; alias kept for derived templates / tests.
 +        "flussonic"
 +    } else if mode.eq_ignore_ascii_case("flussonic-ts") {
 +        "flussonic-ts"
      } else if mode.eq_ignore_ascii_case("vod") {
          "vod"
      } else {
-@@ -171,12 +200,20 @@ fn derive_xc_template(source_url: &str) -> Option<String> {
+@@ -136,9 +143,9 @@
+ 
+ fn append_siptv_template(source_url: &str) -> String {
+     if source_url.contains('?') {
+-        format!("&{}", SIPTV_APPEND_TEMPLATE.trim_start_matches('?'))
++        format!("&{}", M3U_APPEND_TEMPLATE.trim_start_matches('?'))
+     } else {
+-        SIPTV_APPEND_TEMPLATE.to_string()
++        M3U_APPEND_TEMPLATE.to_string()
+     }
  }
  
- fn derive_flussonic_template(source_url: &str) -> Option<String> {
-+    derive_flussonic_path_template(source_url, FLUSSONIC_TEMPLATE)
-+}
-+
-+fn derive_flussonic_hls_archive_template(source_url: &str) -> Option<String> {
-+    derive_flussonic_path_template(source_url, FLUSSONIC_HLS_ARCHIVE_TEMPLATE)
-+}
-+
-+fn derive_flussonic_path_template(source_url: &str, stem_template: &str) -> Option<String> {
-     let mut parsed = Url::parse(source_url).ok()?;
-     let mut segments = parsed
-         .path_segments()
-         .map(|it| it.map(ToString::to_string).collect::<Vec<_>>())?;
-     let file_name = segments.pop()?;
+@@ -170,17 +177,6 @@
+     Some(rebuilt.into())
+ }
+ 
+-fn derive_flussonic_template(source_url: &str) -> Option<String> {
+-    let mut parsed = Url::parse(source_url).ok()?;
+-    let mut segments = parsed
+-        .path_segments()
+-        .map(|it| it.map(ToString::to_string).collect::<Vec<_>>())?;
+-    let file_name = segments.pop()?;
 -    segments.push(format!("{FLUSSONIC_TEMPLATE}{}", extract_suffix_from_filename(&file_name)));
-+    segments.push(format!("{stem_template}{}", extract_suffix_from_filename(&file_name)));
-     parsed.set_path(&format!("/{}", segments.join("/")));
+-    parsed.set_path(&format!("/{}", segments.join("/")));
+-    Some(parsed.into())
+-}
+-
+ fn append_query_template(source_url: &str, source_template: &str) -> Option<String> {
+     let mut parsed = Url::parse(source_url).ok()?;
+     let append = source_template.strip_prefix('?').unwrap_or(source_template);
+@@ -193,19 +189,19 @@
      Some(parsed.into())
  }
-@@ -205,7 +242,7 @@ fn is_append_like_query_source(mode: &str, source: &str) -> bool {
+ 
+-fn extract_suffix_from_filename(file_name: &str) -> &str {
+-    file_name
+-        .char_indices()
+-        .find_map(|(idx, ch)| (ch == '.').then_some(&file_name[idx..]))
+-        .unwrap_or_default()
+-}
+-
+ fn is_append_like_query_source(mode: &str, source: &str) -> bool {
+     mode_alias(mode) == "append" || source.starts_with('?')
  }
  
++fn effective_catchup_mode(catchup: &CatchupProperties) -> &str {
++    if let Some(mode) = catchup.flussonic_player_mode() {
++        return mode;
++    }
++    catchup.mode.as_deref().unwrap_or("")
++}
++
  fn derived_template_for_mode<'a>(source_url: &'a str, catchup: &'a CatchupProperties) -> Option<Cow<'a, str>> {
 -    let mode = catchup.mode.as_deref().unwrap_or_default();
 +    let mode = effective_catchup_mode(catchup);
      if let Some(source) = catchup.source.as_deref().filter(|source| !source.is_empty()) {
          return Some(if is_append_like_query_source(mode, source) {
              append_query_template(source_url, source).map(Cow::Owned)?
-@@ -217,7 +254,10 @@ fn derived_template_for_mode<'a>(source_url: &'a str, catchup: &'a CatchupProper
+@@ -217,31 +213,63 @@
      match mode_alias(mode) {
          "shift" => Some(Cow::Owned(format!("{source_url}{}", append_siptv_template(source_url)))),
          "xc" => derive_xc_template(source_url).map(Cow::Owned),
 -        "fs" => derive_flussonic_template(source_url).map(Cow::Owned),
-+        "flussonic" | "fs" => derive_flussonic_hls_archive_template(source_url)
-+            .or_else(|| derive_flussonic_template(source_url))
-+            .map(Cow::Owned),
-+        "flussonic-ts" => derive_flussonic_template(source_url).map(Cow::Owned),
++        // Flussonic is served via path rewrite on the live proxy URL — no token template.
++        "flussonic" | "flussonic-ts" | "fs" => None,
          "vod" => Some(Cow::Borrowed("{catchup-id}")),
          _ => None,
      }
-@@ -280,6 +320,12 @@ pub fn build_m3u_catchup_rewrite(
+ }
+ 
+-fn resolve_collectors(raw_query: Option<&str>) -> Result<Vec<(usize, String)>, TuliproxError> {
+-    let mut collectors = Vec::new();
++fn resolve_collectors(raw_query: Option<&str>, placeholders: &[&str]) -> Vec<(usize, String)> {
++    let mut collectors: Vec<Option<String>> = vec![None; placeholders.len()];
+     let Some(raw_query) = raw_query else {
+-        return Ok(collectors);
++        return into_collectors(collectors);
+     };
+ 
+-    for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+-        if key == M3U_CATCHUP_MARKER {
+-            continue;
++    let params: Vec<(String, String)> = url::form_urlencoded::parse(raw_query.as_bytes())
++        .filter(|(key, _)| key != M3U_CATCHUP_MARKER)
++        .map(|(k, v)| (k.into_owned(), v.into_owned()))
++        .collect();
++
++    // First pass: named mapping for native SIPTV/shift placeholders.
++    // Smart IPTV strips the proxy marker and indexed `v0`/`v1` keys, leaving
++    // only `utc`/`lutc` in the request. Map those by placeholder name so the
++    // upstream URL still gets the correct values.
++    for (idx, placeholder) in placeholders.iter().enumerate() {
++        let name = placeholder_name(placeholder);
++        if let Some((_, value)) = params.iter().find(|(key, _)| key == name) {
++            collectors[idx] = Some(value.clone());
+         }
++    }
++
++    // Second pass: indexed `v0`/`v1` collectors where named pass left a hole.
++    for (key, value) in &params {
+         let Some(idx) = key
+             .strip_prefix(COLLECTOR_PREFIX)
+-            .and_then(|suffix| suffix.parse::<usize>().ok()) else {
+-            return Err(TuliproxError::Crypto(format!("Unsupported catchup query parameter '{key}'")));
++            .and_then(|suffix| suffix.parse::<usize>().ok())
++        else {
++            continue;
+         };
+-        collectors.push((idx, value.into_owned()));
+-    }
+-    collectors.sort_by_key(|(idx, _)| *idx);
+-    Ok(collectors)
++        if idx < collectors.len() && collectors[idx].is_none() {
++            collectors[idx] = Some(value.clone());
++        }
++    }
++
++    into_collectors(collectors)
++}
++
++fn into_collectors(collectors: Vec<Option<String>>) -> Vec<(usize, String)> {
++    collectors
++        .into_iter()
++        .enumerate()
++        .filter_map(|(idx, val)| val.map(|v| (idx, v)))
++        .collect()
++}
++
++fn placeholder_name(placeholder: &str) -> &str {
++    let trimmed = placeholder.strip_prefix("${").unwrap_or(placeholder);
++    let trimmed = trimmed.strip_prefix('{').unwrap_or(trimmed);
++    trimmed.strip_suffix('}').unwrap_or(trimmed)
+ }
+ 
+ fn render_template(segments: &[TemplateSegment], collectors: &[(usize, String)]) -> Result<String, TuliproxError> {
+@@ -280,6 +308,11 @@
      source_url: &str,
      catchup: &CatchupProperties,
  ) -> Result<Option<M3uCatchupRewrite>, TuliproxError> {
-+    // TiviMate flussonic: player appends ?utc=&lutc= to the live proxy URL; skip token rewrite.
-+    if is_flussonic_catchup(catchup)
-+        && catchup.source.as_deref().filter(|source| !source.is_empty()).is_none()
-+    {
++    // TiviMate flussonic: player rewrites `.../{id}/index.m3u8` → `.../{id}/archive-{utc}-{duration}.m3u8`.
++    // Do not emit catchup-source / m3u-catchup token routes for these channels.
++    if catchup.is_flussonic() {
 +        return Ok(None);
 +    }
      let Some(template) = derived_template_for_mode(source_url, catchup) else {
          return Ok(None);
      };
-diff --git a/backend/src/utils/mod.rs b/backend/src/utils/mod.rs
-index 1560efa..197b84d 100644
---- a/backend/src/utils/mod.rs
-+++ b/backend/src/utils/mod.rs
-@@ -10,6 +10,7 @@ mod json_utils;
- mod provider_resolve_token;
- mod m3u_catchup;
- mod m3u_catchup_token;
-+mod m3u_archive;
- mod binary_utils;
- mod telegram;
- pub(crate) mod geoip;
-@@ -88,6 +89,7 @@ pub use self::json_utils::*;
- pub use self::network::*;
- pub use self::m3u_catchup::*;
- pub use self::m3u_catchup_token::*;
-+pub use self::m3u_archive::*;
- pub use self::provider_resolve_token::*;
- pub use self::step_measure::*;
- pub use self::sys_utils::*;
-diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
-index da37655..a2a059a 100644
---- a/shared/src/model/playlist.rs
-+++ b/shared/src/model/playlist.rs
-@@ -595,21 +595,38 @@ fn append_m3u_catchup_attributes(
-     rewritten_mode: Option<&Arc<str>>,
-     rewritten_source: Option<&Arc<str>>,
- ) {
-+    let mut export_catchup = catchup.clone();
-+    let is_flussonic = export_catchup
-+        .catchup_type
-+        .as_deref()
-+        .is_some_and(|t| matches!(t.to_ascii_lowercase().as_str(), "flussonic" | "flussonic-hls" | "flussonic-ts" | "fs"))
-+        || export_catchup
-+            .mode
-+            .as_deref()
-+            .is_some_and(|t| matches!(t.to_ascii_lowercase().as_str(), "flussonic" | "flussonic-hls" | "flussonic-ts" | "fs"));
-+    if is_flussonic {
-+        export_catchup.catchup_type.get_or_insert_with(|| "flussonic".intern());
-+        if export_catchup.source.as_ref().is_none_or(|s| s.is_empty()) {
-+            export_catchup.source = Some("?utc={utc}&lutc={lutc}".intern());
-+        }
-+    }
-     if let Some(mode) = rewritten_mode.filter(|mode| !mode.is_empty()) {
-         write_m3u_attr(line, "catchup", mode.as_ref());
-+    } else if is_flussonic {
-+        write_m3u_attr(line, "catchup", "flussonic");
-     } else {
--        append_catchup_attribute(line, "catchup", catchup.mode.as_ref());
-+        append_catchup_attribute(line, "catchup", export_catchup.mode.as_ref());
-     }
--    append_catchup_attribute(line, "catchup-days", catchup.days.as_ref());
-+    append_catchup_attribute(line, "catchup-days", export_catchup.days.as_ref());
-     if let Some(source) = rewritten_source.filter(|source| !source.is_empty()) {
-         write_m3u_attr(line, "catchup-source", source.as_ref());
-     } else {
--        append_catchup_attribute(line, "catchup-source", catchup.source.as_ref());
-+        append_catchup_attribute(line, "catchup-source", export_catchup.source.as_ref());
-     }
--    append_catchup_attribute(line, "catchup-time", catchup.time.as_ref());
--    append_catchup_attribute(line, "catchup-correction", catchup.correction.as_ref());
--    append_catchup_attribute(line, "catchup-type", catchup.catchup_type.as_ref());
--    append_extra_catchup_attributes(line, &catchup.extra_attributes);
-+    append_catchup_attribute(line, "catchup-time", export_catchup.time.as_ref());
-+    append_catchup_attribute(line, "catchup-correction", export_catchup.correction.as_ref());
-+    append_catchup_attribute(line, "catchup-type", export_catchup.catchup_type.as_ref());
-+    append_extra_catchup_attributes(line, &export_catchup.extra_attributes);
+@@ -306,7 +339,9 @@
+ 
+ pub fn has_m3u_catchup_marker(raw_query: Option<&str>) -> bool {
+     raw_query.is_some_and(|query| {
+-        url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == M3U_CATCHUP_MARKER)
++        url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| {
++            key == M3U_CATCHUP_MARKER || key == M3U_CATCHUP_PARAM_UTC || key == M3U_CATCHUP_PARAM_LUTC
++        })
+     })
  }
  
- impl M3uPlaylistItem {
+@@ -320,7 +355,7 @@
+     };
+     let segments = parse_template(template.as_ref());
+     let placeholders = collect_placeholders(&segments);
+-    let collectors = resolve_collectors(raw_query)?;
++    let collectors = resolve_collectors(raw_query, &placeholders);
+     if collectors.len() != placeholders.len() {
+         return Err(TuliproxError::Crypto(format!(
+             "Catchup collector mismatch: expected {}, got {}",
+@@ -332,8 +367,8 @@
+     let url = render_template(&segments, &collectors)?;
+     let mut discriminator = url::form_urlencoded::Serializer::new(String::new());
+     discriminator.append_pair("mode", catchup.mode.as_deref().unwrap_or("default"));
+-    for (idx, value) in collectors {
+-        discriminator.append_pair(&format!("{COLLECTOR_PREFIX}{idx}"), &value);
++    for (idx, value) in &collectors {
++        discriminator.append_pair(&format!("{COLLECTOR_PREFIX}{idx}"), value);
+     }
+     let discriminator = short_hash(&discriminator.finish());
+     Ok(Some(ResolvedM3uCatchup { url, discriminator }))
+@@ -529,4 +564,90 @@
+         assert!(!has_m3u_catchup_marker(Some("v0=1")));
+         assert!(!has_m3u_catchup_marker(None));
+     }
+-}
++
++    #[test]
++    fn siptv_style_catchup_request_is_detected() {
++        // Smart IPTV keeps `utc`/`lutc` and strips the proxy marker.
++        assert!(has_m3u_catchup_marker(Some("utc=1784869500&lutc=1784877418")));
++        assert!(has_m3u_catchup_marker(Some("lutc=1784877418")));
++        assert!(!has_m3u_catchup_marker(Some("foo=1")));
++    }
++
++    #[test]
++    fn resolve_shift_template_from_siptv_native_collectors() {
++        // Smart IPTV strips `tuliprox-catchup`/`v0`/`v1` and forwards only `utc`/`lutc`.
++        let resolved = resolve_m3u_catchup_url(
++            "http://provider.example/live/42.ts",
++            &CatchupProperties {
++                mode: Some("shift".intern()),
++                ..CatchupProperties::default()
++            },
++            Some("utc=20240101120000&lutc=20240101130000"),
++        )
++        .unwrap()
++        .unwrap();
++
++        assert_eq!(
++            resolved.url,
++            "http://provider.example/live/42.ts?utc=20240101120000&lutc=20240101130000"
++        );
++    }
++
++    #[test]
++    fn resolve_append_template_keeps_indexed_collectors() {
++        let resolved = resolve_m3u_catchup_url(
++            "http://provider.example/live/42.m3u8",
++            &CatchupProperties {
++                mode: Some("append".intern()),
++                source: Some("?offset=-${offset}&utcstart=${timestamp}".intern()),
++                ..CatchupProperties::default()
++            },
++            Some("v0=120&v1=1717200000"),
++        )
++        .unwrap()
++        .unwrap();
++
++        assert_eq!(
++            resolved.url,
++            "http://provider.example/live/42.m3u8?offset=-120&utcstart=1717200000"
++        );
++    }
++
++    #[test]
++    fn resolve_collectors_mix_named_and_indexed() {
++        let resolved = resolve_m3u_catchup_url(
++            "http://provider.example/live/42.ts",
++            &CatchupProperties {
++                mode: Some("shift".intern()),
++                ..CatchupProperties::default()
++            },
++            Some("utc=20240101120000&v1=20240101130000"),
++        )
++        .unwrap()
++        .unwrap();
++
++        assert_eq!(
++            resolved.url,
++            "http://provider.example/live/42.ts?utc=20240101120000&lutc=20240101130000"
++        );
++    }
++
++    #[test]
++    fn flussonic_rewrite_is_skipped_for_path_based_players() {
++        let rewrite = build_m3u_catchup_rewrite(
++            &[7u8; 16],
++            "http://proxy.example",
++            "alice",
++            7,
++            42,
++            "http://provider.example/ch/index.m3u8",
++            &CatchupProperties {
++                mode: Some("flussonic".intern()),
++                days: Some("3".intern()),
++                ..CatchupProperties::default()
++            },
++        )
++        .unwrap();
++        assert!(rewrite.is_none());
++    }
++}
+diff --git a/backend/src/utils/mod.rs b/backend/src/utils/mod.rs
+--- a/backend/src/utils/mod.rs
++++ b/backend/src/utils/mod.rs
+@@ -8,6 +8,7 @@
+ mod trakt;
+ mod json_utils;
+ mod provider_resolve_token;
++mod m3u_archive;
+ mod m3u_catchup;
+ mod m3u_catchup_token;
+ mod binary_utils;
+@@ -86,6 +87,7 @@
+ pub use self::file::*;
+ pub use self::json_utils::*;
+ pub use self::network::*;
++pub use self::m3u_archive::*;
+ pub use self::m3u_catchup::*;
+ pub use self::m3u_catchup_token::*;
+ pub use self::provider_resolve_token::*;
+diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
+--- a/backend/src/api/endpoints/m3u_api.rs
++++ b/backend/src/api/endpoints/m3u_api.rs
+@@ -22,7 +22,11 @@
+     auth::{check_network_access_only, resolve_api_user_context, ApiUserAuthError, Fingerprint},
+     model::{ConfigTarget, ProxyUserCredentials},
+     repository::{m3u_get_item_for_stream_id, m3u_load_rewrite_playlist, storage_const},
+-    utils::{debug_if_enabled, decode_m3u_catchup_token, has_m3u_catchup_marker, resolve_m3u_catchup_url, M3uCatchupToken, PROVIDER_SCHEME_PREFIX},
++    utils::{
++        build_provider_flussonic_archive_url, debug_if_enabled, decode_m3u_catchup_token,
++        flussonic_archive_from_utc_lutc_query, has_m3u_catchup_marker, is_flussonic_live_file,
++        parse_flussonic_archive_file, resolve_m3u_catchup_url, M3uCatchupToken, PROVIDER_SCHEME_PREFIX,
++    },
+ };
+ use axum::response::IntoResponse;
+ use bytes::Bytes;
+@@ -34,7 +38,7 @@
+         ConnectFailureReason, FieldGetAccessor, PlaylistEntry, PlaylistItemType, TargetType, UserConnectionPermission,
+         XtreamCluster,
+     },
+-    utils::{concat_path, extract_extension_from_url, sanitize_sensitive_info},
++    utils::{concat_path, extract_extension_from_url, sanitize_sensitive_info, Internable},
+     defaults::{HLS_EXT}
+ };
+ use std::borrow::Cow;
+@@ -405,7 +409,10 @@
+     };
+ 
+     if let Some(response) = redirect_response(app_state, &redirect_params).await {
+-        return response.into_response();
++        // Archive/catchup must keep the resolved provider archive URL — do not redirect to live.
++        if archive_discriminator.is_none() && pli.item_type != PlaylistItemType::Catchup {
++            return response.into_response();
++        }
+     }
+ 
+     let is_session_request = is_session_based_playback(pli.item_type, Some(extension));
+@@ -479,26 +486,138 @@
+     input.resolve_url(&item.url)
+ }
+ 
++fn playlist_item_catchup(pli: &shared::model::M3uPlaylistItem) -> Option<&shared::model::CatchupProperties> {
++    match pli.additional_properties.as_ref()? {
++        shared::model::StreamProperties::Live(live) => live.catchup.as_ref(),
++        _ => None,
++    }
++}
++
++fn playlist_item_is_flussonic(pli: &shared::model::M3uPlaylistItem) -> bool {
++    playlist_item_catchup(pli).is_some_and(shared::model::CatchupProperties::is_flussonic)
++}
++
++/// Apply a resolved Flussonic archive to a playlist item for playback.
++fn apply_flussonic_archive(
++    pli: &shared::model::M3uPlaylistItem,
++    input: &crate::model::ConfigInput,
++    archive: &crate::utils::FlussonicArchiveKind,
++) -> Result<(shared::model::M3uPlaylistItem, String), TuliproxError> {
++    let source_url = resolve_effective_source_url(pli, input)?;
++    let Some(archive_url) = build_provider_flussonic_archive_url(source_url.as_ref(), archive) else {
++        return Err(TuliproxError::RepositoryM3u(
++            "Failed to build Flussonic archive URL".to_string(),
++        ));
++    };
++    let mut catchup_item = pli.clone();
++    catchup_item.item_type = PlaylistItemType::Catchup;
++    catchup_item.url = archive_url.intern();
++    Ok((catchup_item, archive.discriminator()))
++}
++
++/// Shift / append / xc / token catchup — never used for Flussonic channels.
++fn resolve_shift_style_m3u_catchup(
++    pli: &shared::model::M3uPlaylistItem,
++    input: &crate::model::ConfigInput,
++    raw_query: Option<&str>,
++) -> Result<(shared::model::M3uPlaylistItem, String), TuliproxError> {
++    let Some(catchup) = playlist_item_catchup(pli) else {
++        return Err(TuliproxError::RepositoryM3u("M3U catchup metadata missing".to_string()));
++    };
++    if catchup.is_flussonic() {
++        return Err(TuliproxError::RepositoryM3u(
++            "Flussonic catchup must use path rewrite, not shift collectors".to_string(),
++        ));
++    }
++    let source_url = resolve_effective_source_url(pli, input)?;
++    let Some(resolved) = resolve_m3u_catchup_url(source_url.as_ref(), catchup, raw_query)? else {
++        return Err(TuliproxError::RepositoryM3u("M3U catchup mode cannot be proxied".to_string()));
++    };
++    let mut catchup_item = pli.clone();
++    catchup_item.item_type = PlaylistItemType::Catchup;
++    catchup_item.url = resolved.url.into();
++    Ok((catchup_item, resolved.discriminator))
++}
++
++/// Flat URL dispatch (`.../{id}.m3u8`):
++/// - Flussonic → only `?utc=&lutc=` → provider archive path (no shift templates)
++/// - Shift/append → marker / `utc`/`lutc` / `v0`… → template collectors
++fn resolve_flat_m3u_catchup_if_needed(
++    pli: shared::model::M3uPlaylistItem,
++    input: &crate::model::ConfigInput,
++    raw_query: Option<&str>,
++) -> Result<(shared::model::M3uPlaylistItem, Option<String>), TuliproxError> {
++    if playlist_item_is_flussonic(&pli) {
++        if let Some(query) = raw_query.filter(|q| !q.is_empty()) {
++            if let Some(archive) = flussonic_archive_from_utc_lutc_query(query) {
++                let (item, disc) = apply_flussonic_archive(&pli, input, &archive)?;
++                return Ok((item, Some(disc)));
++            }
++        }
++        // Flussonic live (or unrelated query) — do not enter shift resolver.
++        return Ok((pli, None));
++    }
++
++    if has_m3u_catchup_marker(raw_query) {
++        let (item, disc) = resolve_shift_style_m3u_catchup(&pli, input, raw_query)?;
++        return Ok((item, Some(disc)));
++    }
++    Ok((pli, None))
++}
++
++/// Nested URL dispatch (`.../{id}/{file}`):
++/// - `archive-*` / `timeshift_*` → Flussonic only
++/// - live file + `?utc=&lutc=` → Flussonic archive
++/// - live file otherwise → live
++/// Shift channels never use this URL shape.
++fn resolve_nested_m3u_playback<'a>(
++    pli: shared::model::M3uPlaylistItem,
++    input: &crate::model::ConfigInput,
++    file: &'a str,
++    raw_query: Option<&str>,
++) -> Result<(shared::model::M3uPlaylistItem, Option<String>, Option<&'a str>), TuliproxError> {
++    let stream_ext = extract_extension_from_url(file);
++
++    if let Some(archive) = parse_flussonic_archive_file(file) {
++        if !playlist_item_is_flussonic(&pli) {
++            return Err(TuliproxError::RepositoryM3u(
++                "Flussonic archive path is only valid for flussonic catchup channels".to_string(),
++            ));
++        }
++        let (item, disc) = apply_flussonic_archive(&pli, input, &archive)?;
++        return Ok((item, Some(disc), stream_ext.or(Some(HLS_EXT))));
++    }
++
++    if is_flussonic_live_file(file) {
++        if playlist_item_is_flussonic(&pli) {
++            if let Some(query) = raw_query.filter(|q| !q.is_empty()) {
++                if let Some(archive) = flussonic_archive_from_utc_lutc_query(query) {
++                    let (item, disc) = apply_flussonic_archive(&pli, input, &archive)?;
++                    return Ok((item, Some(disc), stream_ext.or(Some(HLS_EXT))));
++                }
++            }
++        }
++        // Live playback (flussonic index.m3u8 or accidental nested hit).
++        return Ok((pli, None, stream_ext));
++    }
++
++    Err(TuliproxError::RepositoryM3u(format!(
++        "Unsupported nested M3U stream file: {file}"
++    )))
++}
++
+ fn resolve_loaded_m3u_catchup(
+     pli: &shared::model::M3uPlaylistItem,
+     input: &crate::model::ConfigInput,
+     raw_query: Option<&str>,
+ ) -> Result<(shared::model::M3uPlaylistItem, String), TuliproxError> {
+-    let Some(shared::model::StreamProperties::Live(live)) = pli.additional_properties.as_ref() else {
+-        return Err(TuliproxError::RepositoryM3u("M3U catchup requested for non-live stream".to_string()));
+-    };
+-    let Some(catchup) = live.catchup.as_ref() else {
+-        return Err(TuliproxError::RepositoryM3u("M3U catchup metadata missing".to_string()));
+-    };
+-    let source_url = resolve_effective_source_url(pli, input)?;
+-    let Some(resolved) = resolve_m3u_catchup_url(source_url.as_ref(), catchup, raw_query)? else {
+-        return Err(TuliproxError::RepositoryM3u("M3U catchup mode cannot be proxied".to_string()));
+-    };
+-
+-    let mut catchup_item = pli.clone();
+-    catchup_item.item_type = PlaylistItemType::Catchup;
+-    catchup_item.url = resolved.url.into();
+-    Ok((catchup_item, resolved.discriminator))
++    // Used by /m3u-catchup/{token} — always shift-style collectors, never Flussonic path mode.
++    if playlist_item_is_flussonic(pli) {
++        return Err(TuliproxError::RepositoryM3u(
++            "Flussonic channels do not use m3u-catchup tokens".to_string(),
++        ));
++    }
++    resolve_shift_style_m3u_catchup(pli, input, raw_query)
+ }
+ 
+ fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, item_type: PlaylistItemType) -> bool {
+@@ -546,17 +665,76 @@
+         true,
+         format!("Can't find input {} for target {target_name}, stream_id {}", pli.input_name, pli.virtual_id)
+     );
+-    let (resolved_pli, archive_discriminator) = if has_m3u_catchup_marker(raw_query) {
+-        match resolve_loaded_m3u_catchup(&pli, &input, raw_query) {
+-            Ok((item, discriminator)) => (item, Some(discriminator)),
++    let (resolved_pli, archive_discriminator) = match resolve_flat_m3u_catchup_if_needed(pli, &input, raw_query) {
++        Ok(result) => result,
++        Err(err) => {
++            debug!("Failed to resolve M3U catchup request: {}", sanitize_sensitive_info(&err.to_string()));
++            return axum::http::StatusCode::BAD_REQUEST.into_response();
++        }
++    };
++    m3u_api_stream_loaded(
++        user,
++        target,
++        fingerprint,
++        req_headers,
++        app_state,
++        resolved_pli,
++        input,
++        stream_ext,
++        archive_discriminator.as_deref(),
++    )
++    .await
++    .into_response()
++}
++
++/// Nested Flussonic-compatible path: `/m3u-stream/{user}/{pass}/{id}/{file}`
++/// where `file` is `index.m3u8` (live) or `archive-{utc}-{duration}.m3u8` (TiviMate catchup).
++#[allow(clippy::too_many_lines)]
++async fn m3u_api_stream_nested(
++    user: Arc<ProxyUserCredentials>,
++    target: Arc<ConfigTarget>,
++    fingerprint: &Fingerprint,
++    req_headers: &axum::http::HeaderMap,
++    app_state: &Arc<AppState>,
++    stream_req: ApiStreamRequest<'_>,
++    file: &str,
++    raw_query: Option<&str>,
++) -> impl IntoResponse + Send {
++    let _user_guard = app_state.app_config.file_locks.write_lock_str(&user.username).await;
++
++    let target_name = &target.name;
++    if !target.has_output(TargetType::M3u) {
++        debug!("Target has no m3u playlist {target_name}");
++        return axum::http::StatusCode::BAD_REQUEST.into_response();
++    }
++
++    let req_virtual_id: u32 = try_result_bad_request!(stream_req.stream_id.trim().parse());
++    let pli = match m3u_get_item_for_stream_id(req_virtual_id, app_state, &target).await {
++        Ok(pli) => pli,
++        Err(err) => {
++            error!("Failed to read m3u item for stream id {req_virtual_id}: {err}");
++            return axum::http::StatusCode::NOT_FOUND.into_response();
++        }
++    };
++
++    let input = try_option_bad_request!(
++        app_state.app_config.get_input_by_name(&pli.input_name),
++        true,
++        format!("Can't find input {} for target {target_name}, stream_id {}", pli.input_name, pli.virtual_id)
++    );
++
++    let (resolved_pli, archive_discriminator, stream_ext) =
++        match resolve_nested_m3u_playback(pli, &input, file, raw_query) {
++            Ok(result) => result,
+             Err(err) => {
+-                debug!("Failed to resolve M3U catchup request: {}", sanitize_sensitive_info(&err.to_string()));
++                debug!(
++                    "Failed to resolve nested M3U stream: {}",
++                    sanitize_sensitive_info(&err.to_string())
++                );
+                 return axum::http::StatusCode::BAD_REQUEST.into_response();
+             }
+-        }
+-    } else {
+-        (pli, None)
+-    };
++        };
++
+     m3u_api_stream_loaded(
+         user,
+         target,
+@@ -746,17 +924,60 @@
+     };
+ }
+ 
++macro_rules! create_m3u_api_stream_nested {
++    ($fn_name:ident, $context:expr) => {
++        async fn $fn_name(
++            fingerprint: Fingerprint,
++            req_headers: axum::http::HeaderMap,
++            axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
++            axum::extract::Query(api_req): axum::extract::Query<UserApiRequest>,
++            axum::extract::Path((username, password, stream_id, file)): axum::extract::Path<(
++                String,
++                String,
++                String,
++                String,
++            )>,
++            axum::extract::State(app_state): axum::extract::State<Arc<AppState>>,
++        ) -> impl IntoResponse + Send {
++            let stream_req = ApiStreamRequest::from($context, &username, &password, &stream_id, "");
++            let auth_status = app_state.app_config.get_auth_error_status();
++            match m3u_api_stream_network_auth(&fingerprint, &app_state, &api_req, &stream_req) {
++                Ok((user, target)) => {
++                    m3u_api_stream_nested(
++                        user,
++                        target,
++                        &fingerprint,
++                        &req_headers,
++                        &app_state,
++                        stream_req,
++                        &file,
++                        raw_query.as_deref(),
++                    )
++                    .await
++                    .into_response()
++                }
++                Err(e) => e.into_player_response(auth_status),
++            }
++        }
++    };
++}
++
+ create_m3u_api_stream!(m3u_api_live_stream_alt, ApiStreamContext::LiveAlt);
+ create_m3u_api_stream!(m3u_api_live_stream, ApiStreamContext::Live);
+ create_m3u_api_stream!(m3u_api_series_stream, ApiStreamContext::Series);
+ create_m3u_api_stream!(m3u_api_movie_stream, ApiStreamContext::Movie);
+ 
++create_m3u_api_stream_nested!(m3u_api_live_stream_alt_nested, ApiStreamContext::LiveAlt);
++create_m3u_api_stream_nested!(m3u_api_live_stream_nested, ApiStreamContext::Live);
++create_m3u_api_stream_nested!(m3u_api_series_stream_nested, ApiStreamContext::Series);
++create_m3u_api_stream_nested!(m3u_api_movie_stream_nested, ApiStreamContext::Movie);
++
+ macro_rules! register_m3u_api_stream {
+-     ($router:expr, [$(($path:expr, $fn_name:ident)),*]) => {{
++     ($router:expr, [$(($path:expr, $fn_name:ident, $nested_fn:ident)),*]) => {{
+          $router
+        $(
++        .route(&format!("/{}/{{username}}/{{password}}/{{stream_id}}/{{file}}", $path), axum::routing::get($nested_fn))
+         .route(&format!("/{}/{{username}}/{{password}}/{{stream_id}}", $path), axum::routing::get($fn_name))
+-            // $cfg.service(web::resource(format!("/{M3U_STREAM_PATH}/{}/{{username}}/{{password}}/{{stream_id}}", $path)).route(web::get().to(m3u_api_stream)));
+         )*
+     }};
+ }
+@@ -766,7 +987,6 @@
+         $router
+         $(
+             .route(&format!("/{}", $path), axum::routing::get(m3u_api_get).post(m3u_api_post))
+-            // $cfg.service(web::resource(format!("/{}", $path)).route(web::get().to(m3u_api_get)).route(web::post().to(m3u_api_post)));
+         )*
+     }};
+ }
+@@ -778,10 +998,10 @@
+     router = register_m3u_api_stream!(
+         router,
+         [
+-            (storage_const::M3U_STREAM_PATH, m3u_api_live_stream_alt),
+-            (concat_path(storage_const::M3U_STREAM_PATH, "live"), m3u_api_live_stream),
+-            (concat_path(storage_const::M3U_STREAM_PATH, "movie"), m3u_api_movie_stream),
+-            (concat_path(storage_const::M3U_STREAM_PATH, "series"), m3u_api_series_stream)
++            (storage_const::M3U_STREAM_PATH, m3u_api_live_stream_alt, m3u_api_live_stream_alt_nested),
++            (concat_path(storage_const::M3U_STREAM_PATH, "live"), m3u_api_live_stream, m3u_api_live_stream_nested),
++            (concat_path(storage_const::M3U_STREAM_PATH, "movie"), m3u_api_movie_stream, m3u_api_movie_stream_nested),
++            (concat_path(storage_const::M3U_STREAM_PATH, "series"), m3u_api_series_stream, m3u_api_series_stream_nested)
+         ]
+     );
+ 
+diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
+--- a/backend/src/repository/m3u_playlist_iterator.rs
++++ b/backend/src/repository/m3u_playlist_iterator.rs
+@@ -5,7 +5,7 @@
+ use crate::repository::user_get_bouquet_filter;
+ use crate::repository::{ensure_target_storage_path, get_file_path_for_db_index};
+ use crate::repository::{open_playlist_reader, LockedReceiverStream};
+-use crate::utils::build_m3u_catchup_rewrite;
++use crate::utils::{build_m3u_catchup_rewrite, flussonic_proxy_live_file};
+ use futures::Stream;
+ use log::error;
+ use shared::create_bitset;
+@@ -163,14 +163,37 @@
+     };
+ 
+     if should_rewrite_urls {
+-        let stream_url = build_rewritten_url(
+-            ctx,
+-            effective_source_url.as_ref(),
+-            &m3u_pli,
+-            flags.contains(M3uPlaylistIteratorFlags::IncludeTypeInUrl),
+-            storage_const::M3U_STREAM_PATH,
+-            true,
+-        );
++        let flussonic_live_file = m3u_pli
++            .additional_properties
++            .as_ref()
++            .and_then(|props| match props {
++                StreamProperties::Live(live) => live.catchup.as_ref().and_then(|c| c.flussonic_player_mode()),
++                _ => None,
++            })
++            .map(flussonic_proxy_live_file);
++
++        let stream_url = if let Some(live_file) = flussonic_live_file {
++            // TiviMate flussonic rewrites the last segment:
++            //   .../{id}/index.m3u8 → .../{id}/archive-{utc}-{duration}.m3u8
++            let base = build_rewritten_url(
++                ctx,
++                effective_source_url.as_ref(),
++                &m3u_pli,
++                flags.contains(M3uPlaylistIteratorFlags::IncludeTypeInUrl),
++                storage_const::M3U_STREAM_PATH,
++                false,
++            );
++            shared::concat_string!(&base, "/", live_file)
++        } else {
++            build_rewritten_url(
++                ctx,
++                effective_source_url.as_ref(),
++                &m3u_pli,
++                flags.contains(M3uPlaylistIteratorFlags::IncludeTypeInUrl),
++                storage_const::M3U_STREAM_PATH,
++                true,
++            )
++        };
+         let resource_url = if flags.contains(M3uPlaylistIteratorFlags::RewriteResource) {
+             let source_url = if m3u_pli.logo.is_empty() { m3u_pli.logo_small.as_ref() } else { m3u_pli.logo.as_ref() };
+             Some(build_rewritten_url(
+diff --git a/shared/src/model/stream_properties.rs b/shared/src/model/stream_properties.rs
+--- a/shared/src/model/stream_properties.rs
++++ b/shared/src/model/stream_properties.rs
+@@ -46,6 +46,47 @@
+             && self.correction.is_none()
+             && self.catchup_type.is_none()
+             && self.extra_attributes.is_empty()
++    }
++
++    fn is_flussonic_mode_str(mode: Option<&str>) -> bool {
++        mode.is_some_and(|m| {
++            matches!(
++                m.trim().to_ascii_lowercase().as_str(),
++                "flussonic" | "flussonic-hls" | "flussonic-ts" | "fs"
++            )
++        })
++    }
++
++    /// True when catchup / catchup-type is a Flussonic family mode.
++    ///
++    /// Prefer `catchup-type` when both are set so a leftover `catchup="shift"` from a
++    /// provider cannot steal Flussonic path-rewrite channels (and vice versa).
++    pub fn is_flussonic(&self) -> bool {
++        if let Some(ct) = self.catchup_type.as_deref().filter(|v| !v.is_empty()) {
++            return Self::is_flussonic_mode_str(Some(ct));
++        }
++        Self::is_flussonic_mode_str(self.mode.as_deref())
++    }
++
++    /// Value for the M3U `catchup=` attribute that TiviMate understands for Flussonic.
++    ///
++    /// TiviMate rewrites the live URL path itself for these modes — do not emit
++    /// `catchup-source` or a duplicate `catchup-type`.
++    pub fn flussonic_player_mode(&self) -> Option<&'static str> {
++        if !self.is_flussonic() {
++            return None;
++        }
++        let raw = self
++            .catchup_type
++            .as_deref()
++            .filter(|v| !v.is_empty())
++            .or(self.mode.as_deref())
++            .unwrap_or("flussonic");
++        if raw.eq_ignore_ascii_case("flussonic-ts") {
++            Some("flussonic-ts")
++        } else {
++            Some("flussonic")
++        }
+     }
+ }
+ 
+@@ -1000,7 +1041,27 @@
+ mod tests {
+     use super::*;
+     use crate::model::{PlaylistItemType, XtreamCluster, XtreamPlaylistItem};
++    use crate::utils::Internable;
+     use serde_json::json;
++
++    #[test]
++    fn flussonic_mode_prefers_catchup_type_over_mode() {
++        let flussonic_wins = CatchupProperties {
++            mode: Some("shift".intern()),
++            catchup_type: Some("flussonic".intern()),
++            ..CatchupProperties::default()
++        };
++        assert!(flussonic_wins.is_flussonic());
++        assert_eq!(flussonic_wins.flussonic_player_mode(), Some("flussonic"));
++
++        let shift_wins = CatchupProperties {
++            mode: Some("flussonic".intern()),
++            catchup_type: Some("shift".intern()),
++            ..CatchupProperties::default()
++        };
++        assert!(!shift_wins.is_flussonic());
++        assert_eq!(shift_wins.flussonic_player_mode(), None);
++    }
+ 
+     fn sample_video_info(tmdb_id: &str) -> XtreamVideoInfo {
+         serde_json::from_value(json!({
+diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
+--- a/shared/src/model/playlist.rs
++++ b/shared/src/model/playlist.rs
+@@ -637,19 +637,43 @@
+         if self.chno != 0 {
+             let _ = write!(line, " tvg-chno=\"{}\"", self.chno);
+         }
+-        to_m3u_non_empty_fields!(self, line,
+-            (parent_code, "parent-code"),
+-            (audio_track, "audio-track"),
+-            (time_shift, "timeshift"),
+-            (rec, "tvg-rec"););
++        let flussonic_mode = self.additional_properties.as_ref().and_then(|props| match props {
++            StreamProperties::Live(live) => live.catchup.as_ref().and_then(CatchupProperties::flussonic_player_mode),
++            _ => None,
++        });
++        if flussonic_mode.is_some() {
++            // Prefer catchup-days for Flussonic players; omit legacy timeshift duplicate.
++            to_m3u_non_empty_fields!(self, line,
++                (parent_code, "parent-code"),
++                (audio_track, "audio-track"),
++                (rec, "tvg-rec"););
++        } else {
++            to_m3u_non_empty_fields!(self, line,
++                (parent_code, "parent-code"),
++                (audio_track, "audio-track"),
++                (time_shift, "timeshift"),
++                (rec, "tvg-rec"););
++        }
+         if let Some(StreamProperties::Live(live)) = self.additional_properties.as_ref() {
+             if let Some(catchup) = live.catchup.as_ref() {
+-                append_m3u_catchup_attributes(
+-                    &mut line,
+-                    catchup,
+-                    self.t_catchup_mode.as_ref(),
+-                    self.t_catchup_source.as_ref(),
+-                );
++                if let Some(mode) = flussonic_mode {
++                    // TiviMate flussonic: catchup + catchup-days only. Path rewrite uses live URL.
++                    write_m3u_attr(&mut line, "catchup", mode);
++                    if catchup.days.as_ref().is_some_and(|d| !d.is_empty()) {
++                        append_catchup_attribute(&mut line, "catchup-days", catchup.days.as_ref());
++                    } else if !self.time_shift.is_empty() {
++                        write_m3u_attr(&mut line, "catchup-days", self.time_shift.as_ref());
++                    }
++                    append_catchup_attribute(&mut line, "catchup-time", catchup.time.as_ref());
++                    append_catchup_attribute(&mut line, "catchup-correction", catchup.correction.as_ref());
++                } else {
++                    append_m3u_catchup_attributes(
++                        &mut line,
++                        catchup,
++                        self.t_catchup_mode.as_ref(),
++                        self.t_catchup_source.as_ref(),
++                    );
++                }
+             }
+         }
+ 
+@@ -2088,4 +2112,50 @@
+         assert!(output.contains(r#"catchup-source="http://proxy.example/m3u-catchup/token?v0={utc}""#));
+         assert!(!output.contains(r#"catchup-source="?offset=-${offset}""#));
+     }
+-}
++
++    #[test]
++    fn m3u_to_m3u_flussonic_omits_source_and_type() {
++        let item = M3uPlaylistItem {
++            virtual_id: 59,
++            provider_id: "prov1".intern(),
++            input_stream_id: "prov1".intern(),
++            name: "Звезда +7".intern(),
++            chno: 60,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "Общие".intern(),
++            title: "Звезда +7".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "3".intern(),
++            rec: "".intern(),
++            url: "http://provider/ch/index.m3u8".intern(),
++            epg_channel_id: Some("elb3517".intern()),
++            input_name: "test".intern(),
++            item_type: PlaylistItemType::Live,
++            t_stream_url: "https://proxy/m3u-stream/u/p/59/index.m3u8".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: Some(StreamProperties::Live(Box::new(LiveStreamProperties {
++                catchup: Some(CatchupProperties {
++                    mode: Some("flussonic".intern()),
++                    days: Some("3".intern()),
++                    source: Some("?utc={utc}&lutc={lutc}".intern()),
++                    catchup_type: Some("flussonic".intern()),
++                    ..CatchupProperties::default()
++                }),
++                ..LiveStreamProperties::default()
++            }))),
++        };
++
++        let output = item.to_m3u(None, true);
++        assert!(output.contains(r#"catchup="flussonic""#));
++        assert!(output.contains(r#"catchup-days="3""#));
++        assert!(!output.contains("catchup-source"));
++        assert!(!output.contains("catchup-type"));
++        assert!(!output.contains("timeshift="));
++        assert!(output.contains("https://proxy/m3u-stream/u/p/59/index.m3u8"));
++    }
++}
