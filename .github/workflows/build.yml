@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4.2.2
 
-      - name: Apply Flussonic / TiviMate archive patch
+      - name: Apply Flussonic + EPG url-tvg patches
         run: |
           set -euo pipefail
           chmod +x scripts/apply-maxpain-flussonic.sh
@@ -112,5 +112,5 @@ jobs:
             gh release create "$TAG" artifacts/* \
               --repo "$GH_REPO" \
               --title "$TAG" \
-              --notes "Release ${TAG} (Flussonic archive / TiviMate patch included)"
+              --notes "Release ${TAG} (Flussonic archive / TiviMate + EPG url-tvg patches included)"
           fi
