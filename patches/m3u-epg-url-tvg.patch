@@ -1,6 +1,5 @@
 # MaxPain: emit tuliprox /xmltv.php as M3U url-tvg (separate from Flussonic patch).
-# Apply AFTER m3u-flussonic-tivimate.patch (line offsets assume Flussonic is already applied).
-# Players (TiviMate, etc.) read url-tvg from #EXTM3U and fetch EPG from the proxy.
+# Apply AFTER m3u-flussonic-tivimate.patch.
 
 diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
 --- a/backend/src/repository/m3u_playlist_iterator.rs

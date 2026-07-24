@@ -1,11 +1,14 @@
-# MaxPain Flussonic + Shift M3U archive patch for tuliprox develop
-# Apply: ./scripts/apply-maxpain-flussonic.sh
-# - Flussonic path rewrite: .../{id}/index.m3u8 -> .../{id}/{index|video|mono|archive}-{utc}-{duration}.m3u8
-# - TiviMate 5.x uses video-{utc}-{duration}.m3u8 (not only archive-*)
+# =============================================================================
+# [BitTV fork] m3u-flussonic-tivimate.patch
+# -----------------------------------------------------------------------------
+# Dual catchup support without conflicts:
+#   1) flussonic (TiviMate path rewrite: index/video/mono/archive-{utc}-{duration})
+#   2) Shift: ?utc=&lutc= (with or without m3u-catchup marker)
 # - Panel Catchup/EPG: recover archive ts from m3u-catchup session token when BitTV
-#   media URLs lose Flussonic path markers after HLS rewrite
-# - Shift: ?utc=&lutc= (with or without m3u-catchup marker)
-# - Export keeps BitTV attrs only: timeshift, catchup-days, catchup-type (no invented catchup=)
+#   rewrites media URLs to date paths; keep archive HLS-cache sessions separate from live
+#   and store archive origin URL on the access lease (playlist DB only has live URL).
+# Apply BEFORE m3u-epg-url-tvg.patch.
+# =============================================================================
 
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
 --- a/backend/src/api/endpoints/hls_api.rs
@@ -123,17 +126,21 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      format!("{base}|hls-cache|{}", generate_random_string(16))
  }
  
-@@ -1242,8 +1284,16 @@
+@@ -1242,8 +1284,20 @@
          .map_or_else(|| Cow::Borrowed(""), |value| String::from_utf8_lossy(value.as_bytes()));
  
      stream_channel.url = Arc::from(hls_cache_stream_stats_url(&proxy_session_id));
 -    stream_channel.item_type = PlaylistItemType::LiveHls;
 -    stream_channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(stream_channel.cluster);
-+    if is_m3u_catchup_session_token(&access.user_session_token) {
++    if access.epg_reference_ts.is_some()
++        || access.archive_origin_url.is_some()
++        || is_m3u_catchup_session_token(&access.user_session_token)
++    {
 +        stream_channel.item_type = PlaylistItemType::Catchup;
 +        stream_channel.cluster = XtreamCluster::try_from(PlaylistItemType::Catchup).unwrap_or(XtreamCluster::Video);
-+        stream_channel.epg_reference_ts =
-+            m3u_catchup_epg_reference_from_session_token(&access.user_session_token);
++        stream_channel.epg_reference_ts = access.epg_reference_ts.or_else(|| {
++            m3u_catchup_epg_reference_from_session_token(&access.user_session_token)
++        });
 +    } else {
 +        stream_channel.item_type = PlaylistItemType::LiveHls;
 +        stream_channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(stream_channel.cluster);
@@ -142,7 +149,28 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      let shared_stream_id = hls_cache_shared_stream_id(&proxy_session_id);
      stream_channel.shared = true;
      stream_channel.shared_stream_id = Some(shared_stream_id);
-@@ -3648,7 +3698,8 @@
+@@ -2145,6 +2199,20 @@
+     HlsOriginSource::new(input.id, Arc::clone(&input.name), stream_ref, hls_origin_source_kind(input.input_type))
+ }
+ 
++/// Live and archive must not share an HLS-cache session: after redirect the
++/// canonical path reloads the playlist item, which only has the live URL.
++fn build_hls_origin_source_for_playback(
++    input: &ConfigInput,
++    stream_ref: &str,
++    archive_reference: Option<i64>,
++) -> HlsOriginSource {
++    let stream_ref = match archive_reference {
++        Some(ts) => format!("{stream_ref}|archive|{ts}"),
++        None => stream_ref.to_string(),
++    };
++    build_hls_origin_source(input, stream_ref)
++}
++
+ /// Keeps target routing identity separate from the immutable input content identity.
+ #[derive(Debug, Clone, Eq, PartialEq)]
+ pub(in crate::api) struct HlsEntryStreamIdentity {
+@@ -3648,7 +3716,8 @@
      user: &ProxyUserCredentials,
      origin_source: HlsOriginSource,
      virtual_id: u32,
@@ -152,7 +180,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      request_url: &str,
      input: &ConfigInput,
      connection_permission: UserConnectionPermission,
-@@ -3665,7 +3716,13 @@
+@@ -3665,7 +3734,13 @@
      let now_ms = current_time_millis();
      let origin_connection_kind = hls_entry_origin_connection_kind(connection_permission, connection_kind);
      let access_lease_id = new_hls_access_lease_id();
@@ -167,7 +195,18 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      let session_token = prepare_hls_cache_user_session(
          app_state,
          fingerprint,
-@@ -5168,7 +5225,7 @@
+@@ -3689,6 +3764,10 @@
+         virtual_id,
+         now_ms,
+         hls_pending_bootstrap_window_ms(),
++    )
++    .with_archive_playback(
++        archive_reference,
++        archive_reference.map(|_| request_url.to_string()),
+     );
+     if let Some(connection_kind) = origin_connection_kind {
+         lease = lease.with_origin_acquire_policy(connection_kind, connection_priority_for_kind(user, connection_kind));
+@@ -5168,7 +5247,7 @@
      target: &ConfigTarget,
      user_session: Option<&UserSession>,
      hls_url: &str,
@@ -176,7 +215,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      stream_identity: HlsEntryStreamIdentity,
      input: &ConfigInput,
      req_headers: &HeaderMap,
-@@ -5177,6 +5234,13 @@
+@@ -5177,6 +5256,13 @@
      original_hls_entry_path: &str,
  ) -> impl IntoResponse + Send {
      let virtual_id = stream_identity.virtual_id();
@@ -190,15 +229,34 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      if app_state.active_users.is_user_blocked_for_stream(&user.username, virtual_id).await {
          return axum::http::StatusCode::BAD_REQUEST.into_response();
      }
-@@ -5218,6 +5282,7 @@
+@@ -5192,7 +5278,9 @@
+     }
+     let url = ensure_hls_manifest_extension(&normalized_hls_url);
+     let hls_cache_origin = build_hls_origin_resolution(input, &url);
+-    let hls_origin_source = hls_cache_origin.as_ref().map(|_| build_hls_origin_source(input, stream_ref.clone()));
++    let hls_origin_source = hls_cache_origin
++        .as_ref()
++        .map(|_| build_hls_origin_source_for_playback(input, &stream_ref, archive_reference));
+     let server_info = app_state.app_config.get_user_server_info(user);
+     let Some(server_info) = server_info else {
+         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+@@ -5218,7 +5306,14 @@
              origin_source,
              virtual_id,
              user_session,
+-            hls_cache_origin.as_ref().map_or(url.as_str(), |origin| origin.session_entry_url.as_str()),
 +            archive_reference,
-             hls_cache_origin.as_ref().map_or(url.as_str(), |origin| origin.session_entry_url.as_str()),
++            // Archive must keep the provider archive playlist URL on the lease.
++            // Live keeps session_entry_url for provider-scheme failover identity.
++            if archive_reference.is_some() {
++                url.as_str()
++            } else {
++                hls_cache_origin.as_ref().map_or(url.as_str(), |origin| origin.session_entry_url.as_str())
++            },
              input,
              connection_permission,
-@@ -5289,7 +5354,7 @@
+             connection_kind,
+@@ -5289,7 +5384,7 @@
                          addr: &fingerprint.addr,
                          connection_permission,
                          connection_kind: session.connection_kind.or(connection_kind),
@@ -207,7 +265,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
                      })
                      .await;
                  let hls_session_ttl_secs = get_hls_session_ttl_secs(app_state);
-@@ -5306,7 +5371,7 @@
+@@ -5306,7 +5401,7 @@
              fingerprint,
              &user.username,
              virtual_id,
@@ -216,7 +274,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
          );
          let hls_session_owner = if hls_cache_enabled_for_target(app_state, target) {
-@@ -5487,6 +5552,7 @@
+@@ -5487,6 +5582,7 @@
      virtual_id: u32,
      hls_url: &str,
      archive_reference: Option<i64>,
@@ -224,7 +282,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
  ) -> StreamChannel {
      let unknown = "Unknown".intern();
      let mut channel = match get_stream_channel(app_state, target, virtual_id).await {
-@@ -5513,7 +5579,10 @@
+@@ -5513,7 +5609,10 @@
          },
      };
  
@@ -236,7 +294,24 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          channel.item_type = PlaylistItemType::Catchup;
          channel.cluster = XtreamCluster::Video;
          channel.epg_reference_ts = archive_reference;
-@@ -5708,7 +5777,7 @@
+@@ -5554,9 +5653,14 @@
+     let Some(channel) = get_stream_channel(app_state, &target, access_context.virtual_id).await else {
+         return Err(StatusCode::NOT_FOUND);
+     };
+-    let origin_playlist_url =
++    // Playlist DB only stores the live URL. Archive entry stored the provider archive
++    // playlist on the access lease — use it so HLS-cache does not silently play live.
++    let origin_playlist_url = if let Some(archive_url) = access_context.archive_origin_url.as_ref() {
++        archive_url.clone()
++    } else {
+         resolve_hls_origin_playlist_url(app_state, &target, &input, access_context.virtual_id, channel.url.as_ref())
+-            .await?;
++            .await?
++    };
+     let Some(hls_cache_origin) = build_hls_origin_resolution(&input, &origin_playlist_url) else {
+         return Err(StatusCode::SERVICE_UNAVAILABLE);
+     };
+@@ -5708,7 +5812,7 @@
      );
  
      if user.permission_denied(&app_state) {
@@ -245,7 +320,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          return hls_admission_failure_manifest_response(
              &app_state,
              &fingerprint,
-@@ -5741,7 +5810,8 @@
+@@ -5741,7 +5845,8 @@
          app_state.active_users.get_and_update_user_session(&user.username, &lookup_session_token).await;
  
      if let Some(session) = &mut user_session {
@@ -255,7 +330,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          if session.permission == UserConnectionPermission::Exhausted {
              let stream_channel = resolve_stream_channel(
                  &app_state,
-@@ -5750,6 +5820,7 @@
+@@ -5750,6 +5855,7 @@
                  virtual_id,
                  &decoded_hls_token.1,
                  decoded_archive_reference,
@@ -263,7 +338,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              )
              .await;
              return hls_admission_failure_manifest_response(
-@@ -5771,6 +5842,7 @@
+@@ -5771,6 +5877,7 @@
                  virtual_id,
                  &decoded_hls_token.1,
                  decoded_archive_reference,
@@ -271,7 +346,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              )
              .await;
              return hls_admission_failure_manifest_response(
-@@ -5790,12 +5862,20 @@
+@@ -5790,12 +5897,20 @@
              _ => return axum::http::StatusCode::BAD_REQUEST.into_response(),
          };
          let hls_url = hls_url.intern();
@@ -295,7 +370,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              if is_seek_request(stream_channel.cluster, &req_headers).await {
                  // partial request means we are in reverse proxy mode, seek happened
                  return force_provider_stream_response(
-@@ -5849,9 +5929,16 @@
+@@ -5849,9 +5964,16 @@
              || (connection_permission == UserConnectionPermission::GracePeriod && connection_kind.is_none())
          {
              let provider = if session.provider.is_empty() { input.name.clone() } else { session.provider.clone() };
@@ -315,7 +390,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              return hls_admission_failure_manifest_response(
                  &app_state,
                  &fingerprint,
-@@ -5897,8 +5984,16 @@
+@@ -5897,8 +6019,16 @@
          }
  
          if is_file_url(&session.stream_url) {
@@ -334,7 +409,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              return local_stream_response(
                  &fingerprint,
                  &app_state,
-@@ -5917,8 +6012,16 @@
+@@ -5917,8 +6047,16 @@
              .into_response();
          }
  
@@ -353,7 +428,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          force_provider_stream_response(
              &fingerprint,
              &app_state,
-@@ -5969,8 +6072,9 @@
+@@ -5969,8 +6107,9 @@
  #[cfg(test)]
  mod tests {
      use super::{
@@ -365,7 +440,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      };
      use crate::{
          api::model::{
-@@ -6046,11 +6150,60 @@
+@@ -6046,11 +6185,60 @@
              m3u_archive_epg_reference_ts("http://provider/live/42.m3u8?start=1700000000&end=1700003600"),
              Some(1_700_000_000)
          );
@@ -426,7 +501,16 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      }
  
      #[test]
-@@ -9434,6 +9587,7 @@
+@@ -8884,6 +9072,8 @@
+             virtual_id: 12345,
+             lease_id: access_lease_id,
+             family_key: HlsPlaybackFamilyKey::new("hls-user", client_fingerprint),
++            epg_reference_ts: None,
++            archive_origin_url: None,
+         }
+     }
+ 
+@@ -9434,6 +9624,7 @@
              origin_source,
              12345,
              None,
@@ -434,7 +518,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -9472,6 +9626,7 @@
+@@ -9472,6 +9663,7 @@
              &user,
              origin_source,
              12345,
@@ -442,7 +526,16 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -9841,6 +9996,7 @@
+@@ -9807,6 +9999,8 @@
+             virtual_id: 12345,
+             lease_id: HlsAccessLeaseId("access-lease".to_string()),
+             family_key: HlsPlaybackFamilyKey::new("hls-user", test_fingerprint().key),
++            epg_reference_ts: None,
++            archive_origin_url: None,
+         };
+ 
+         let Err(err) =
+@@ -9841,6 +10035,7 @@
              origin_source.clone(),
              12345,
              None,
@@ -450,7 +543,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -9864,6 +10020,7 @@
+@@ -9864,6 +10059,7 @@
              &normal_user,
              origin_source,
              12345,
@@ -458,7 +551,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10055,6 +10212,7 @@
+@@ -10055,6 +10251,7 @@
              origin_source.clone(),
              12345,
              None,
@@ -466,7 +559,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10080,6 +10238,7 @@
+@@ -10080,6 +10277,7 @@
              &user,
              origin_source,
              12345,
@@ -474,7 +567,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10122,6 +10281,7 @@
+@@ -10122,6 +10320,7 @@
              origin_source.clone(),
              12345,
              None,
@@ -482,7 +575,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10164,6 +10324,7 @@
+@@ -10164,6 +10363,7 @@
              origin_source,
              12345,
              None,
@@ -490,7 +583,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10203,6 +10364,7 @@
+@@ -10203,6 +10403,7 @@
              &user,
              origin_source.clone(),
              12345,
@@ -498,7 +591,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10240,6 +10402,7 @@
+@@ -10240,6 +10441,7 @@
              &user,
              origin_source,
              12345,
@@ -506,7 +599,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10311,6 +10474,7 @@
+@@ -10311,6 +10513,7 @@
              origin_source,
              12345,
              None,
@@ -514,7 +607,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10345,6 +10509,7 @@
+@@ -10345,6 +10548,7 @@
              &user,
              origin_source.clone(),
              12345,
@@ -522,7 +615,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10373,6 +10538,7 @@
+@@ -10373,6 +10577,7 @@
              &user,
              origin_source,
              12345,
@@ -530,7 +623,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10438,6 +10604,7 @@
+@@ -10438,6 +10643,7 @@
              origin_source,
              80510,
              None,
@@ -538,7 +631,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              "http://origin.example.com/live/user/pass/80510.m3u8",
              &input,
              UserConnectionPermission::Allowed,
-@@ -10474,6 +10641,7 @@
+@@ -10474,6 +10680,7 @@
              &user,
              origin_source,
              70001,
@@ -924,6 +1017,57 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
          ]
      );
  
+diff --git a/backend/src/api/model/hls_cache/lease.rs b/backend/src/api/model/hls_cache/lease.rs
+--- a/backend/src/api/model/hls_cache/lease.rs
++++ b/backend/src/api/model/hls_cache/lease.rs
+@@ -126,6 +126,10 @@
+     pub pending_deadline: Option<HlsAccessLeasePendingDeadline>,
+     pub valid_until_ms: u64,
+     pub response_flag: Option<HlsAccessLeaseResponseFlag>,
++    /// Archive EPG centre time; set for Flussonic/M3U catchup HLS-cache entry.
++    pub epg_reference_ts: Option<i64>,
++    /// Provider archive playlist URL captured at entry (DB item URL is live-only).
++    pub archive_origin_url: Option<String>,
+ }
+ 
+ impl HlsAccessLease {
+@@ -162,7 +166,15 @@
+             }),
+             valid_until_ms: now_ms.saturating_add(valid_window_ms),
+             response_flag: None,
+-        }
++            epg_reference_ts: None,
++            archive_origin_url: None,
++        }
++    }
++
++    pub fn with_archive_playback(mut self, epg_reference_ts: Option<i64>, archive_origin_url: Option<String>) -> Self {
++        self.epg_reference_ts = epg_reference_ts;
++        self.archive_origin_url = archive_origin_url;
++        self
+     }
+ 
+     pub const fn with_origin_acquire_policy(mut self, connection_kind: ConnectionKind, priority: i8) -> Self {
+diff --git a/backend/src/api/model/hls_cache/playback.rs b/backend/src/api/model/hls_cache/playback.rs
+--- a/backend/src/api/model/hls_cache/playback.rs
++++ b/backend/src/api/model/hls_cache/playback.rs
+@@ -27,6 +27,8 @@
+     pub virtual_id: u32,
+     pub lease_id: HlsAccessLeaseId,
+     pub family_key: HlsPlaybackFamilyKey,
++    pub epg_reference_ts: Option<i64>,
++    pub archive_origin_url: Option<String>,
+ }
+ 
+ #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+@@ -149,5 +151,7 @@
+         virtual_id: lease.virtual_id,
+         lease_id: lease.lease_id,
+         family_key: lease.family_key,
++        epg_reference_ts: lease.epg_reference_ts,
++        archive_origin_url: lease.archive_origin_url,
+     })
+ }
 diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
 --- a/backend/src/repository/m3u_playlist_iterator.rs
 +++ b/backend/src/repository/m3u_playlist_iterator.rs
