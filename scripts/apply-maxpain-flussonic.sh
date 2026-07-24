@@ -1,36 +1,30 @@
 #!/bin/bash
-# Apply patches/m3u-flussonic-tivimate.patch (Flussonic path-rewrite + Shift utc/lutc).
+# Apply MaxPain tuliprox patches (Flussonic archives + EPG url-tvg).
 # Used by .github/workflows/build.yml and local builds.
 #
 # Usage:
 #   ./scripts/apply-maxpain-flussonic.sh [TREE]
 #   TULIPROX_ROOT=/path/to/tuliprox ./scripts/apply-maxpain-flussonic.sh
+#
+# Order matters: Flussonic first, then EPG (EPG only touches TextIterator / tests).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PATCH="${ROOT_DIR}/patches/m3u-flussonic-tivimate.patch"
 TREE="$(cd "${1:-${TULIPROX_ROOT:-${ROOT_DIR}}}" && pwd)"
 
-if [[ ! -f "${PATCH}" ]]; then
-  echo "ERROR: patch not found: ${PATCH}" >&2
-  exit 1
-fi
+PATCHES=(
+  "m3u-flussonic-tivimate.patch"
+  "m3u-epg-url-tvg.patch"
+)
+
 if [[ ! -d "${TREE}/backend" ]]; then
   echo "ERROR: not a tuliprox tree: ${TREE}" >&2
   exit 1
 fi
 
-echo "==> Applying $(basename "${PATCH}") -> ${TREE}"
-
-# Body only (skip comment banner before first diff --git)
 BODY="$(mktemp)"
 trap 'rm -f "${BODY}"' EXIT
-sed -n '/^diff --git /,$p' "${PATCH}" >"${BODY}"
-if [[ ! -s "${BODY}" ]]; then
-  echo "ERROR: no diff --git in ${PATCH}" >&2
-  exit 1
-fi
 
 apply_with_git() {
   git -C "${TREE}" apply --check --whitespace=nowarn "${BODY}"
@@ -84,7 +78,7 @@ def apply_unified(work: Path, diff_text: str) -> None:
                     line = lines[i]
                     if line.startswith("+"):
                         content_lines.append(line[1:])
-                    elif line.startswith(" ") :
+                    elif line.startswith(" "):
                         content_lines.append(line[1:])
                     i += 1
             else:
@@ -145,23 +139,45 @@ for part in parts:
 PY
 }
 
-if command -v git >/dev/null 2>&1; then
-  apply_with_git
-elif command -v patch >/dev/null 2>&1; then
-  apply_with_patch
-elif command -v python3 >/dev/null 2>&1; then
-  echo "git/patch missing — using embedded Python applicator"
-  apply_with_python
-else
-  echo "ERROR: need git, patch, or python3 to apply the patch" >&2
-  exit 1
-fi
+apply_one_patch() {
+  local patch_file="$1"
+  if [[ ! -f "${patch_file}" ]]; then
+    echo "ERROR: patch not found: ${patch_file}" >&2
+    exit 1
+  fi
+
+  echo "==> Applying $(basename "${patch_file}") -> ${TREE}"
+  sed -n '/^diff --git /,$p' "${patch_file}" >"${BODY}"
+  if [[ ! -s "${BODY}" ]]; then
+    echo "ERROR: no diff --git in ${patch_file}" >&2
+    exit 1
+  fi
+
+  if command -v git >/dev/null 2>&1; then
+    apply_with_git
+  elif command -v patch >/dev/null 2>&1; then
+    apply_with_patch
+  elif command -v python3 >/dev/null 2>&1; then
+    echo "git/patch missing — using embedded Python applicator"
+    apply_with_python
+  else
+    echo "ERROR: need git, patch, or python3 to apply the patch" >&2
+    exit 1
+  fi
+}
+
+for name in "${PATCHES[@]}"; do
+  apply_one_patch "${ROOT_DIR}/patches/${name}"
+done
 
 # Sanity checks (must match current patch contents)
 test -f "${TREE}/backend/src/utils/m3u_archive.rs"
 grep -q 'resolve_nested_m3u_playback' "${TREE}/backend/src/api/endpoints/m3u_api.rs"
 grep -q 'M3U_CATCHUP_PARAM_UTC' "${TREE}/backend/src/utils/m3u_catchup.rs"
 grep -q 'flussonic_player_mode' "${TREE}/shared/src/model/stream_properties.rs"
+grep -q 'build_proxy_xmltv_url_tvg' "${TREE}/backend/src/repository/m3u_playlist_iterator.rs"
+grep -q 'xmltv.php' "${TREE}/backend/src/repository/m3u_playlist_iterator.rs"
+grep -q 'url-tvg=' "${TREE}/backend/src/repository/m3u_playlist_iterator.rs"
 
-echo "Flussonic+Shift patch applied OK"
+echo "Flussonic + EPG url-tvg patches applied OK"
 echo "Rebuild tuliprox and refresh the user M3U playlist."
