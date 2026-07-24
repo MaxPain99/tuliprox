@@ -1,0 +1,126 @@
+# MaxPain: emit tuliprox /xmltv.php as M3U url-tvg (separate from Flussonic patch).
+# Apply AFTER m3u-flussonic-tivimate.patch (line offsets assume Flussonic is already applied).
+# Players (TiviMate, etc.) read url-tvg from #EXTM3U and fetch EPG from the proxy.
+
+diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
+--- a/backend/src/repository/m3u_playlist_iterator.rs
++++ b/backend/src/repository/m3u_playlist_iterator.rs
+@@ -374,10 +374,25 @@
+     }
+ }
+ 
++/// Proxied XMLTV URL for `#EXTM3U url-tvg="…"` (never the provider's source `url-tvg`).
++fn build_proxy_xmltv_url_tvg(base_url: &str, username: &str, password: &str) -> Option<String> {
++    let base = base_url.trim_end_matches('/');
++    if base.is_empty() || username.is_empty() || password.is_empty() {
++        return None;
++    }
++    let query = url::form_urlencoded::Serializer::new(String::new())
++        .append_pair("username", username)
++        .append_pair("password", password)
++        .finish();
++    Some(format!("{base}/xmltv.php?{query}"))
++}
++
+ pub struct M3uPlaylistM3uTextIterator {
+     inner: M3uPlaylistIterator,
+     started: bool,
+     target_options: Option<ConfigTargetOptions>,
++    /// When set, first line is `#EXTM3U url-tvg="{url}"` pointing at tuliprox `/xmltv.php`.
++    url_tvg: Option<String>,
+ }
+ 
+ impl M3uPlaylistM3uTextIterator {
+@@ -386,10 +401,13 @@
+         target: &ConfigTarget,
+         user: &ProxyUserCredentials,
+     ) -> Result<Self, TuliproxError> {
++        let base_url = cfg.get_user_server_info(user).map(|si| si.get_base_url()).unwrap_or_default();
++        let url_tvg = build_proxy_xmltv_url_tvg(&base_url, user.username.as_ref(), user.password.as_ref());
+         Ok(Self {
+             inner: M3uPlaylistIterator::new(cfg, target, user).await?,
+             started: false,
+             target_options: target.options.clone(),
++            url_tvg,
+         })
+     }
+ }
+@@ -400,7 +418,11 @@
+     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+         if !self.started {
+             self.started = true;
+-            return Poll::Ready(Some(Ok("#EXTM3U".to_string())));
++            let header = match self.url_tvg.as_ref() {
++                Some(url) => format!("#EXTM3U url-tvg=\"{url}\""),
++                None => "#EXTM3U".to_string(),
++            };
++            return Poll::Ready(Some(Ok(header)));
+         }
+ 
+         match Pin::new(&mut self.inner).poll_next(cx) {
+@@ -569,26 +591,56 @@
+         assert_eq!(rewritten.t_stream_url.as_ref(), "https://example.com/m3u-stream/user/pass/813294.ts");
+     }
+ 
+-    // Regression lock: the streaming M3U response used by `m3u_api` must emit a
+-    // bare `#EXTM3U` header line, never a proxy-rewritten `url-tvg` from the
+-    // source playlist. The parser does not capture the source's `url-tvg`
+-    // attribute (`M3uPlaylistItem` has no field for it), and the writer must
+-    // therefore emit the bare marker regardless of what the upstream feed
+-    // declared. The inner channel is closed immediately so the iterator yields
+-    // no item lines, which lets the assertion focus on the header line only.
++    // Regression lock: never forward the provider's source `url-tvg`. Without a
++    // reverse-proxy base URL the header stays bare `#EXTM3U`. With a base URL,
++    // `new()` sets `url_tvg` to tuliprox `/xmltv.php?username=&password=`.
+     #[tokio::test]
+     async fn m3u_text_iterator_emits_bare_extm3u_header_without_proxying_source_url_tvg() {
+         let (tx, rx) = mpsc::channel::<Result<(M3uPlaylistItem, bool), shared::error::TuliproxError>>(1);
+         drop(tx);
+         let inner_iter = M3uPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
+-        let mut text_iter = M3uPlaylistM3uTextIterator { inner: inner_iter, started: false, target_options: None };
++        let mut text_iter = M3uPlaylistM3uTextIterator {
++            inner: inner_iter,
++            started: false,
++            target_options: None,
++            url_tvg: None,
++        };
+ 
+         let first = text_iter.next().await;
+-        assert_eq!(first.as_ref().and_then(|line| line.as_deref().ok()), Some("#EXTM3U"), "EXTM3U header must be bare, never contain url-tvg");
++        assert_eq!(first.as_ref().and_then(|line| line.as_deref().ok()), Some("#EXTM3U"), "EXTM3U header must be bare when url_tvg is unset");
+ 
+         let second = text_iter.next().await;
+         assert_eq!(second, None, "inner channel is closed, so no item lines should follow");
+     }
++
++    #[tokio::test]
++    async fn m3u_text_iterator_emits_proxy_xmltv_url_tvg_when_configured() {
++        let (tx, rx) = mpsc::channel::<Result<(M3uPlaylistItem, bool), shared::error::TuliproxError>>(1);
++        drop(tx);
++        let inner_iter = M3uPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
++        let mut text_iter = M3uPlaylistM3uTextIterator {
++            inner: inner_iter,
++            started: false,
++            target_options: None,
++            url_tvg: Some("https://hls.example/iptv/xmltv.php?username=u&password=p".into()),
++        };
++
++        let first = text_iter.next().await;
++        assert_eq!(
++            first.as_ref().and_then(|line| line.as_deref().ok()),
++            Some("#EXTM3U url-tvg=\"https://hls.example/iptv/xmltv.php?username=u&password=p\""),
++        );
++    }
++
++    #[test]
++    fn build_proxy_xmltv_url_tvg_encodes_credentials() {
++        assert_eq!(
++            build_proxy_xmltv_url_tvg("https://hls.example/iptv/", "u ser", "p&ss"),
++            Some("https://hls.example/iptv/xmltv.php?username=u+ser&password=p%26ss".into()),
++        );
++        assert_eq!(build_proxy_xmltv_url_tvg("", "u", "p"), None);
++    }
++
+ 
+     #[tokio::test]
+     async fn iterator_forwards_one_storage_error_then_ends() {

@@ -2,7 +2,8 @@
 # Apply: ./scripts/apply-maxpain-flussonic.sh
 # - Flussonic path rewrite: .../{id}/index.m3u8 -> .../{id}/{index|video|mono|archive}-{utc}-{duration}.m3u8
 # - TiviMate 5.x uses video-{utc}-{duration}.m3u8 (not only archive-*)
-# - Panel marks Catchup via EPG ts parsed from index/video/mono/archive stems
+# - Panel Catchup/EPG: recover archive ts from m3u-catchup session token when BitTV
+#   media URLs lose Flussonic path markers after HLS rewrite
 # - Shift: ?utc=&lutc= (with or without m3u-catchup marker)
 # - Export keeps BitTV attrs only: timeshift, catchup-days, catchup-type (no invented catchup=)
 
@@ -21,7 +22,37 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
  };
  use axum::{
      body::Body,
-@@ -109,16 +112,10 @@
+@@ -101,6 +104,29 @@
+     session_token.starts_with("m3u-catchup|") || session_token.starts_with("catchup|")
+ }
+ 
++/// Recover archive EPG reference from `m3u-catchup|…|archive|{start}|{duration}` session keys.
++///
++/// BitTV archive media URLs look like `…/2026/07/24/14/13/38-06800.ts` and lose Flussonic
++/// path markers after HLS rewrite, so the panel would otherwise keep showing Live + live EPG.
++pub(in crate::api) fn m3u_catchup_epg_reference_from_session_token(session_token: &str) -> Option<i64> {
++    let rest = session_token.strip_prefix("m3u-catchup|")?;
++    for marker in ["|archive|", "|timeshift_abs|"] {
++        if let Some(idx) = rest.rfind(marker) {
++            let after = &rest[idx + marker.len()..];
++            let start = after.split('|').next()?.trim();
++            if let Ok(ts) = start.parse::<i64>() {
++                return Some(ts);
++            }
++        }
++    }
++    None
++}
++
++fn resolve_m3u_archive_reference(stream_url: &str, session_token: Option<&str>) -> Option<i64> {
++    m3u_archive_epg_reference_ts(stream_url)
++        .or_else(|| session_token.and_then(m3u_catchup_epg_reference_from_session_token))
++}
++
+ fn query_flag_is_archive(key: &str) -> bool { key.eq_ignore_ascii_case("utc") }
+ 
+ fn query_flag_marks_start_context(key: &str) -> bool {
+@@ -109,16 +135,10 @@
  
  pub(in crate::api) fn m3u_archive_epg_reference_ts(stream_url: &str) -> Option<i64> {
      let parsed = Url::parse(stream_url).ok()?;
@@ -42,7 +73,213 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              return Some(ts);
          }
      }
-@@ -6046,6 +6043,14 @@
+@@ -1242,8 +1262,16 @@
+         .map_or_else(|| Cow::Borrowed(""), |value| String::from_utf8_lossy(value.as_bytes()));
+ 
+     stream_channel.url = Arc::from(hls_cache_stream_stats_url(&proxy_session_id));
+-    stream_channel.item_type = PlaylistItemType::LiveHls;
+-    stream_channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(stream_channel.cluster);
++    if is_m3u_catchup_session_token(&access.user_session_token) {
++        stream_channel.item_type = PlaylistItemType::Catchup;
++        stream_channel.cluster = XtreamCluster::try_from(PlaylistItemType::Catchup).unwrap_or(XtreamCluster::Video);
++        stream_channel.epg_reference_ts =
++            m3u_catchup_epg_reference_from_session_token(&access.user_session_token);
++    } else {
++        stream_channel.item_type = PlaylistItemType::LiveHls;
++        stream_channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(stream_channel.cluster);
++        stream_channel.epg_reference_ts = None;
++    }
+     let shared_stream_id = hls_cache_shared_stream_id(&proxy_session_id);
+     stream_channel.shared = true;
+     stream_channel.shared_stream_id = Some(shared_stream_id);
+@@ -5168,7 +5196,7 @@
+     target: &ConfigTarget,
+     user_session: Option<&UserSession>,
+     hls_url: &str,
+-    _archive_reference: Option<i64>,
++    archive_reference: Option<i64>,
+     stream_identity: HlsEntryStreamIdentity,
+     input: &ConfigInput,
+     req_headers: &HeaderMap,
+@@ -5177,6 +5205,13 @@
+     original_hls_entry_path: &str,
+ ) -> impl IntoResponse + Send {
+     let virtual_id = stream_identity.virtual_id();
++    let playback_item_type = if archive_reference.is_some()
++        || user_session.is_some_and(|session| is_m3u_catchup_session_token(&session.token))
++    {
++        PlaylistItemType::Catchup
++    } else {
++        PlaylistItemType::LiveHls
++    };
+     if app_state.active_users.is_user_blocked_for_stream(&user.username, virtual_id).await {
+         return axum::http::StatusCode::BAD_REQUEST.into_response();
+     }
+@@ -5289,7 +5324,7 @@
+                         addr: &fingerprint.addr,
+                         connection_permission,
+                         connection_kind: session.connection_kind.or(connection_kind),
+-                        socket_bound: PlaylistItemType::LiveHls.uses_socket_bound_session(),
++                        socket_bound: playback_item_type.uses_socket_bound_session(),
+                     })
+                     .await;
+                 let hls_session_ttl_secs = get_hls_session_ttl_secs(app_state);
+@@ -5306,7 +5341,7 @@
+             fingerprint,
+             &user.username,
+             virtual_id,
+-            PlaylistItemType::LiveHls,
++            playback_item_type,
+             None,
+         );
+         let hls_session_owner = if hls_cache_enabled_for_target(app_state, target) {
+@@ -5487,6 +5522,7 @@
+     virtual_id: u32,
+     hls_url: &str,
+     archive_reference: Option<i64>,
++    session_token: Option<&str>,
+ ) -> StreamChannel {
+     let unknown = "Unknown".intern();
+     let mut channel = match get_stream_channel(app_state, target, virtual_id).await {
+@@ -5513,7 +5549,10 @@
+         },
+     };
+ 
+-    if archive_reference.is_some() {
++    let archive_reference = archive_reference.or_else(|| resolve_m3u_archive_reference(hls_url, session_token));
++    let is_catchup =
++        archive_reference.is_some() || session_token.is_some_and(is_m3u_catchup_session_token);
++    if is_catchup {
+         channel.item_type = PlaylistItemType::Catchup;
+         channel.cluster = XtreamCluster::Video;
+         channel.epg_reference_ts = archive_reference;
+@@ -5708,7 +5747,7 @@
+     );
+ 
+     if user.permission_denied(&app_state) {
+-        let stream_channel = resolve_stream_channel(&app_state, &target, &input, virtual_id, "", None).await;
++        let stream_channel = resolve_stream_channel(&app_state, &target, &input, virtual_id, "", None, None).await;
+         return hls_admission_failure_manifest_response(
+             &app_state,
+             &fingerprint,
+@@ -5741,7 +5780,8 @@
+         app_state.active_users.get_and_update_user_session(&user.username, &lookup_session_token).await;
+ 
+     if let Some(session) = &mut user_session {
+-        let decoded_archive_reference = m3u_archive_epg_reference_ts(&decoded_hls_token.1);
++        let decoded_archive_reference =
++            resolve_m3u_archive_reference(&decoded_hls_token.1, Some(lookup_session_token.as_str()));
+         if session.permission == UserConnectionPermission::Exhausted {
+             let stream_channel = resolve_stream_channel(
+                 &app_state,
+@@ -5750,6 +5790,7 @@
+                 virtual_id,
+                 &decoded_hls_token.1,
+                 decoded_archive_reference,
++                Some(session.token.as_str()),
+             )
+             .await;
+             return hls_admission_failure_manifest_response(
+@@ -5771,6 +5812,7 @@
+                 virtual_id,
+                 &decoded_hls_token.1,
+                 decoded_archive_reference,
++                Some(session.token.as_str()),
+             )
+             .await;
+             return hls_admission_failure_manifest_response(
+@@ -5790,12 +5832,20 @@
+             _ => return axum::http::StatusCode::BAD_REQUEST.into_response(),
+         };
+         let hls_url = hls_url.intern();
+-        let archive_reference = m3u_archive_epg_reference_ts(&hls_url);
++        let archive_reference = resolve_m3u_archive_reference(&hls_url, Some(session.token.as_str()));
+         session.stream_url = hls_url.clone();
+         if session.virtual_id == virtual_id {
+             app_state.connection_manager.touch_http_activity(&user.username, &session.token, &fingerprint.addr).await;
+-            let stream_channel =
+-                resolve_stream_channel(&app_state, &target, &input, virtual_id, &hls_url, archive_reference).await;
++            let stream_channel = resolve_stream_channel(
++                &app_state,
++                &target,
++                &input,
++                virtual_id,
++                &hls_url,
++                archive_reference,
++                Some(session.token.as_str()),
++            )
++            .await;
+             if is_seek_request(stream_channel.cluster, &req_headers).await {
+                 // partial request means we are in reverse proxy mode, seek happened
+                 return force_provider_stream_response(
+@@ -5849,9 +5899,16 @@
+             || (connection_permission == UserConnectionPermission::GracePeriod && connection_kind.is_none())
+         {
+             let provider = if session.provider.is_empty() { input.name.clone() } else { session.provider.clone() };
+-            let stream_channel =
+-                resolve_stream_channel(&app_state, &target, &input, virtual_id, &session.stream_url, archive_reference)
+-                    .await;
++            let stream_channel = resolve_stream_channel(
++                &app_state,
++                &target,
++                &input,
++                virtual_id,
++                &session.stream_url,
++                archive_reference,
++                Some(session.token.as_str()),
++            )
++            .await;
+             return hls_admission_failure_manifest_response(
+                 &app_state,
+                 &fingerprint,
+@@ -5897,8 +5954,16 @@
+         }
+ 
+         if is_file_url(&session.stream_url) {
+-            let stream_channel =
+-                resolve_stream_channel(&app_state, &target, &input, virtual_id, &hls_url, archive_reference).await;
++            let stream_channel = resolve_stream_channel(
++                &app_state,
++                &target,
++                &input,
++                virtual_id,
++                &hls_url,
++                archive_reference,
++                Some(session.token.as_str()),
++            )
++            .await;
+             return local_stream_response(
+                 &fingerprint,
+                 &app_state,
+@@ -5917,8 +5982,16 @@
+             .into_response();
+         }
+ 
+-        let stream_channel =
+-            resolve_stream_channel(&app_state, &target, &input, virtual_id, &hls_url, archive_reference).await;
++        let stream_channel = resolve_stream_channel(
++            &app_state,
++            &target,
++            &input,
++            virtual_id,
++            &hls_url,
++            archive_reference,
++            Some(session.token.as_str()),
++        )
++        .await;
+         force_provider_stream_response(
+             &fingerprint,
+             &app_state,
+@@ -5970,7 +6043,7 @@
+ mod tests {
+     use super::{
+         build_hls_manifest_request_headers, extract_hls_provider_session_headers, hls_api_register,
+-        m3u_archive_epg_reference_ts, MAX_HLS_MANIFEST_BYTES,
++        m3u_archive_epg_reference_ts, m3u_catchup_epg_reference_from_session_token, MAX_HLS_MANIFEST_BYTES,
+     };
+     use crate::{
+         api::model::{
+@@ -6046,11 +6119,38 @@
              m3u_archive_epg_reference_ts("http://provider/live/42.m3u8?start=1700000000&end=1700003600"),
              Some(1_700_000_000)
          );
@@ -53,6 +290,30 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
 +        assert_eq!(
 +            m3u_archive_epg_reference_ts("http://provider/ch/index-1784898000-3600.m3u8"),
 +            Some(1_784_898_000)
++        );
+     }
+ 
+     #[test]
+     fn archive_epg_reference_rejects_plain_start_queries() {
+         assert_eq!(m3u_archive_epg_reference_ts("http://provider/live/42.m3u8?start=1700000000"), None);
++    }
++
++    #[test]
++    fn catchup_session_token_recovers_archive_epg_reference() {
++        let token = "m3u-catchup|fp|user|31|archive|1784898000|3600";
++        assert_eq!(
++            m3u_catchup_epg_reference_from_session_token(token),
++            Some(1_784_898_000)
++        );
++        assert_eq!(
++            m3u_catchup_epg_reference_from_session_token(
++                "m3u-catchup|fp|user|31|timeshift_abs|1700007200"
++            ),
++            Some(1_700_007_200)
++        );
++        assert_eq!(
++            m3u_catchup_epg_reference_from_session_token("m3u-catchup|fp|user|31|live"),
++            None
 +        );
      }
  
@@ -94,7 +355,23 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
      }
  
      let is_session_request = is_session_based_playback(pli.item_type, Some(extension));
-@@ -479,26 +486,138 @@
+@@ -415,7 +422,14 @@
+     // branch attaches it to the StreamChannel so the frontend's stream_epg
+     // request can centre its EPG window on the archive timestamp instead of
+     // falling back to `now`.
+-    let archive_reference = m3u_archive_epg_reference_ts(&pli.url);
++    let archive_reference = m3u_archive_epg_reference_ts(&pli.url).or_else(|| {
++        archive_discriminator.and_then(|disc| {
++            disc.strip_prefix("archive|")
++                .or_else(|| disc.strip_prefix("timeshift_abs|"))
++                .and_then(|rest| rest.split('|').next())
++                .and_then(|start| start.parse::<i64>().ok())
++        })
++    });
+     // Reverse proxy mode — only route genuine HLS into the HLS handler, not DASH
+     if is_session_request && extension == shared::defaults::HLS_EXT {
+         let Some(stream_identity) = HlsEntryStreamIdentity::from_playlist_item(&pli) else {
+@@ -479,26 +493,138 @@
      input.resolve_url(&item.url)
  }
  
@@ -248,7 +525,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
  }
  
  fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, item_type: PlaylistItemType) -> bool {
-@@ -546,17 +665,76 @@
+@@ -546,17 +672,76 @@
          true,
          format!("Can't find input {} for target {target_name}, stream_id {}", pli.input_name, pli.virtual_id)
      );
@@ -333,7 +610,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
      m3u_api_stream_loaded(
          user,
          target,
-@@ -746,17 +924,60 @@
+@@ -746,17 +931,60 @@
      };
  }
  
@@ -396,7 +673,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
          )*
      }};
  }
-@@ -766,7 +987,6 @@
+@@ -766,7 +994,6 @@
          $router
          $(
              .route(&format!("/{}", $path), axum::routing::get(m3u_api_get).post(m3u_api_post))
@@ -404,7 +681,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
          )*
      }};
  }
-@@ -778,10 +998,10 @@
+@@ -778,10 +1005,10 @@
      router = register_m3u_api_stream!(
          router,
          [
