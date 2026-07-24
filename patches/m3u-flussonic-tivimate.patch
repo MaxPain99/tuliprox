@@ -2,9 +2,61 @@
 # Apply: ./scripts/apply-maxpain-flussonic.sh
 # - Flussonic path rewrite: .../{id}/index.m3u8 -> .../{id}/{index|video|mono|archive}-{utc}-{duration}.m3u8
 # - TiviMate 5.x uses video-{utc}-{duration}.m3u8 (not only archive-*)
+# - Panel marks Catchup via EPG ts parsed from index/video/mono/archive stems
 # - Shift: ?utc=&lutc= (with or without m3u-catchup marker)
-# - Export keeps BitTV attrs: timeshift, catchup-days, catchup-type (+ catchup= for TiviMate)
+# - Export keeps BitTV attrs only: timeshift, catchup-days, catchup-type (no invented catchup=)
 
+diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
+--- a/backend/src/api/endpoints/hls_api.rs
++++ b/backend/src/api/endpoints/hls_api.rs
+@@ -68,7 +68,10 @@
+         rewrite_hls, RewriteHlsProps,
+     },
+     repository::{m3u_get_item_for_stream_id, storage_const, xtream_get_item_for_stream_id},
+-    utils::{content_coding::OutboundContentCodingPolicy, debug_if_enabled, request, request::is_file_url},
++    utils::{
++        content_coding::OutboundContentCodingPolicy, debug_if_enabled, parse_flussonic_archive_file, request,
++        request::is_file_url,
++    },
+ };
+ use axum::{
+     body::Body,
+@@ -109,16 +112,10 @@
+ 
+ pub(in crate::api) fn m3u_archive_epg_reference_ts(stream_url: &str) -> Option<i64> {
+     let parsed = Url::parse(stream_url).ok()?;
+-    let path = parsed.path();
+-    if let Some(rest) = path.split("/archive-").nth(1) {
+-        let start = rest.split('-').next()?;
+-        if let Ok(ts) = start.parse::<i64>() {
+-            return Some(ts);
+-        }
+-    }
+-    if let Some(rest) = path.split("/timeshift_abs-").nth(1) {
+-        let start = rest.trim_end_matches(".ts").trim_end_matches(".m3u8");
+-        if let Ok(ts) = start.parse::<i64>() {
++    // Flussonic / TiviMate path forms: archive|index|video|mono-{utc}-{duration}.m3u8
++    // and timeshift_abs / timeshift_rel. Without this, HLS sessions stay LiveHls in the panel.
++    if let Some(file) = parsed.path_segments().and_then(|mut segments| segments.next_back()) {
++        if let Some(ts) = parse_flussonic_archive_file(file).and_then(|archive| archive.epg_reference_ts()) {
+             return Some(ts);
+         }
+     }
+@@ -6046,6 +6043,14 @@
+             m3u_archive_epg_reference_ts("http://provider/live/42.m3u8?start=1700000000&end=1700003600"),
+             Some(1_700_000_000)
+         );
++        assert_eq!(
++            m3u_archive_epg_reference_ts("http://provider/ch/video-1784898000-3600.m3u8?token=abc"),
++            Some(1_784_898_000)
++        );
++        assert_eq!(
++            m3u_archive_epg_reference_ts("http://provider/ch/index-1784898000-3600.m3u8"),
++            Some(1_784_898_000)
++        );
+     }
+ 
+     #[test]
 diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
 --- a/backend/src/api/endpoints/m3u_api.rs
 +++ b/backend/src/api/endpoints/m3u_api.rs
@@ -1076,7 +1128,7 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
          to_m3u_non_empty_fields!(self, line,
              (parent_code, "parent-code"),
              (audio_track, "audio-track"),
-@@ -644,12 +650,32 @@
+@@ -644,12 +650,35 @@
              (rec, "tvg-rec"););
          if let Some(StreamProperties::Live(live)) = self.additional_properties.as_ref() {
              if let Some(catchup) = live.catchup.as_ref() {
@@ -1086,11 +1138,13 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
 -                    self.t_catchup_mode.as_ref(),
 -                    self.t_catchup_source.as_ref(),
 -                );
-+                if let Some(mode) = flussonic_mode {
-+                    // BitTV/provider style + TiviMate:
-+                    // timeshift / catchup-days / catchup-type + catchup=flussonic.
-+                    // Path rewrite uses the live URL — never emit shift catchup-source.
-+                    write_m3u_attr(&mut line, "catchup", mode);
++                if flussonic_mode.is_some() {
++                    // BitTV / provider style: timeshift + catchup-days + catchup-type.
++                    // Do not invent catchup= — only emit it when the source playlist had it.
++                    // Never emit shift-style catchup-source (breaks Flussonic path rewrite).
++                    if let Some(mode) = catchup.mode.as_ref().filter(|v| !v.is_empty()) {
++                        write_m3u_attr(&mut line, "catchup", mode.as_ref());
++                    }
 +                    if catchup.days.as_ref().is_some_and(|d| !d.is_empty()) {
 +                        append_catchup_attribute(&mut line, "catchup-days", catchup.days.as_ref());
 +                    } else if !self.time_shift.is_empty() {
@@ -1100,7 +1154,8 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
 +                    append_catchup_attribute(&mut line, "catchup-correction", catchup.correction.as_ref());
 +                    if let Some(ct) = catchup.catchup_type.as_ref().filter(|v| !v.is_empty()) {
 +                        write_m3u_attr(&mut line, "catchup-type", ct.as_ref());
-+                    } else {
++                    } else if let Some(mode) = flussonic_mode {
++                        // Source had catchup=flussonic without catchup-type — keep type for players.
 +                        write_m3u_attr(&mut line, "catchup-type", mode);
 +                    }
 +                    append_extra_catchup_attributes(&mut line, &catchup.extra_attributes);
@@ -1115,7 +1170,7 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
              }
          }
  
-@@ -2088,4 +2114,52 @@
+@@ -2088,4 +2117,52 @@
          assert!(output.contains(r#"catchup-source="http://proxy.example/m3u-catchup/token?v0={utc}""#));
          assert!(!output.contains(r#"catchup-source="?offset=-${offset}""#));
      }
@@ -1124,7 +1179,7 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
 +    #[test]
 +    fn m3u_to_m3u_flussonic_keeps_provider_attrs_omits_shift_source() {
 +        // Provider style (BitTV): timeshift + catchup-days + catchup-type=flussonic
-+        // (often without catchup=). Export must keep those and add catchup= for TiviMate.
++        // without catchup=. Do not invent catchup= on export.
 +        let item = M3uPlaylistItem {
 +            virtual_id: 59,
 +            provider_id: "prov1".intern(),
@@ -1164,7 +1219,7 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
 +        assert!(output.contains(r#"timeshift="3""#));
 +        assert!(output.contains(r#"catchup-days="3""#));
 +        assert!(output.contains(r#"catchup-type="flussonic""#));
-+        assert!(output.contains(r#"catchup="flussonic""#));
++        assert!(!output.contains(r#"catchup="flussonic""#));
 +        assert!(!output.contains("catchup-source"));
 +        assert!(output.contains("https://proxy/m3u-stream/u/p/59/index.m3u8"));
 +    }
@@ -1202,7 +1257,7 @@ diff --git a/shared/src/model/stream_properties.rs b/shared/src/model/stream_pro
 +    ///
 +    /// TiviMate rewrites the live URL path for these modes. Providers like BitTV often
 +    /// ship `catchup-type` + `timeshift` instead of `catchup=` — export should keep those
-+    /// and still emit `catchup=` for TiviMate. Never emit a shift-style `catchup-source`.
++    /// without inventing a `catchup=` attribute. Never emit a shift-style `catchup-source`.
 +    pub fn flussonic_player_mode(&self) -> Option<&'static str> {
 +        if !self.is_flussonic() {
 +            return None;
