@@ -184,6 +184,7 @@ grep -q 'build_hls_origin_source_for_playback' "${TREE}/backend/src/api/endpoint
 grep -q 'create_archive_aware_hls_user_session_token' "${TREE}/backend/src/api/endpoints/hls_api.rs"
 grep -q 'parse_flat_flussonic_rewritten_stream_id' "${TREE}/backend/src/utils/m3u_archive.rs"
 grep -q 'playlist_item_allows_flussonic_archive' "${TREE}/backend/src/api/endpoints/m3u_api.rs"
+grep -q 'PlaylistItemType::Catchup' "${TREE}/frontend/src/hooks/use_server_status.rs"
 
 echo "Flussonic + EPG url-tvg patches applied OK"
 echo "Rebuild tuliprox and refresh the user M3U playlist."
