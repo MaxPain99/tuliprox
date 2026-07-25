@@ -4,8 +4,8 @@
 # Dual catchup support without conflicts:
 #   1) flussonic (TiviMate path rewrite): .../{id}/index.m3u8 -> .../{id}/index-{utc}-{duration}.m3u8
 #   2) shift / append (Smart IPTV): flat URL + ?utc=&lutc=
-# Panel: archive HLS keeps m3u-catchup|… session tokens (legacy rewrite + HLS-cache)
-# so WebUI shows Catchup after BitTV rewrites media URLs to date paths.
+# Panel: archive HLS keeps m3u-catchup|… session tokens and Streams UI keeps
+# preserved Catchup rows between segment fetches (same as LiveHls).
 # Apply EPG url-tvg patch AFTER this one.
 # =============================================================================
 
@@ -1982,6 +1982,68 @@ diff --git a/backend/src/utils/mod.rs b/backend/src/utils/mod.rs
  pub use self::m3u_catchup::*;
  pub use self::m3u_catchup_token::*;
  pub use self::provider_resolve_token::*;
+diff --git a/frontend/src/hooks/use_server_status.rs b/frontend/src/hooks/use_server_status.rs
+--- a/frontend/src/hooks/use_server_status.rs
++++ b/frontend/src/hooks/use_server_status.rs
+@@ -54,7 +54,12 @@
+ }
+ 
+ fn should_keep_preserved_stream_visible(stream: &StreamInfo) -> bool {
+-    stream.session_token.is_some() && (stream.channel.item_type.is_live_adaptive() || is_shared_hls_stream(stream))
++    // Live HLS/DASH and Flussonic archive (Catchup over HLS) only transfer during
++    // segment fetches. Keep the Streams row visible between chunks via preserved TTL.
++    stream.session_token.is_some()
++        && (stream.channel.item_type.is_live_adaptive()
++            || stream.channel.item_type == PlaylistItemType::Catchup
++            || is_shared_hls_stream(stream))
+ }
+ 
+ fn should_keep_stream_when_connections_drop_to_zero(stream: &StreamInfo) -> bool {
+@@ -525,6 +530,44 @@
+     }
+ 
+     #[test]
++    fn test_preserved_catchup_update_stays_visible_between_hls_segments() {
++        let mut preserved = test_stream(1, "127.0.0.1:1234", Some("tok-catchup"), PlaylistItemType::Catchup);
++        preserved.preserved = true;
++        let mut status = shared::model::StatusCheck {
++            active_users: 1,
++            active_user_connections: 1,
++            active_user_streams: vec![test_stream(
++                1,
++                "127.0.0.1:1234",
++                Some("tok-catchup"),
++                PlaylistItemType::Catchup,
++            )],
++            ..Default::default()
++        };
++
++        apply_active_user_change(&mut status, ActiveUserConnectionChange::Updated(preserved.clone()));
++
++        assert_eq!(status.active_user_streams, vec![preserved]);
++    }
++
++    #[test]
++    fn test_connections_zero_keeps_preserved_catchup_rows_for_ttl_cleanup() {
++        let mut preserved = test_stream(1, "127.0.0.1:1234", Some("tok-catchup"), PlaylistItemType::Catchup);
++        preserved.preserved = true;
++        let non_adaptive = test_stream(2, "127.0.0.1:5678", Some("tok-vod"), PlaylistItemType::Video);
++        let mut status = shared::model::StatusCheck {
++            active_users: 1,
++            active_user_connections: 1,
++            active_user_streams: vec![preserved.clone(), non_adaptive],
++            ..Default::default()
++        };
++
++        apply_active_user_change(&mut status, ActiveUserConnectionChange::Connections(0, 0));
++
++        assert_eq!(status.active_user_streams, vec![preserved]);
++    }
++
++    #[test]
+     fn test_preserved_non_adaptive_update_removes_active_stream_without_clearing_other_rows() {
+         let mut preserved = test_stream(1, "127.0.0.1:1234", Some("tok-vod"), PlaylistItemType::Video);
+         preserved.preserved = true;
 diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
 --- a/shared/src/model/playlist.rs
 +++ b/shared/src/model/playlist.rs
