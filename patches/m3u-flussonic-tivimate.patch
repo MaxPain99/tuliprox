@@ -2,12 +2,11 @@
 # [BitTV fork] m3u-flussonic-tivimate.patch
 # -----------------------------------------------------------------------------
 # Dual catchup support without conflicts:
-#   1) flussonic (TiviMate path rewrite: index/video/mono/archive-{utc}-{duration})
-#   2) Shift: ?utc=&lutc= (with or without m3u-catchup marker)
-# - Panel Catchup/EPG: recover archive ts from m3u-catchup session token when BitTV
-#   rewrites media URLs to date paths; keep archive HLS-cache sessions separate from live
-#   and store archive origin URL on the access lease (playlist DB only has live URL).
-# Apply BEFORE m3u-epg-url-tvg.patch.
+#   1) flussonic (TiviMate path rewrite): .../{id}/index.m3u8 -> .../{id}/index-{utc}-{duration}.m3u8
+#   2) shift / append (Smart IPTV): flat URL + ?utc=&lutc=
+# Panel: archive HLS keeps m3u-catchup|… session tokens (legacy rewrite + HLS-cache)
+# so WebUI shows Catchup after BitTV rewrites media URLs to date paths.
+# Apply EPG url-tvg patch AFTER this one.
 # =============================================================================
 
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
@@ -94,17 +93,39 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              return Some(ts);
          }
      }
-@@ -449,8 +470,29 @@
+@@ -449,8 +470,48 @@
      Ok(HlsResourceAccess { session, access_context })
  }
  
 -fn create_hls_cache_user_session_token(fingerprint: &Fingerprint, username: &str, virtual_id: u32) -> String {
 -    let base = create_playback_session_fingerprint(fingerprint, username, virtual_id, PlaylistItemType::LiveHls, None);
-+/// Session token for HLS-cache leases.
++/// Session token for archive-aware HLS playback (legacy rewrite path and HLS-cache).
 +///
 +/// Archive playback must keep a `m3u-catchup|…|archive|{utc}|…` prefix so
-+/// `ensure_hls_cache_stream_registered` can mark the panel stream as Catchup
-+/// and recover `epg_reference_ts` after BitTV rewrites media URLs to date paths.
++/// segment handlers can mark the panel stream as Catchup and recover
++/// `epg_reference_ts` after BitTV rewrites media URLs to date paths.
++fn create_archive_aware_hls_user_session_token(
++    fingerprint: &Fingerprint,
++    username: &str,
++    virtual_id: u32,
++    existing_user_session: Option<&UserSession>,
++    archive_reference: Option<i64>,
++    playback_item_type: PlaylistItemType,
++) -> String {
++    if let Some(token) = existing_user_session
++        .map(|session| session.token.as_str())
++        .filter(|token| is_m3u_catchup_session_token(token))
++    {
++        return token.to_string();
++    }
++    if let Some(ts) = archive_reference {
++        // Duration may be unknown at entry time; EPG only needs the archive start.
++        return create_m3u_catchup_session_key(fingerprint, username, virtual_id, &format!("archive|{ts}|0"));
++    }
++    create_playback_session_fingerprint(fingerprint, username, virtual_id, playback_item_type, None)
++}
++
++/// Session token for HLS-cache leases.
 +fn create_hls_cache_user_session_token(
 +    fingerprint: &Fingerprint,
 +    username: &str,
@@ -112,21 +133,18 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
 +    existing_user_session: Option<&UserSession>,
 +    archive_reference: Option<i64>,
 +) -> String {
-+    let base = if let Some(token) = existing_user_session
-+        .map(|session| session.token.as_str())
-+        .filter(|token| is_m3u_catchup_session_token(token))
-+    {
-+        token.to_string()
-+    } else if let Some(ts) = archive_reference {
-+        // Duration is unknown at cache-entry time; EPG only needs the archive start.
-+        create_m3u_catchup_session_key(fingerprint, username, virtual_id, &format!("archive|{ts}|0"))
-+    } else {
-+        create_playback_session_fingerprint(fingerprint, username, virtual_id, PlaylistItemType::LiveHls, None)
-+    };
++    let base = create_archive_aware_hls_user_session_token(
++        fingerprint,
++        username,
++        virtual_id,
++        existing_user_session,
++        archive_reference,
++        PlaylistItemType::LiveHls,
++    );
      format!("{base}|hls-cache|{}", generate_random_string(16))
  }
  
-@@ -1242,8 +1284,20 @@
+@@ -1242,8 +1303,20 @@
          .map_or_else(|| Cow::Borrowed(""), |value| String::from_utf8_lossy(value.as_bytes()));
  
      stream_channel.url = Arc::from(hls_cache_stream_stats_url(&proxy_session_id));
@@ -149,7 +167,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      let shared_stream_id = hls_cache_shared_stream_id(&proxy_session_id);
      stream_channel.shared = true;
      stream_channel.shared_stream_id = Some(shared_stream_id);
-@@ -2145,6 +2199,20 @@
+@@ -2145,6 +2218,20 @@
      HlsOriginSource::new(input.id, Arc::clone(&input.name), stream_ref, hls_origin_source_kind(input.input_type))
  }
  
@@ -170,7 +188,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
  /// Keeps target routing identity separate from the immutable input content identity.
  #[derive(Debug, Clone, Eq, PartialEq)]
  pub(in crate::api) struct HlsEntryStreamIdentity {
-@@ -3648,7 +3716,8 @@
+@@ -3648,7 +3735,8 @@
      user: &ProxyUserCredentials,
      origin_source: HlsOriginSource,
      virtual_id: u32,
@@ -180,7 +198,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      request_url: &str,
      input: &ConfigInput,
      connection_permission: UserConnectionPermission,
-@@ -3665,7 +3734,13 @@
+@@ -3665,7 +3753,13 @@
      let now_ms = current_time_millis();
      let origin_connection_kind = hls_entry_origin_connection_kind(connection_permission, connection_kind);
      let access_lease_id = new_hls_access_lease_id();
@@ -195,7 +213,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      let session_token = prepare_hls_cache_user_session(
          app_state,
          fingerprint,
-@@ -3689,6 +3764,10 @@
+@@ -3689,6 +3783,10 @@
          virtual_id,
          now_ms,
          hls_pending_bootstrap_window_ms(),
@@ -206,7 +224,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      );
      if let Some(connection_kind) = origin_connection_kind {
          lease = lease.with_origin_acquire_policy(connection_kind, connection_priority_for_kind(user, connection_kind));
-@@ -5168,7 +5247,7 @@
+@@ -5168,7 +5266,7 @@
      target: &ConfigTarget,
      user_session: Option<&UserSession>,
      hls_url: &str,
@@ -215,7 +233,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      stream_identity: HlsEntryStreamIdentity,
      input: &ConfigInput,
      req_headers: &HeaderMap,
-@@ -5177,6 +5256,13 @@
+@@ -5177,6 +5275,13 @@
      original_hls_entry_path: &str,
  ) -> impl IntoResponse + Send {
      let virtual_id = stream_identity.virtual_id();
@@ -229,7 +247,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      if app_state.active_users.is_user_blocked_for_stream(&user.username, virtual_id).await {
          return axum::http::StatusCode::BAD_REQUEST.into_response();
      }
-@@ -5192,7 +5278,9 @@
+@@ -5192,7 +5297,9 @@
      }
      let url = ensure_hls_manifest_extension(&normalized_hls_url);
      let hls_cache_origin = build_hls_origin_resolution(input, &url);
@@ -240,7 +258,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      let server_info = app_state.app_config.get_user_server_info(user);
      let Some(server_info) = server_info else {
          return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
-@@ -5218,7 +5306,14 @@
+@@ -5218,7 +5325,14 @@
              origin_source,
              virtual_id,
              user_session,
@@ -256,7 +274,27 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              input,
              connection_permission,
              connection_kind,
-@@ -5289,7 +5384,7 @@
+@@ -5278,18 +5392,26 @@
+                     app_state.connection_manager.release_provider_handle(provider_handle).await;
+                     return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                 };
++                let archive_session_token = create_archive_aware_hls_user_session_token(
++                    fingerprint,
++                    &user.username,
++                    virtual_id,
++                    Some(session),
++                    archive_reference,
++                    playback_item_type,
++                );
+                 let session_token = app_state
+                     .active_users
+                     .create_user_session(crate::api::model::CreateUserSessionParams {
+                         user,
+-                        session_token: &session.token,
++                        session_token: &archive_session_token,
+                         virtual_id,
+                         provider: &cfg.name,
+                         stream_url: &stream_url,
                          addr: &fingerprint.addr,
                          connection_permission,
                          connection_kind: session.connection_kind.or(connection_kind),
@@ -265,16 +303,26 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
                      })
                      .await;
                  let hls_session_ttl_secs = get_hls_session_ttl_secs(app_state);
-@@ -5306,7 +5401,7 @@
+@@ -5302,12 +5424,16 @@
+             None => (url, None, None, None),
+         }
+     } else {
+-        let user_session_token = create_playback_session_fingerprint(
++        // First archive hit often has no UserSession yet (catchup key miss).
++        // Without an m3u-catchup|… token, BitTV date-path segment URLs look like
++        // live HLS and the WebUI keeps showing Live/HLS instead of Catchup.
++        let user_session_token = create_archive_aware_hls_user_session_token(
              fingerprint,
              &user.username,
              virtual_id,
 -            PlaylistItemType::LiveHls,
-+            playback_item_type,
              None,
++            archive_reference,
++            playback_item_type,
          );
          let hls_session_owner = if hls_cache_enabled_for_target(app_state, target) {
-@@ -5487,6 +5582,7 @@
+             let session_key = HlsSessionKey::new(input.id, stream_identity.stream_ref());
+@@ -5487,6 +5613,7 @@
      virtual_id: u32,
      hls_url: &str,
      archive_reference: Option<i64>,
@@ -282,7 +330,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
  ) -> StreamChannel {
      let unknown = "Unknown".intern();
      let mut channel = match get_stream_channel(app_state, target, virtual_id).await {
-@@ -5513,7 +5609,10 @@
+@@ -5513,7 +5640,10 @@
          },
      };
  
@@ -294,7 +342,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          channel.item_type = PlaylistItemType::Catchup;
          channel.cluster = XtreamCluster::Video;
          channel.epg_reference_ts = archive_reference;
-@@ -5554,9 +5653,14 @@
+@@ -5554,9 +5684,14 @@
      let Some(channel) = get_stream_channel(app_state, &target, access_context.virtual_id).await else {
          return Err(StatusCode::NOT_FOUND);
      };
@@ -311,7 +359,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      let Some(hls_cache_origin) = build_hls_origin_resolution(&input, &origin_playlist_url) else {
          return Err(StatusCode::SERVICE_UNAVAILABLE);
      };
-@@ -5708,7 +5812,7 @@
+@@ -5708,7 +5843,7 @@
      );
  
      if user.permission_denied(&app_state) {
@@ -320,7 +368,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          return hls_admission_failure_manifest_response(
              &app_state,
              &fingerprint,
-@@ -5741,7 +5845,8 @@
+@@ -5741,7 +5876,8 @@
          app_state.active_users.get_and_update_user_session(&user.username, &lookup_session_token).await;
  
      if let Some(session) = &mut user_session {
@@ -330,7 +378,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          if session.permission == UserConnectionPermission::Exhausted {
              let stream_channel = resolve_stream_channel(
                  &app_state,
-@@ -5750,6 +5855,7 @@
+@@ -5750,6 +5886,7 @@
                  virtual_id,
                  &decoded_hls_token.1,
                  decoded_archive_reference,
@@ -338,7 +386,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              )
              .await;
              return hls_admission_failure_manifest_response(
-@@ -5771,6 +5877,7 @@
+@@ -5771,6 +5908,7 @@
                  virtual_id,
                  &decoded_hls_token.1,
                  decoded_archive_reference,
@@ -346,7 +394,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              )
              .await;
              return hls_admission_failure_manifest_response(
-@@ -5790,12 +5897,20 @@
+@@ -5790,12 +5928,20 @@
              _ => return axum::http::StatusCode::BAD_REQUEST.into_response(),
          };
          let hls_url = hls_url.intern();
@@ -370,7 +418,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              if is_seek_request(stream_channel.cluster, &req_headers).await {
                  // partial request means we are in reverse proxy mode, seek happened
                  return force_provider_stream_response(
-@@ -5849,9 +5964,16 @@
+@@ -5849,9 +5995,16 @@
              || (connection_permission == UserConnectionPermission::GracePeriod && connection_kind.is_none())
          {
              let provider = if session.provider.is_empty() { input.name.clone() } else { session.provider.clone() };
@@ -390,7 +438,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              return hls_admission_failure_manifest_response(
                  &app_state,
                  &fingerprint,
-@@ -5897,8 +6019,16 @@
+@@ -5897,8 +6050,16 @@
          }
  
          if is_file_url(&session.stream_url) {
@@ -409,7 +457,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              return local_stream_response(
                  &fingerprint,
                  &app_state,
-@@ -5917,8 +6047,16 @@
+@@ -5917,8 +6078,16 @@
              .into_response();
          }
  
@@ -428,19 +476,20 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          force_provider_stream_response(
              &fingerprint,
              &app_state,
-@@ -5969,8 +6107,9 @@
+@@ -5969,8 +6138,10 @@
  #[cfg(test)]
  mod tests {
      use super::{
 -        build_hls_manifest_request_headers, extract_hls_provider_session_headers, hls_api_register,
 -        m3u_archive_epg_reference_ts, MAX_HLS_MANIFEST_BYTES,
-+        build_hls_manifest_request_headers, create_hls_cache_user_session_token, extract_hls_provider_session_headers,
-+        hls_api_register, is_m3u_catchup_session_token, m3u_archive_epg_reference_ts,
-+        m3u_catchup_epg_reference_from_session_token, MAX_HLS_MANIFEST_BYTES,
++        build_hls_manifest_request_headers, create_archive_aware_hls_user_session_token,
++        create_hls_cache_user_session_token, extract_hls_provider_session_headers, hls_api_register,
++        is_m3u_catchup_session_token, m3u_archive_epg_reference_ts, m3u_catchup_epg_reference_from_session_token,
++        MAX_HLS_MANIFEST_BYTES,
      };
      use crate::{
          api::model::{
-@@ -6046,11 +6185,60 @@
+@@ -6046,11 +6217,88 @@
              m3u_archive_epg_reference_ts("http://provider/live/42.m3u8?start=1700000000&end=1700003600"),
              Some(1_700_000_000)
          );
@@ -486,6 +535,34 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
 +    }
 +
 +    #[test]
++    fn legacy_hls_session_token_preserves_archive_marker() {
++        let fp = test_fingerprint();
++        let live = create_archive_aware_hls_user_session_token(
++            &fp,
++            "user",
++            31,
++            None,
++            None,
++            PlaylistItemType::LiveHls,
++        );
++        assert!(!is_m3u_catchup_session_token(&live));
++
++        let archive = create_archive_aware_hls_user_session_token(
++            &fp,
++            "user",
++            31,
++            None,
++            Some(1_784_898_000),
++            PlaylistItemType::Catchup,
++        );
++        assert!(is_m3u_catchup_session_token(&archive));
++        assert_eq!(
++            m3u_catchup_epg_reference_from_session_token(&archive),
++            Some(1_784_898_000)
++        );
++    }
++
++    #[test]
 +    fn hls_cache_session_token_preserves_archive_marker() {
 +        let fp = test_fingerprint();
 +        let live = create_hls_cache_user_session_token(&fp, "user", 31, None, None);
@@ -501,7 +578,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      }
  
      #[test]
-@@ -8884,6 +9072,8 @@
+@@ -8884,6 +9132,8 @@
              virtual_id: 12345,
              lease_id: access_lease_id,
              family_key: HlsPlaybackFamilyKey::new("hls-user", client_fingerprint),
@@ -510,7 +587,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          }
      }
  
-@@ -9434,6 +9624,7 @@
+@@ -9434,6 +9684,7 @@
              origin_source,
              12345,
              None,
@@ -518,7 +595,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -9472,6 +9663,7 @@
+@@ -9472,6 +9723,7 @@
              &user,
              origin_source,
              12345,
@@ -526,7 +603,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -9807,6 +9999,8 @@
+@@ -9807,6 +10059,8 @@
              virtual_id: 12345,
              lease_id: HlsAccessLeaseId("access-lease".to_string()),
              family_key: HlsPlaybackFamilyKey::new("hls-user", test_fingerprint().key),
@@ -535,7 +612,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          };
  
          let Err(err) =
-@@ -9841,6 +10035,7 @@
+@@ -9841,6 +10095,7 @@
              origin_source.clone(),
              12345,
              None,
@@ -543,7 +620,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -9864,6 +10059,7 @@
+@@ -9864,6 +10119,7 @@
              &normal_user,
              origin_source,
              12345,
@@ -551,7 +628,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10055,6 +10251,7 @@
+@@ -10055,6 +10311,7 @@
              origin_source.clone(),
              12345,
              None,
@@ -559,7 +636,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10080,6 +10277,7 @@
+@@ -10080,6 +10337,7 @@
              &user,
              origin_source,
              12345,
@@ -567,7 +644,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10122,6 +10320,7 @@
+@@ -10122,6 +10380,7 @@
              origin_source.clone(),
              12345,
              None,
@@ -575,7 +652,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10164,6 +10363,7 @@
+@@ -10164,6 +10423,7 @@
              origin_source,
              12345,
              None,
@@ -583,7 +660,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10203,6 +10403,7 @@
+@@ -10203,6 +10463,7 @@
              &user,
              origin_source.clone(),
              12345,
@@ -591,7 +668,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10240,6 +10441,7 @@
+@@ -10240,6 +10501,7 @@
              &user,
              origin_source,
              12345,
@@ -599,7 +676,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10311,6 +10513,7 @@
+@@ -10311,6 +10573,7 @@
              origin_source,
              12345,
              None,
@@ -607,7 +684,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10345,6 +10548,7 @@
+@@ -10345,6 +10608,7 @@
              &user,
              origin_source.clone(),
              12345,
@@ -615,7 +692,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10373,6 +10577,7 @@
+@@ -10373,6 +10637,7 @@
              &user,
              origin_source,
              12345,
@@ -623,7 +700,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              None,
              request_url,
              &input,
-@@ -10438,6 +10643,7 @@
+@@ -10438,6 +10703,7 @@
              origin_source,
              80510,
              None,
@@ -631,7 +708,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              "http://origin.example.com/live/user/pass/80510.m3u8",
              &input,
              UserConnectionPermission::Allowed,
-@@ -10474,6 +10680,7 @@
+@@ -10474,6 +10740,7 @@
              &user,
              origin_source,
              70001,
@@ -642,7 +719,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
 diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
 --- a/backend/src/api/endpoints/m3u_api.rs
 +++ b/backend/src/api/endpoints/m3u_api.rs
-@@ -22,7 +22,11 @@
+@@ -22,7 +22,12 @@
      auth::{check_network_access_only, resolve_api_user_context, ApiUserAuthError, Fingerprint},
      model::{ConfigTarget, ProxyUserCredentials},
      repository::{m3u_get_item_for_stream_id, m3u_load_rewrite_playlist, storage_const},
@@ -650,12 +727,13 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
 +    utils::{
 +        build_provider_flussonic_archive_url, debug_if_enabled, decode_m3u_catchup_token,
 +        flussonic_archive_from_utc_lutc_query, has_m3u_catchup_marker, is_flussonic_live_file,
-+        parse_flussonic_archive_file, resolve_m3u_catchup_url, M3uCatchupToken, PROVIDER_SCHEME_PREFIX,
++        parse_flat_flussonic_rewritten_stream_id, parse_flussonic_archive_file, resolve_m3u_catchup_url,
++        M3uCatchupToken, PROVIDER_SCHEME_PREFIX,
 +    },
  };
  use axum::response::IntoResponse;
  use bytes::Bytes;
-@@ -34,7 +38,7 @@
+@@ -34,7 +39,7 @@
          ConnectFailureReason, FieldGetAccessor, PlaylistEntry, PlaylistItemType, TargetType, UserConnectionPermission,
          XtreamCluster,
      },
@@ -664,7 +742,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
      defaults::{HLS_EXT}
  };
  use std::borrow::Cow;
-@@ -405,7 +409,10 @@
+@@ -405,7 +410,10 @@
      };
  
      if let Some(response) = redirect_response(app_state, &redirect_params).await {
@@ -676,7 +754,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
      }
  
      let is_session_request = is_session_based_playback(pli.item_type, Some(extension));
-@@ -415,7 +422,14 @@
+@@ -415,7 +423,14 @@
      // branch attaches it to the StreamChannel so the frontend's stream_epg
      // request can centre its EPG window on the archive timestamp instead of
      // falling back to `now`.
@@ -692,7 +770,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
      // Reverse proxy mode — only route genuine HLS into the HLS handler, not DASH
      if is_session_request && extension == shared::defaults::HLS_EXT {
          let Some(stream_identity) = HlsEntryStreamIdentity::from_playlist_item(&pli) else {
-@@ -479,26 +493,138 @@
+@@ -479,26 +494,151 @@
      input.resolve_url(&item.url)
  }
  
@@ -705,6 +783,19 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
 +
 +fn playlist_item_is_flussonic(pli: &shared::model::M3uPlaylistItem) -> bool {
 +    playlist_item_catchup(pli).is_some_and(shared::model::CatchupProperties::is_flussonic)
++}
++
++/// Channels that may accept Flussonic archive path rewrite.
++/// Prefer explicit flussonic catchup-type/mode; fall back to timeshift/catchup-days
++/// so BitTV-style rows still work if catchup-type was dropped from storage.
++fn playlist_item_allows_flussonic_archive(pli: &shared::model::M3uPlaylistItem) -> bool {
++    if playlist_item_is_flussonic(pli) {
++        return true;
++    }
++    if !pli.time_shift.is_empty() {
++        return true;
++    }
++    playlist_item_catchup(pli).is_some_and(|c| c.days.as_ref().is_some_and(|d| !d.is_empty()))
 +}
 +
 +/// Apply a resolved Flussonic archive to a playlist item for playback.
@@ -789,9 +880,9 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
 +    let stream_ext = extract_extension_from_url(file);
 +
 +    if let Some(archive) = parse_flussonic_archive_file(file) {
-+        if !playlist_item_is_flussonic(&pli) {
++        if !playlist_item_allows_flussonic_archive(&pli) {
 +            return Err(TuliproxError::RepositoryM3u(
-+                "Flussonic archive path is only valid for flussonic catchup channels".to_string(),
++                "Flussonic archive path is only valid for catchup/timeshift channels".to_string(),
 +            ));
 +        }
 +        let (item, disc) = apply_flussonic_archive(&pli, input, &archive)?;
@@ -846,7 +937,60 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
  }
  
  fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, item_type: PlaylistItemType) -> bool {
-@@ -546,17 +672,76 @@
+@@ -521,6 +661,52 @@
+     if !target.has_output(TargetType::M3u) {
+         debug!("Target has no m3u playlist {target_name}");
+         return axum::http::StatusCode::BAD_REQUEST.into_response();
++    }
++
++    // TiviMate flussonic rewrite of flat `/{id}.m3u8` → `/{id}-{utc}-{duration}.m3u8`
++    // (when the playlist still uses flat live URLs instead of nested `/{id}/index.m3u8`).
++    if let Some((req_virtual_id, archive)) = parse_flat_flussonic_rewritten_stream_id(stream_req.stream_id) {
++        let pli = match m3u_get_item_for_stream_id(req_virtual_id, app_state, &target).await {
++            Ok(pli) => pli,
++            Err(err) => {
++                error!("Failed to read m3u item for flat archive stream id {req_virtual_id}: {err}");
++                return axum::http::StatusCode::NOT_FOUND.into_response();
++            }
++        };
++        let input = try_option_bad_request!(
++            app_state.app_config.get_input_by_name(&pli.input_name),
++            true,
++            format!("Can't find input {} for target {target_name}, stream_id {}", pli.input_name, pli.virtual_id)
++        );
++        if !playlist_item_allows_flussonic_archive(&pli) {
++            debug!(
++                "Rejecting flat Flussonic archive rewrite for non-archive channel virtual_id={req_virtual_id}"
++            );
++            return axum::http::StatusCode::BAD_REQUEST.into_response();
++        }
++        let (resolved_pli, archive_discriminator) = match apply_flussonic_archive(&pli, &input, &archive) {
++            Ok(result) => result,
++            Err(err) => {
++                debug!(
++                    "Failed to resolve flat Flussonic archive: {}",
++                    sanitize_sensitive_info(&err.to_string())
++                );
++                return axum::http::StatusCode::BAD_REQUEST.into_response();
++            }
++        };
++        return m3u_api_stream_loaded(
++            user,
++            target,
++            fingerprint,
++            req_headers,
++            app_state,
++            resolved_pli,
++            input,
++            Some(HLS_EXT),
++            Some(archive_discriminator.as_str()),
++        )
++        .await
++        .into_response();
+     }
+ 
+     let (action_stream_id, stream_ext) = separate_number_and_remainder(stream_req.stream_id);
+@@ -546,17 +732,76 @@
          true,
          format!("Can't find input {} for target {target_name}, stream_id {}", pli.input_name, pli.virtual_id)
      );
@@ -931,7 +1075,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
      m3u_api_stream_loaded(
          user,
          target,
-@@ -746,17 +931,60 @@
+@@ -746,17 +991,60 @@
      };
  }
  
@@ -994,7 +1138,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
          )*
      }};
  }
-@@ -766,7 +994,6 @@
+@@ -766,7 +1054,6 @@
          $router
          $(
              .route(&format!("/{}", $path), axum::routing::get(m3u_api_get).post(m3u_api_post))
@@ -1002,7 +1146,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
          )*
      }};
  }
-@@ -778,10 +1005,10 @@
+@@ -778,10 +1065,10 @@
      router = register_m3u_api_stream!(
          router,
          [
@@ -1076,11 +1220,11 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
  use crate::repository::{ensure_target_storage_path, get_file_path_for_db_index};
  use crate::repository::{open_playlist_reader, LockedReceiverStream};
 -use crate::utils::build_m3u_catchup_rewrite;
-+use crate::utils::{build_m3u_catchup_rewrite, flussonic_proxy_live_file};
++use crate::utils::{build_m3u_catchup_rewrite, flussonic_proxy_live_file, FLUSSONIC_PROXY_LIVE_FILE};
  use futures::Stream;
  use log::error;
  use shared::create_bitset;
-@@ -163,14 +163,38 @@
+@@ -163,14 +163,50 @@
      };
  
      if should_rewrite_urls {
@@ -1099,7 +1243,19 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
 +                StreamProperties::Live(live) => live.catchup.as_ref().and_then(|c| c.flussonic_player_mode()),
 +                _ => None,
 +            })
-+            .map(flussonic_proxy_live_file);
++            .map(flussonic_proxy_live_file)
++            .or_else(|| {
++                // BitTV rows often have timeshift/catchup-days; nested live file is required
++                // so TiviMate can rewrite the last path segment for archive.
++                let has_timeshift = !m3u_pli.time_shift.is_empty();
++                let has_days = m3u_pli.additional_properties.as_ref().and_then(|props| match props {
++                    StreamProperties::Live(live) => {
++                        live.catchup.as_ref().and_then(|c| c.days.as_ref().filter(|d| !d.is_empty()))
++                    }
++                    _ => None,
++                });
++                (has_timeshift || has_days.is_some()).then_some(FLUSSONIC_PROXY_LIVE_FILE)
++            });
 +
 +        let stream_url = if let Some(live_file) = flussonic_live_file {
 +            // TiviMate flussonic rewrites the last segment:
@@ -1127,11 +1283,27 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
          let resource_url = if flags.contains(M3uPlaylistIteratorFlags::RewriteResource) {
              let source_url = if m3u_pli.logo.is_empty() { m3u_pli.logo_small.as_ref() } else { m3u_pli.logo.as_ref() };
              Some(build_rewritten_url(
+@@ -545,6 +581,7 @@
+         assert_eq!(rewritten.t_stream_url.as_ref(), "https://example.com/m3u-stream/user/pass/813294.ts");
+     }
+ 
++
+     // Regression lock: the streaming M3U response used by `m3u_api` must emit a
+     // bare `#EXTM3U` header line, never a proxy-rewritten `url-tvg` from the
+     // source playlist. The parser does not capture the source's `url-tvg`
+@@ -566,6 +603,7 @@
+         assert_eq!(second, None, "inner channel is closed, so no item lines should follow");
+     }
+ 
++
+     #[tokio::test]
+     async fn iterator_forwards_one_storage_error_then_ends() {
+         let (tx, rx) = mpsc::channel(2);
 diff --git a/backend/src/utils/m3u_archive.rs b/backend/src/utils/m3u_archive.rs
 new file mode 100644
 --- /dev/null
 +++ b/backend/src/utils/m3u_archive.rs
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,356 @@
 +//! Flussonic-compatible M3U archive paths for reverse-proxied playlists.
 +//!
 +//! TiviMate (`catchup="flussonic"` / `catchup-type="flussonic"`) rewrites the last
@@ -1217,6 +1389,40 @@ new file mode 100644
 +        }
 +    }
 +    None
++}
++
++/// Parse TiviMate flussonic rewrite of a *flat* live URL.
++///
++/// Live:  `.../m3u-stream/{user}/{pass}/{id}.m3u8`
++/// Archive: `.../m3u-stream/{user}/{pass}/{id}-{utc}-{duration}.m3u8`
++///
++/// Without this, `separate_number_and_remainder` yields a non-numeric stem and the
++/// request 400s — or older playlists keep serving live while the player UI shows archive.
++pub fn parse_flat_flussonic_rewritten_stream_id(stream_id: &str) -> Option<(u32, FlussonicArchiveKind)> {
++    let stem = strip_media_suffix(stream_id.trim().trim_start_matches('/'));
++    // Need at least `{id}-{start}-{duration}` → three dash-separated components from the right.
++    let mut parts = stem.rsplitn(3, '-');
++    let duration = parts.next()?.trim();
++    let start = parts.next()?.trim();
++    let id_part = parts.next()?.trim();
++    if id_part.is_empty() || start.is_empty() || duration.is_empty() {
++        return None;
++    }
++    if start.parse::<i64>().is_err() {
++        return None;
++    }
++    let duration_ok = duration.eq_ignore_ascii_case("now") || duration.parse::<i64>().is_ok();
++    if !duration_ok {
++        return None;
++    }
++    let virtual_id = id_part.parse::<u32>().ok()?;
++    Some((
++        virtual_id,
++        FlussonicArchiveKind::ArchiveHls {
++            start: start.to_string(),
++            duration: duration.to_string(),
++        },
++    ))
 +}
 +
 +/// Parse a Flussonic archive / timeshift filename from the last URL path segment.
@@ -1356,6 +1562,21 @@ new file mode 100644
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
++
++    #[test]
++    fn parses_flat_tivimate_rewritten_stream_id() {
++        let (id, archive) = parse_flat_flussonic_rewritten_stream_id("59-1784898000-3600.m3u8").unwrap();
++        assert_eq!(id, 59);
++        assert_eq!(
++            archive,
++            FlussonicArchiveKind::ArchiveHls {
++                start: "1784898000".into(),
++                duration: "3600".into(),
++            }
++        );
++        assert_eq!(parse_flat_flussonic_rewritten_stream_id("59.m3u8"), None);
++        assert_eq!(parse_flat_flussonic_rewritten_stream_id("index-1784898000-3600.m3u8"), None);
++    }
 +
 +    #[test]
 +    fn parses_archive_hls_file() {
@@ -1777,7 +1998,7 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
          to_m3u_non_empty_fields!(self, line,
              (parent_code, "parent-code"),
              (audio_track, "audio-track"),
-@@ -644,12 +650,35 @@
+@@ -644,12 +650,37 @@
              (rec, "tvg-rec"););
          if let Some(StreamProperties::Live(live)) = self.additional_properties.as_ref() {
              if let Some(catchup) = live.catchup.as_ref() {
@@ -1789,10 +2010,12 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
 -                );
 +                if flussonic_mode.is_some() {
 +                    // BitTV / provider style: timeshift + catchup-days + catchup-type.
-+                    // Do not invent catchup= — only emit it when the source playlist had it.
-+                    // Never emit shift-style catchup-source (breaks Flussonic path rewrite).
++                    // Emit catchup= when source had it; also emit catchup=flussonic when only
++                    // catchup-type=flussonic is present so TiviMate enables path rewrite.
 +                    if let Some(mode) = catchup.mode.as_ref().filter(|v| !v.is_empty()) {
 +                        write_m3u_attr(&mut line, "catchup", mode.as_ref());
++                    } else if let Some(mode) = catchup.flussonic_player_mode() {
++                        write_m3u_attr(&mut line, "catchup", mode);
 +                    }
 +                    if catchup.days.as_ref().is_some_and(|d| !d.is_empty()) {
 +                        append_catchup_attribute(&mut line, "catchup-days", catchup.days.as_ref());
@@ -1819,7 +2042,7 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
              }
          }
  
-@@ -2088,4 +2117,52 @@
+@@ -2088,4 +2119,52 @@
          assert!(output.contains(r#"catchup-source="http://proxy.example/m3u-catchup/token?v0={utc}""#));
          assert!(!output.contains(r#"catchup-source="?offset=-${offset}""#));
      }

@@ -4,7 +4,7 @@
 diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
 --- a/backend/src/repository/m3u_playlist_iterator.rs
 +++ b/backend/src/repository/m3u_playlist_iterator.rs
-@@ -374,10 +374,25 @@
+@@ -386,10 +386,25 @@
      }
  }
  
@@ -30,7 +30,7 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
  }
  
  impl M3uPlaylistM3uTextIterator {
-@@ -386,10 +401,13 @@
+@@ -398,10 +413,13 @@
          target: &ConfigTarget,
          user: &ProxyUserCredentials,
      ) -> Result<Self, TuliproxError> {
@@ -44,7 +44,7 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
          })
      }
  }
-@@ -400,7 +418,11 @@
+@@ -412,7 +430,11 @@
      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
          if !self.started {
              self.started = true;
@@ -57,7 +57,7 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
          }
  
          match Pin::new(&mut self.inner).poll_next(cx) {
-@@ -418,8 +440,8 @@
+@@ -430,8 +452,8 @@
  #[cfg(test)]
  mod tests {
      use super::{
@@ -68,10 +68,11 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
      };
      use crate::model::{ConfigInput, ConfigProvider, ProviderDnsCache};
      use crate::repository::LockedReceiverStream;
-@@ -569,25 +591,54 @@
+@@ -581,28 +603,55 @@
          assert_eq!(rewritten.t_stream_url.as_ref(), "https://example.com/m3u-stream/user/pass/813294.ts");
      }
  
+-
 -    // Regression lock: the streaming M3U response used by `m3u_api` must emit a
 -    // bare `#EXTM3U` header line, never a proxy-rewritten `url-tvg` from the
 -    // source playlist. The parser does not capture the source's `url-tvg`
@@ -101,8 +102,8 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
  
          let second = text_iter.next().await;
          assert_eq!(second, None, "inner channel is closed, so no item lines should follow");
-+    }
-+
+     }
+ 
 +    #[tokio::test]
 +    async fn m3u_text_iterator_emits_proxy_xmltv_url_tvg_when_configured() {
 +        let (tx, rx) = mpsc::channel::<Result<(M3uPlaylistItem, bool), shared::error::TuliproxError>>(1);
@@ -129,6 +130,7 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
 +            Some("https://hls.example/iptv/xmltv.php?username=u+ser&password=p%26ss".into()),
 +        );
 +        assert_eq!(build_proxy_xmltv_url_tvg("", "u", "p"), None);
-     }
++    }
  
      #[tokio::test]
+     async fn iterator_forwards_one_storage_error_then_ends() {
