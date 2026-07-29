@@ -8,42 +8,55 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: always
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-musl:
-    name: Build x86_64-unknown-linux-musl
+  prepare:
+    name: Patch + frontend + tests
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
     steps:
       - uses: actions/checkout@v4.2.2
 
-      - name: Apply MaxPain patches (Flussonic catchup + Hide Adult)
+      - name: Apply MaxPain patches
         run: |
           set -euo pipefail
           chmod +x scripts/apply-maxpain-flussonic.sh
           ./scripts/apply-maxpain-flussonic.sh .
           echo "Applied: m3u-flussonic-tivimate.patch, user-hide-adult.patch"
-          echo "Note: EPG url-tvg and EXTVLCOPT are now upstream in v3.3.74+"
 
-      - name: Install musl tools
+      - name: Resolve version / tag
+        id: meta
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          set -euo pipefail
+          VER="$(grep -Po '^version\s*=\s*"\K[^"]+' Cargo.toml | head -1)"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${VER}"
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building ${TAG} (crate ${VER})"
 
-      - name: Install Rust (stable) with musl target
+      - name: Install Rust (stable) + wasm
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: wasm32-unknown-unknown
 
       - name: Install Rust tools for frontend
         uses: taiki-e/install-action@v2
         with:
           tool: trunk,wasm-bindgen-cli,mdbook
-
-      - name: Install wasm32 target
-        run: rustup target add wasm32-unknown-unknown
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -54,7 +67,7 @@ jobs:
           WASM_TOOLS_BIN="$(./bin/install_wasm_tools.sh 128)"
           echo "${WASM_TOOLS_BIN}" >> "$GITHUB_PATH"
 
-      - name: Test Flussonic archive + catchup deltas
+      - name: Test MaxPain deltas
         run: |
           cargo test -p tuliprox parses_flat_tivimate_hls_archive --locked
           cargo test -p tuliprox resolve_default_mode_query_template_keeps_base_stream_url --locked
@@ -66,57 +79,223 @@ jobs:
           chmod +x ./bin/build_docs.sh ./bin/build_fe.sh
           ./bin/build_fe.sh release
 
-      - name: Build release binary (musl)
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release --target x86_64-unknown-linux-musl
-
-      - name: Package artifact
+      - name: Pack patched tree + web UI
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          OUT="tuliprox-${TAG}-x86_64-unknown-linux-musl"
-          mkdir -p "dist/${OUT}"
+          set -euo pipefail
+          mkdir -p artifacts
+          tar --exclude='./.git' --exclude='./target' --exclude='./artifacts' \
+            -czf artifacts/patched-src.tar.gz .
+          tar -C frontend -czf artifacts/web-ui.tar.gz dist
+          ls -la artifacts/
 
-          # Бинарь
-          cp target/x86_64-unknown-linux-musl/release/tuliprox "dist/${OUT}/"
-
-          # Web-панель — trunk кладёт результат в frontend/dist/
-          cp -r frontend/dist "dist/${OUT}/web"
-
-          tar -C dist -czf "${OUT}.tar.gz" "${OUT}"
-          echo "Archive contents:"
-          tar -tzf "${OUT}.tar.gz"
-
-      - name: Upload artifact
+      - name: Upload prepare artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: tuliprox-x86_64-unknown-linux-musl
-          path: "*.tar.gz"
+          name: prepare
+          path: artifacts/*
+          retention-days: 3
+
+  build:
+    name: ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Official release.sh / build_local.sh targets
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            builder: musl
+            archive: tar.gz
+            binary: tuliprox
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            builder: cargo
+            archive: tar.gz
+            binary: tuliprox
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            builder: cross
+            archive: tar.gz
+            binary: tuliprox
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            builder: cross
+            archive: tar.gz
+            binary: tuliprox
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            builder: cross
+            archive: zip
+            binary: tuliprox.exe
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            builder: cargo
+            archive: zip
+            binary: tuliprox.exe
+
+    steps:
+      - name: Download prepare artifacts
+        uses: actions/download-artifact@v4.3.0
+        with:
+          name: prepare
+          path: prepare
+
+      - name: Unpack patched sources (Linux)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          tar -xzf prepare/patched-src.tar.gz
+          rm -rf frontend/dist
+          mkdir -p frontend
+          tar -xzf prepare/web-ui.tar.gz -C frontend
+          test -f frontend/dist/index.html
+
+      - name: Unpack patched sources (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          tar -xzf prepare/patched-src.tar.gz
+          if (Test-Path frontend/dist) { Remove-Item frontend/dist -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path frontend | Out-Null
+          tar -xzf prepare/web-ui.tar.gz -C frontend
+          if (-not (Test-Path frontend/dist/index.html)) { throw "web UI missing" }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Install musl tools
+        if: matrix.builder == 'musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (musl)
+        if: matrix.builder == 'musl'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build -p tuliprox --release --target ${{ matrix.target }} --locked
+
+      - name: Build (cargo host / native)
+        if: matrix.builder == 'cargo'
+        run: cargo build -p tuliprox --release --target ${{ matrix.target }} --locked
+
+      - name: Build (cross)
+        if: matrix.builder == 'cross'
+        run: cross build -p tuliprox --release --target ${{ matrix.target }} --locked
+
+      - name: Package artifact (Unix shell)
+        if: runner.os != 'Windows'
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          OUT="tuliprox-${TAG}-${TARGET}"
+          mkdir -p "dist/${OUT}"
+          BIN_SRC="target/${TARGET}/release/${BINARY}"
+          test -f "${BIN_SRC}"
+          cp "${BIN_SRC}" "dist/${OUT}/"
+          chmod +x "dist/${OUT}/${BINARY}" || true
+          cp -r frontend/dist "dist/${OUT}/web"
+          mkdir -p artifacts
+          if [[ "${ARCHIVE}" == "zip" ]]; then
+            (cd dist && zip -r "../artifacts/${OUT}.zip" "${OUT}")
+          else
+            tar -C dist -czf "artifacts/${OUT}.tar.gz" "${OUT}"
+          fi
+          (cd artifacts && sha256sum "${OUT}".* > "${OUT}.sha256")
+          ls -la artifacts/
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          $Out = "tuliprox-$env:TAG-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path "dist/$Out" | Out-Null
+          $BinSrc = "target/$env:TARGET/release/$env:BINARY"
+          if (-not (Test-Path $BinSrc)) { throw "missing $BinSrc" }
+          Copy-Item $BinSrc "dist/$Out/"
+          Copy-Item -Recurse frontend/dist "dist/$Out/web"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path "dist/$Out" -DestinationPath "artifacts/$Out.zip" -Force
+          Get-FileHash "artifacts/$Out.zip" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $Out.zip" } |
+            Set-Content -Encoding ascii "artifacts/$Out.sha256"
+          Get-ChildItem artifacts
+
+      - name: Upload target artifact
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: tuliprox-${{ matrix.target }}
+          path: artifacts/*
+          retention-days: 14
 
   release:
     name: Publish GitHub Release
-    needs: build-musl
+    needs: [prepare, build]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    if: always() && needs.prepare.result == 'success' && needs.build.result == 'success'
     steps:
-      - name: Download artifact
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4.3.0
         with:
-          name: tuliprox-x86_64-unknown-linux-musl
+          pattern: tuliprox-*
           path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
 
       - name: Create / update release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          set -euo pipefail
+          mapfile -t FILES < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) | sort)
+          test "${#FILES[@]}" -gt 0
+          NOTES="$(cat <<EOF
+          Release ${TAG} (MaxPain fork)
+
+          Includes Flussonic/TiviMate catchup deltas + Hide Adult.
+          EPG url-tvg and EXTVLCOPT are upstream.
+
+          Artifacts:
+          - x86_64-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - x86_64-pc-windows-gnu
+          - x86_64-pc-windows-msvc
+          EOF
+          )"
           if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
-            gh release upload "$TAG" artifacts/* --clobber --repo "$GH_REPO"
+            gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GH_REPO"
           else
-            gh release create "$TAG" artifacts/* \
+            gh release create "$TAG" "${FILES[@]}" \
               --repo "$GH_REPO" \
               --title "$TAG" \
-              --notes "Release ${TAG} (MaxPain: Flussonic catchup deltas + Hide Adult; url-tvg & EXTVLCOPT are upstream)"
+              --notes "$NOTES"
           fi
