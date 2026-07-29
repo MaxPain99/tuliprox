@@ -1,7 +1,5 @@
 # =============================================================================
 # [BitTV fork] user-hide-adult.patch
-# -----------------------------------------------------------------------------
-# Per-user Hide Adult checkbox (create/edit user form).
 # Apply AFTER m3u-flussonic-tivimate.patch on v3.3.76+.
 # =============================================================================
 
@@ -1886,6 +1884,17 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
                  }
              } else {
                  ShortEpgResultDto::default()
+@@ -932,8 +955,8 @@
+     use shared::{
+         foundation::Filter,
+         model::{
+-            ConfigTargetOptions, EpgCategory, EpgChannel, EpgOutputOptions, EpgProgramme, ProcessingOrder,
+-            StreamEpgItemRequest, StreamEpgRequest, TargetType,
++            ConfigTargetOptions, EpgCategory, EpgChannel, EpgOutputOptions, EpgProgramme, M3uPlaylistItem,
++            PlaylistItemType, ProcessingOrder, StreamEpgItemRequest, StreamEpgRequest, TargetType,
+         },
+         utils::{concat_path, obfuscate_text, Internable},
+     };
 @@ -1419,35 +1442,10 @@
              encrypt_secret: [0; 16],
          };
@@ -1923,13 +1932,12 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
      }
  
      #[test]
-@@ -1467,6 +1465,115 @@
+@@ -1467,6 +1465,114 @@
          let xml = String::from_utf8(writer.into_inner()).expect("serialized XML should be UTF-8");
  
          assert_eq!(xml, "<display-name>café network &amp; &lt;hd&gt;</display-name>");
 +    }
 +
-+    #[tokio::test]
 +    fn blank_m3u_item() -> M3uPlaylistItem {
 +        M3uPlaylistItem {
 +            virtual_id: 0,
@@ -1959,11 +1967,11 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
 +        }
 +    }
 +
++    #[tokio::test]
 +    async fn hide_adult_skips_adult_channels_in_xmltv_output() {
 +        use crate::repository::{
 +            clear_adult_epg_id_cache_for_tests, get_target_storage_path, m3u_get_file_path_for_db, BPlusTree,
 +        };
-+        use shared::model::{M3uPlaylistItem, PlaylistItemType};
 +
 +        clear_adult_epg_id_cache_for_tests();
 +        let dir = tempdir().expect("temp dir");
@@ -2039,7 +2047,7 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
      }
  
      #[tokio::test]
-@@ -1743,7 +1850,6 @@
+@@ -1743,7 +1849,6 @@
              &request_id,
              "42".intern(),
              4,
@@ -2047,7 +2055,7 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
          )
          .await;
          let body = response_body_text(response).await;
-@@ -1763,7 +1869,6 @@
+@@ -1763,7 +1868,6 @@
              &request_id,
              "42".intern(),
              4,
