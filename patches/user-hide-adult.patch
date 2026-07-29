@@ -216,6 +216,14 @@ diff --git a/backend/src/repository/user_repository.rs b/backend/src/repository/
              comment: stored.comment.clone(),
              priority: stored.priority.unwrap_or(0),
              soft_connections: stored.soft_connections.unwrap_or(0),
+@@ -518,6 +521,7 @@
+             status: Some(status),
+             output_clusters: ClusterFlags::all(),
+             ui_enabled: true,
++            hide_adult: false,
+             comment: None,
+             priority: 0,
+             soft_connections: 0,
 diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/repository/bplustree/migration.rs
 --- a/backend/src/repository/bplustree/migration.rs
 +++ b/backend/src/repository/bplustree/migration.rs
@@ -515,7 +523,7 @@ diff --git a/backend/src/repository/adult_epg_ids.rs b/backend/src/repository/ad
 new file mode 100644
 --- /dev/null
 +++ b/backend/src/repository/adult_epg_ids.rs
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,361 @@
 +//! Cached adult EPG-id blocklist for Hide Adult XMLTV filtering.
 +//!
 +//! Goal: keep `/xmltv.php` cheap when `hide_adult` is on.
@@ -748,6 +756,62 @@ new file mode 100644
 +    use shared::utils::Internable;
 +    use std::{collections::HashSet, sync::Arc};
 +
++    fn blank_m3u_item() -> M3uPlaylistItem {
++        M3uPlaylistItem {
++            virtual_id: 0,
++            provider_id: "".intern(),
++            input_stream_id: "".intern(),
++            name: "".intern(),
++            chno: 0,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "".intern(),
++            title: "".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "".intern(),
++            rec: "".intern(),
++            url: "".intern(),
++            epg_channel_id: None,
++            input_name: "".intern(),
++            item_type: PlaylistItemType::Live,
++            t_stream_url: "".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: None,
++            upstream_user_agent: None,
++        }
++    }
++
++
++    fn blank_xtream_item() -> XtreamPlaylistItem {
++        XtreamPlaylistItem {
++            virtual_id: 0,
++            provider_id: 0,
++            name: "".intern(),
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "".intern(),
++            title: "".intern(),
++            parent_code: "".intern(),
++            rec: "".intern(),
++            url: "".intern(),
++            epg_channel_id: None,
++            xtream_cluster: XtreamCluster::Live,
++            additional_properties: None,
++            item_type: PlaylistItemType::Live,
++            category_id: 0,
++            input_name: "".intern(),
++            channel_no: 0,
++            source_ordinal: 0,
++            input_stream_id: "".intern(),
++            upstream_user_agent: None,
++        }
++    }
++
++
 +    #[test]
 +    fn adult_group_live_item_contributes_folded_epg_id() {
 +        let mut ids = HashSet::new();
@@ -755,7 +819,7 @@ new file mode 100644
 +            group: "18+ (Adult)".intern(),
 +            item_type: PlaylistItemType::Live,
 +            epg_channel_id: Some("Adult.Channel".intern()),
-+            ..M3uPlaylistItem::default()
++            ..blank_m3u_item()
 +        };
 +        collect_from_m3u_item(&item, &mut ids);
 +        assert!(ids.contains(&"adult.channel".intern()));
@@ -769,7 +833,7 @@ new file mode 100644
 +                group: "News".intern(),
 +                item_type: PlaylistItemType::Live,
 +                epg_channel_id: Some("news.1".intern()),
-+                ..M3uPlaylistItem::default()
++                ..blank_m3u_item()
 +            },
 +            &mut ids,
 +        );
@@ -778,7 +842,7 @@ new file mode 100644
 +                group: "XXX".intern(),
 +                item_type: PlaylistItemType::Video,
 +                epg_channel_id: Some("vod.adult".intern()),
-+                ..M3uPlaylistItem::default()
++                ..blank_m3u_item()
 +            },
 +            &mut ids,
 +        );
@@ -797,7 +861,7 @@ new file mode 100644
 +                    is_adult: 1,
 +                    ..LiveStreamProperties::default()
 +                }))),
-+                ..XtreamPlaylistItem::default()
++                ..blank_xtream_item()
 +            },
 +            &mut ids,
 +        );
@@ -862,7 +926,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
          return axum::http::StatusCode::FORBIDDEN.into_response();
      }
  
-@@ -1095,10 +1095,72 @@
+@@ -1095,10 +1095,74 @@
  
      #[test]
      fn resolved_catchup_item_requires_rechecked_permissions() {
@@ -896,13 +960,14 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
 +            t_catchup_mode: None,
 +            source_ordinal: 0,
 +            additional_properties: None,
++            upstream_user_agent: None,
 +        };
 +        assert!(!resolved_m3u_item_is_allowed(&user, &item));
 +    }
 +
 +    #[test]
 +    fn hide_adult_blocks_adult_group_even_when_cluster_allowed() {
-+        use shared::utils::Internable();
++        use shared::utils::Internable;
 +
 +        let mut user = ProxyUserCredentials::default();
 +        user.hide_adult = true;
@@ -931,6 +996,7 @@ diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3
 +            t_catchup_mode: None,
 +            source_ordinal: 0,
 +            additional_properties: None,
++            upstream_user_agent: None,
 +        };
 +        assert!(!resolved_m3u_item_is_allowed(&user, &item));
      }
@@ -1241,15 +1307,20 @@ diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints
              VideoStreamProperties, XtreamCluster, XtreamPlaylistItem,
          },
          utils::Internable,
-@@ -2016,7 +1947,6 @@
+@@ -2016,9 +1947,9 @@
              channel_no: 1,
              source_ordinal: 0,
              input_stream_id: "".intern(),
 -            upstream_user_agent: None,
-         }
-     }
+-        }
+-    }
++        }
++                upstream_user_agent: None,
++        }
  
-@@ -2121,211 +2051,6 @@
+     #[tokio::test]
+     async fn xtream_short_epg_returns_imported_ics_programme_for_matching_channel_id() {
+@@ -2121,211 +2052,6 @@
          assert_eq!(json["epg_listings"][0]["channel_id"], "f1.calendar");
          assert_eq!(decode_listing_text("title"), "Formula 1 Qualifying");
          assert_eq!(decode_listing_text("description"), "Imported from ICS");
@@ -1461,15 +1532,20 @@ diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints
      }
  
      #[tokio::test]
-@@ -2373,7 +2098,6 @@
+@@ -2373,9 +2099,9 @@
              channel_no: 0,
              source_ordinal: 0,
              input_stream_id: "813563".intern(),
 -            upstream_user_agent: None,
-         }
-     }
+-        }
+-    }
++        }
++                upstream_user_agent: None,
++        }
  
-@@ -2573,202 +2297,4 @@
+     #[test]
+     fn post_query_only_request_prefers_query_when_form_is_missing() {
+@@ -2573,202 +2299,4 @@
  
          assert_eq!(resolve_xtream_playback_extension(Some(".m3u8"), &pli).as_deref(), Some(".m3u8"));
      }
@@ -1847,13 +1923,42 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
      }
  
      #[test]
-@@ -1467,6 +1465,86 @@
+@@ -1467,6 +1465,115 @@
          let xml = String::from_utf8(writer.into_inner()).expect("serialized XML should be UTF-8");
  
          assert_eq!(xml, "<display-name>café network &amp; &lt;hd&gt;</display-name>");
 +    }
 +
 +    #[tokio::test]
++    fn blank_m3u_item() -> M3uPlaylistItem {
++        M3uPlaylistItem {
++            virtual_id: 0,
++            provider_id: "".intern(),
++            input_stream_id: "".intern(),
++            name: "".intern(),
++            chno: 0,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "".intern(),
++            title: "".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "".intern(),
++            rec: "".intern(),
++            url: "".intern(),
++            epg_channel_id: None,
++            input_name: "".intern(),
++            item_type: PlaylistItemType::Live,
++            t_stream_url: "".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: None,
++            upstream_user_agent: None,
++        }
++    }
++
 +    async fn hide_adult_skips_adult_channels_in_xmltv_output() {
 +        use crate::repository::{
 +            clear_adult_epg_id_cache_for_tests, get_target_storage_path, m3u_get_file_path_for_db, BPlusTree,
@@ -1884,7 +1989,7 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
 +                epg_channel_id: Some("adult.one".intern()),
 +                title: "Adult One".intern(),
 +                name: "Adult One".intern(),
-+                ..M3uPlaylistItem::default()
++                ..blank_m3u_item()
 +            },
 +        );
 +        playlist.insert(
@@ -1896,7 +2001,7 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
 +                epg_channel_id: Some("news.one".intern()),
 +                title: "News One".intern(),
 +                name: "News One".intern(),
-+                ..M3uPlaylistItem::default()
++                ..blank_m3u_item()
 +            },
 +        );
 +        playlist.store(&m3u_db).expect("store m3u playlist");
@@ -1934,7 +2039,7 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
      }
  
      #[tokio::test]
-@@ -1743,7 +1821,6 @@
+@@ -1743,7 +1850,6 @@
              &request_id,
              "42".intern(),
              4,
@@ -1942,7 +2047,7 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
          )
          .await;
          let body = response_body_text(response).await;
-@@ -1763,7 +1840,6 @@
+@@ -1763,7 +1869,6 @@
              &request_id,
              "42".intern(),
              4,
@@ -1950,6 +2055,36 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
          )
          .await;
          let disabled_body = response_body_text(disabled_response).await;
+diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
+--- a/backend/src/api/api_utils.rs
++++ b/backend/src/api/api_utils.rs
+@@ -4553,6 +4553,7 @@
+         status: None,
+         output_clusters: shared::model::ClusterFlags::all(),
+         ui_enabled: false,
++        hide_adult: false,
+         comment: None,
+         priority: 0,
+         soft_connections: 0,
+@@ -9743,6 +9744,7 @@
+             status: None,
+             output_clusters: ClusterFlags::all(),
+             ui_enabled: true,
++            hide_adult: false,
+             comment: None,
+             priority: 0,
+             soft_connections: 0,
+diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
+--- a/backend/src/api/model/active_user_manager.rs
++++ b/backend/src/api/model/active_user_manager.rs
+@@ -4666,6 +4666,7 @@
+             status: None,
+             output_clusters: shared::model::ClusterFlags::all(),
+             ui_enabled: true,
++            hide_adult: false,
+             comment: None,
+             priority: 0,
+             soft_connections,
 diff --git a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
 --- a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
 +++ b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
