@@ -1,8 +1,8 @@
 # Unified M3U catchup export, default Wink append template, DVR leak fix, panel EPG archive
-# Generated from clean upstream + Catchup preserve in ensure_hls_cache_stream_registered
+# Includes: Catchup preserve on shared HLS register + Xtream/HLS archive_reference recovery
 
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
-index 9b65185..04369f0 100644
+index 9b65185..adf86ee 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
 @@ -103,6 +103,73 @@ fn is_m3u_catchup_session_token(session_token: &str) -> bool {
@@ -152,7 +152,21 @@ index 9b65185..04369f0 100644
      } else {
          channel.item_type = PlaylistItemType::LiveHls;
          channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(channel.cluster);
-@@ -5747,6 +5820,7 @@ async fn hls_proxy_manifest(
+@@ -5268,6 +5341,13 @@ pub(in crate::api) async fn handle_hls_stream_request(
+         );
+     }
+     let url = ensure_hls_manifest_extension(&normalized_hls_url);
++    // Recover archive context when callers (esp. Xtream timeshift) pass None but the
++    // resolved provider URL / catchup session still carries Flussonic archive markers.
++    let archive_reference = archive_reference
++        .or_else(|| m3u_archive_epg_reference_ts(&url))
++        .or_else(|| {
++            user_session.and_then(|session| m3u_catchup_epg_reference_from_session_token(&session.token))
++        });
+     let hls_cache_origin = build_hls_origin_resolution(input, &url);
+     let hls_origin_source = hls_cache_origin
+         .as_ref()
+@@ -5747,6 +5827,7 @@ async fn hls_proxy_manifest(
  async fn hls_api_stream(
      fingerprint: Fingerprint,
      req_headers: HeaderMap,
@@ -160,7 +174,7 @@ index 9b65185..04369f0 100644
      axum::extract::Path(params): axum::extract::Path<HlsApiPathParams>,
      axum::extract::State(app_state): axum::extract::State<Arc<AppState>>,
  ) -> impl IntoResponse + Send {
-@@ -5765,6 +5839,23 @@ async fn hls_api_stream(
+@@ -5765,6 +5846,23 @@ async fn hls_api_stream(
          }
          (user, target)
      };
@@ -184,7 +198,7 @@ index 9b65185..04369f0 100644
      hls_api_stream_resolved(
          fingerprint,
          req_headers,
-@@ -5778,6 +5869,58 @@ async fn hls_api_stream(
+@@ -5778,6 +5876,58 @@ async fn hls_api_stream(
      .await
  }
  
@@ -243,7 +257,7 @@ index 9b65185..04369f0 100644
  #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
  async fn hls_api_stream_resolved(
      fingerprint: Fingerprint,
-@@ -5839,7 +5982,8 @@ async fn hls_api_stream_resolved(
+@@ -5839,7 +5989,8 @@ async fn hls_api_stream_resolved(
      }
  
      if let Some(session) = &mut user_session {
@@ -253,7 +267,7 @@ index 9b65185..04369f0 100644
          if session.permission == UserConnectionPermission::Exhausted {
              let stream_channel = resolve_stream_channel(
                  &app_state,
-@@ -5888,7 +6032,7 @@ async fn hls_api_stream_resolved(
+@@ -5888,7 +6039,7 @@ async fn hls_api_stream_resolved(
              _ => return axum::http::StatusCode::BAD_REQUEST.into_response(),
          };
          let hls_url = hls_url.intern();
@@ -262,7 +276,7 @@ index 9b65185..04369f0 100644
          session.stream_url = hls_url.clone();
          if session.virtual_id == virtual_id {
              app_state.connection_manager.touch_http_activity(&user.username, &session.token, &fingerprint.addr).await;
-@@ -6062,7 +6206,7 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
+@@ -6062,7 +6213,7 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
              axum::routing::get(hls_proxy_resource),
          )
          .route(
@@ -271,7 +285,7 @@ index 9b65185..04369f0 100644
              axum::routing::get(hls_api_stream),
          )
      //cfg.service(web::resource("/hls/{token}/{stream}").route(web::get().to(xtream_player_api_hls_stream)));
-@@ -6073,7 +6217,8 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
+@@ -6073,7 +6224,8 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
  mod tests {
      use super::{
          build_hls_manifest_request_headers, extract_hls_provider_session_headers, hls_api_register,
@@ -281,7 +295,7 @@ index 9b65185..04369f0 100644
      };
      use crate::{
          api::model::{
-@@ -6156,6 +6301,48 @@ mod tests {
+@@ -6156,6 +6308,48 @@ mod tests {
          assert_eq!(m3u_archive_epg_reference_ts("http://provider/live/42.m3u8?start=1700000000"), None);
      }
  
@@ -330,8 +344,54 @@ index 9b65185..04369f0 100644
      #[test]
      fn archive_epg_reference_supports_contextual_start_aliases() {
          assert_eq!(
+diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints/xtream_api.rs
+index 9c93b8d..81c0ac5 100644
+--- a/backend/src/api/endpoints/xtream_api.rs
++++ b/backend/src/api/endpoints/xtream_api.rs
+@@ -17,7 +17,8 @@ use crate::{
+         endpoints::{
+             hls_api::{
+                 build_virtual_hls_entry_path, handle_hls_stream_request, hls_admission_failure_manifest_response,
+-                hls_custom_video_manifest_response, HlsEntryStreamIdentity,
++                hls_custom_video_manifest_response, m3u_archive_epg_reference_ts,
++                m3u_catchup_epg_reference_from_session_token, HlsEntryStreamIdentity,
+             },
+             xmltv_api::{get_empty_epg_response, get_epg_path_for_target_by_type, serve_short_epg},
+         },
+@@ -636,6 +637,9 @@ async fn xtream_player_api_stream(
+             return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+         };
+         let original_hls_entry_path = build_virtual_hls_entry_path(&target, &input, &user, pli.virtual_id);
++        let archive_reference = m3u_archive_epg_reference_ts(stream_url.as_ref())
++            .or_else(|| m3u_archive_epg_reference_ts(pli.url.as_ref()))
++            .or_else(|| m3u_catchup_epg_reference_from_session_token(&session_key));
+         return handle_hls_stream_request(
+             fingerprint,
+             app_state,
+@@ -643,7 +647,7 @@ async fn xtream_player_api_stream(
+             &target,
+             user_session.as_ref(),
+             &stream_url,
+-            None,
++            archive_reference,
+             stream_identity,
+             &input,
+             req_headers,
+@@ -655,7 +659,11 @@ async fn xtream_player_api_stream(
+         .into_response();
+     }
+ 
+-    let stream_channel = create_stream_channel_with_type(target.id, &pli, item_type);
++    let archive_reference = m3u_archive_epg_reference_ts(stream_url.as_ref())
++        .or_else(|| m3u_archive_epg_reference_ts(pli.url.as_ref()))
++        .or_else(|| m3u_catchup_epg_reference_from_session_token(&session_key));
++    let stream_channel = create_stream_channel_with_type(target.id, &pli, item_type)
++        .with_epg_reference_ts(archive_reference);
+ 
+     let pinned_provider =
+         user_session.as_ref().filter(|_| item_type.requires_provider_affinity()).map(|session| &session.provider);
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
-index ed3ebb5..5f6043c 100644
+index 9055e08..8eb8344 100644
 --- a/backend/src/api/model/active_user_manager.rs
 +++ b/backend/src/api/model/active_user_manager.rs
 @@ -2873,6 +2873,18 @@ impl ActiveUserManager {
@@ -413,7 +473,7 @@ index d254fde..ba6f979 100644
          "fs" => derive_flussonic_template(source_url).map(Cow::Owned),
          "vod" => Some(Cow::Borrowed("{catchup-id}")),
 diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
-index f7b987d..54944a6 100644
+index a9ff41c..d91fe81 100644
 --- a/shared/src/model/playlist.rs
 +++ b/shared/src/model/playlist.rs
 @@ -618,6 +618,28 @@ fn append_m3u_catchup_attributes(
