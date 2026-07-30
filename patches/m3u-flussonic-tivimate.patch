@@ -1,8 +1,8 @@
-# Unified M3U catchup export, default Wink append template, DVR leak fix, panel EPG archive
-# Includes: Catchup preserve on shared HLS register + Xtream/HLS archive_reference recovery
+# Flussonic/TiviMate catchup + panel archive type (Catchup not Live)
+# Force Catchup on shared HLS register; pass catchup session_key hint into HLS cache
 
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
-index 9b65185..adf86ee 100644
+index 9b65185..81db70a 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
 @@ -103,6 +103,73 @@ fn is_m3u_catchup_session_token(session_token: &str) -> bool {
@@ -115,15 +115,30 @@ index 9b65185..adf86ee 100644
      token: String,
  }
  
-@@ -1274,8 +1340,13 @@ async fn ensure_hls_cache_stream_registered(
+@@ -1274,8 +1340,28 @@ async fn ensure_hls_cache_stream_registered(
          .map_or_else(|| Cow::Borrowed(""), |value| String::from_utf8_lossy(value.as_bytes()));
  
      stream_channel.url = Arc::from(hls_cache_stream_stats_url(&proxy_session_id));
 -    stream_channel.item_type = PlaylistItemType::LiveHls;
 -    stream_channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(stream_channel.cluster);
-+    // Shared HLS cache uses LiveHls transport, but archive leases must keep Catchup
-+    // + epg_reference_ts so the web panel does not show Live for archive playback.
-+    if stream_channel.item_type != PlaylistItemType::Catchup {
++    // Panel Streams/History read this item_type. Shared HLS transport is still HLS, but
++    // archive/catchup leases must never be published as Live/LiveHls.
++    let panel_archive_reference = origin_source
++        .archive_reference
++        .or(access.epg_reference_ts)
++        .or_else(|| access.archive_origin_url.as_deref().and_then(m3u_archive_epg_reference_ts))
++        .or_else(|| m3u_catchup_epg_reference_from_session_token(&access.user_session_token))
++        .or(stream_channel.epg_reference_ts);
++    let is_archive_playback = panel_archive_reference.is_some()
++        || access.archive_origin_url.is_some()
++        || origin_source.archive_reference.is_some()
++        || is_m3u_catchup_session_token(&access.user_session_token)
++        || stream_channel.item_type == PlaylistItemType::Catchup;
++    if is_archive_playback {
++        stream_channel.item_type = PlaylistItemType::Catchup;
++        stream_channel.cluster = XtreamCluster::Video;
++        stream_channel.epg_reference_ts = panel_archive_reference;
++    } else {
 +        stream_channel.item_type = PlaylistItemType::LiveHls;
 +        stream_channel.cluster =
 +            XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(stream_channel.cluster);
@@ -131,7 +146,7 @@ index 9b65185..adf86ee 100644
      let shared_stream_id = hls_cache_shared_stream_id(&proxy_session_id);
      stream_channel.shared = true;
      stream_channel.shared_stream_id = Some(shared_stream_id);
-@@ -1359,13 +1430,15 @@ async fn build_hls_cache_stream_channel(
+@@ -1359,13 +1445,15 @@ async fn build_hls_cache_stream_channel(
          fallback_hls_cache_stream_channel(0, access.virtual_id, origin_source, proxy_session_id)
      };
  
@@ -152,7 +167,39 @@ index 9b65185..adf86ee 100644
      } else {
          channel.item_type = PlaylistItemType::LiveHls;
          channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(channel.cluster);
-@@ -5268,6 +5341,13 @@ pub(in crate::api) async fn handle_hls_stream_request(
+@@ -3716,6 +3804,7 @@ async fn try_hls_cache_entry_redirect(
+     origin_source: HlsOriginSource,
+     virtual_id: u32,
+     existing_user_session: Option<&UserSession>,
++    session_token_hint: Option<&str>,
+     request_url: &str,
+     input: &ConfigInput,
+     connection_permission: UserConnectionPermission,
+@@ -3732,11 +3821,14 @@ async fn try_hls_cache_entry_redirect(
+     let now_ms = current_time_millis();
+     let origin_connection_kind = hls_entry_origin_connection_kind(connection_permission, connection_kind);
+     let access_lease_id = new_hls_access_lease_id();
++    let existing_token = existing_user_session
++        .map(|session| session.token.as_str())
++        .or(session_token_hint);
+     let session_token = create_hls_cache_user_session_token(
+         fingerprint,
+         &user.username,
+         virtual_id,
+-        existing_user_session.map(|session| session.token.as_str()),
++        existing_token,
+         origin_source.archive_reference,
+     );
+     let session_token = prepare_hls_cache_user_session(
+@@ -5244,6 +5336,7 @@ pub(in crate::api) async fn handle_hls_stream_request(
+     user: &ProxyUserCredentials,
+     target: &ConfigTarget,
+     user_session: Option<&UserSession>,
++    session_token_hint: Option<&str>,
+     hls_url: &str,
+     archive_reference: Option<i64>,
+     stream_identity: HlsEntryStreamIdentity,
+@@ -5268,6 +5361,16 @@ pub(in crate::api) async fn handle_hls_stream_request(
          );
      }
      let url = ensure_hls_manifest_extension(&normalized_hls_url);
@@ -161,12 +208,23 @@ index 9b65185..adf86ee 100644
 +    let archive_reference = archive_reference
 +        .or_else(|| m3u_archive_epg_reference_ts(&url))
 +        .or_else(|| {
-+            user_session.and_then(|session| m3u_catchup_epg_reference_from_session_token(&session.token))
++            user_session
++                .map(|session| session.token.as_str())
++                .or(session_token_hint)
++                .and_then(m3u_catchup_epg_reference_from_session_token)
 +        });
      let hls_cache_origin = build_hls_origin_resolution(input, &url);
      let hls_origin_source = hls_cache_origin
          .as_ref()
-@@ -5747,6 +5827,7 @@ async fn hls_proxy_manifest(
+@@ -5298,6 +5401,7 @@ pub(in crate::api) async fn handle_hls_stream_request(
+             origin_source,
+             virtual_id,
+             user_session,
++            session_token_hint,
+             if archive_reference.is_some() {
+                 url.as_str()
+             } else {
+@@ -5747,6 +5851,7 @@ async fn hls_proxy_manifest(
  async fn hls_api_stream(
      fingerprint: Fingerprint,
      req_headers: HeaderMap,
@@ -174,7 +232,7 @@ index 9b65185..adf86ee 100644
      axum::extract::Path(params): axum::extract::Path<HlsApiPathParams>,
      axum::extract::State(app_state): axum::extract::State<Arc<AppState>>,
  ) -> impl IntoResponse + Send {
-@@ -5765,6 +5846,23 @@ async fn hls_api_stream(
+@@ -5765,6 +5870,23 @@ async fn hls_api_stream(
          }
          (user, target)
      };
@@ -198,7 +256,7 @@ index 9b65185..adf86ee 100644
      hls_api_stream_resolved(
          fingerprint,
          req_headers,
-@@ -5778,6 +5876,58 @@ async fn hls_api_stream(
+@@ -5778,6 +5900,58 @@ async fn hls_api_stream(
      .await
  }
  
@@ -257,7 +315,7 @@ index 9b65185..adf86ee 100644
  #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
  async fn hls_api_stream_resolved(
      fingerprint: Fingerprint,
-@@ -5839,7 +5989,8 @@ async fn hls_api_stream_resolved(
+@@ -5839,7 +6013,8 @@ async fn hls_api_stream_resolved(
      }
  
      if let Some(session) = &mut user_session {
@@ -267,7 +325,7 @@ index 9b65185..adf86ee 100644
          if session.permission == UserConnectionPermission::Exhausted {
              let stream_channel = resolve_stream_channel(
                  &app_state,
-@@ -5888,7 +6039,7 @@ async fn hls_api_stream_resolved(
+@@ -5888,7 +6063,7 @@ async fn hls_api_stream_resolved(
              _ => return axum::http::StatusCode::BAD_REQUEST.into_response(),
          };
          let hls_url = hls_url.intern();
@@ -276,7 +334,15 @@ index 9b65185..adf86ee 100644
          session.stream_url = hls_url.clone();
          if session.virtual_id == virtual_id {
              app_state.connection_manager.touch_http_activity(&user.username, &session.token, &fingerprint.addr).await;
-@@ -6062,7 +6213,7 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
+@@ -5986,6 +6161,7 @@ async fn hls_api_stream_resolved(
+                 &user,
+                 &target,
+                 Some(session),
++                None,
+                 &session.stream_url,
+                 archive_reference,
+                 source.stream_identity,
+@@ -6062,7 +6238,7 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
              axum::routing::get(hls_proxy_resource),
          )
          .route(
@@ -285,7 +351,7 @@ index 9b65185..adf86ee 100644
              axum::routing::get(hls_api_stream),
          )
      //cfg.service(web::resource("/hls/{token}/{stream}").route(web::get().to(xtream_player_api_hls_stream)));
-@@ -6073,7 +6224,8 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
+@@ -6073,7 +6249,8 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
  mod tests {
      use super::{
          build_hls_manifest_request_headers, extract_hls_provider_session_headers, hls_api_register,
@@ -295,7 +361,7 @@ index 9b65185..adf86ee 100644
      };
      use crate::{
          api::model::{
-@@ -6156,6 +6308,48 @@ mod tests {
+@@ -6156,6 +6333,48 @@ mod tests {
          assert_eq!(m3u_archive_epg_reference_ts("http://provider/live/42.m3u8?start=1700000000"), None);
      }
  
@@ -344,8 +410,76 @@ index 9b65185..adf86ee 100644
      #[test]
      fn archive_epg_reference_supports_contextual_start_aliases() {
          assert_eq!(
+@@ -9707,6 +9926,7 @@ mod tests {
+             &user,
+             &target,
+             None,
++            None,
+             archive_url,
+             Some(1_784_898_000),
+             stream_identity,
+@@ -9829,6 +10049,7 @@ mod tests {
+             &user,
+             &target,
+             None,
++            None,
+             "http://origin.example.com/live/user/pass/1001.m3u8",
+             None,
+             super::HlsEntryStreamIdentity::new(1001, "80510").expect("valid input stream identity"),
+@@ -9886,6 +10107,7 @@ mod tests {
+             &user,
+             &first_target,
+             None,
++            None,
+             "http://origin.example.com/live/user/pass/1001.m3u8",
+             None,
+             super::HlsEntryStreamIdentity::new(1001, "80510").expect("first input stream identity"),
+@@ -9903,6 +10125,7 @@ mod tests {
+             &user,
+             &second_target,
+             None,
++            None,
+             "http://origin.example.com/live/user/pass/9007.m3u8",
+             None,
+             super::HlsEntryStreamIdentity::new(9007, "80510").expect("second input stream identity"),
+@@ -9989,6 +10212,7 @@ mod tests {
+             &user,
+             &target,
+             None,
++            None,
+             "http://origin.example.com/live/user/pass/12345.m3u8",
+             None,
+             super::HlsEntryStreamIdentity::new(12345, "80510").expect("valid input stream identity"),
+@@ -10759,6 +10983,7 @@ mod tests {
+             origin_source,
+             80510,
+             None,
++            None,
+             "http://origin.example.com/live/user/pass/80510.m3u8",
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10796,6 +11021,7 @@ mod tests {
+             origin_source,
+             70001,
+             None,
++            None,
+             "http://media.example.com/channel/playlist.m3u8",
+             &input,
+             UserConnectionPermission::Allowed,
+diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
+index 020c0ed..ae5332b 100644
+--- a/backend/src/api/endpoints/m3u_api.rs
++++ b/backend/src/api/endpoints/m3u_api.rs
+@@ -452,6 +452,7 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
+             &user,
+             &target,
+             user_session.as_ref(),
++            Some(session_key.as_str()),
+             &pli.url,
+             archive_reference,
+             stream_identity,
 diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints/xtream_api.rs
-index 9c93b8d..81c0ac5 100644
+index 9c93b8d..f7666aa 100644
 --- a/backend/src/api/endpoints/xtream_api.rs
 +++ b/backend/src/api/endpoints/xtream_api.rs
 @@ -17,7 +17,8 @@ use crate::{
@@ -358,7 +492,7 @@ index 9c93b8d..81c0ac5 100644
              },
              xmltv_api::{get_empty_epg_response, get_epg_path_for_target_by_type, serve_short_epg},
          },
-@@ -636,6 +637,9 @@ async fn xtream_player_api_stream(
+@@ -636,14 +637,18 @@ async fn xtream_player_api_stream(
              return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
          };
          let original_hls_entry_path = build_virtual_hls_entry_path(&target, &input, &user, pli.virtual_id);
@@ -368,16 +502,17 @@ index 9c93b8d..81c0ac5 100644
          return handle_hls_stream_request(
              fingerprint,
              app_state,
-@@ -643,7 +647,7 @@ async fn xtream_player_api_stream(
+             &user,
              &target,
              user_session.as_ref(),
++            Some(session_key.as_str()),
              &stream_url,
 -            None,
 +            archive_reference,
              stream_identity,
              &input,
              req_headers,
-@@ -655,7 +659,11 @@ async fn xtream_player_api_stream(
+@@ -655,7 +660,11 @@ async fn xtream_player_api_stream(
          .into_response();
      }
  
@@ -390,6 +525,17 @@ index 9c93b8d..81c0ac5 100644
  
      let pinned_provider =
          user_session.as_ref().filter(|_| item_type.requires_provider_affinity()).map(|session| &session.provider);
+@@ -927,8 +936,9 @@ pub(in crate::api) async fn xtream_player_api_stream_with_token(
+                 &user,
+                 &target,
+                 None,
++                Some(session_key.as_str()),
+                 &pli.url,
+-                None,
++                m3u_archive_epg_reference_ts(pli.url.as_ref()),
+                 stream_identity,
+                 &input,
+                 req_headers,
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
 index 9055e08..8eb8344 100644
 --- a/backend/src/api/model/active_user_manager.rs
