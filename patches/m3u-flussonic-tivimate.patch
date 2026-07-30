@@ -113,6 +113,29 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
 +    /// Single obfuscated token, or a leaked relative origin path (`dvr-YYYY/…ts`).
      token: String,
  }
+
+@@ -1365,14 +1431,16 @@ async fn build_hls_cache_stream_channel(
+     } else {
+         fallback_hls_cache_stream_channel(0, access.virtual_id, origin_source, proxy_session_id)
+     };
+ 
+-    if access.epg_reference_ts.is_some()
+-        || access.archive_origin_url.is_some()
+-        || is_m3u_catchup_session_token(&access.user_session_token)
+-    {
++    let archive_reference = access
++        .epg_reference_ts
++        .or_else(|| access.archive_origin_url.as_deref().and_then(m3u_archive_epg_reference_ts))
++        .or_else(|| m3u_catchup_epg_reference_from_session_token(&access.user_session_token));
++
++    if archive_reference.is_some() || access.archive_origin_url.is_some() || is_m3u_catchup_session_token(&access.user_session_token) {
+         channel.item_type = PlaylistItemType::Catchup;
+         channel.cluster = XtreamCluster::Video;
+-        channel.epg_reference_ts = access.epg_reference_ts;
++        channel.epg_reference_ts = archive_reference;
+     } else {
+         channel.item_type = PlaylistItemType::LiveHls;
+         channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(channel.cluster);
  
 @@ -5747,6 +5813,7 @@
  async fn hls_api_stream(
