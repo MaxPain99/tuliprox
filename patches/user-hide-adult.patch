@@ -752,7 +752,7 @@ new file mode 100644
 +        XtreamPlaylistItem,
 +    };
 +    use shared::utils::Internable;
-+    use std::{collections::HashSet, sync::Arc};
++    use std::collections::HashSet;
 +
 +    fn blank_m3u_item() -> M3uPlaylistItem {
 +        M3uPlaylistItem {
