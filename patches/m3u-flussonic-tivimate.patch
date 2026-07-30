@@ -4,7 +4,7 @@
 # Connections never wipes stream rows; Catchup never TTL-hidden
 
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
-index 4263a498..3dc172da 100644
+index 4263a498..3ae82330 100644
 --- a/backend/src/api/api_utils.rs
 +++ b/backend/src/api/api_utils.rs
 @@ -2535,9 +2535,9 @@ pub async fn force_provider_stream_response(
@@ -29,33 +29,17 @@ index 4263a498..3dc172da 100644
      for addr in cleanup_addrs {
          app_state.connection_manager.release_provider_connection(addr).await;
          if close_client_socket {
-@@ -4590,6 +4590,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
-         status: None,
-         output_clusters: shared::model::ClusterFlags::all(),
-         ui_enabled: false,
-+        hide_adult: false,
-         comment: None,
-         priority: 0,
-         soft_connections: 0,
-@@ -9780,6 +9781,7 @@ mod tests {
-             status: None,
-             output_clusters: ClusterFlags::all(),
-             ui_enabled: true,
-+            hide_adult: false,
-             comment: None,
-             priority: 0,
-             soft_connections: 0,
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
-index 9b65185c..807bbc97 100644
+index 9b65185c..65474bc7 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
 @@ -103,6 +103,123 @@ fn is_m3u_catchup_session_token(session_token: &str) -> bool {
      session_token.starts_with("m3u-catchup|") || session_token.starts_with("catchup|")
  }
  
-+/// Recover archive EPG reference from `m3u-catchup|тАж|archive|{start}|{duration}` session keys.
++/// Recover archive EPG reference from `m3u-catchup|╤В╨Р╨╢|archive|{start}|{duration}` session keys.
 +///
-+/// BitTV archive media URLs look like `тАж/2026/07/24/14/13/38-06800.ts` and lose Flussonic
++/// BitTV archive media URLs look like `╤В╨Р╨╢/2026/07/24/14/13/38-06800.ts` and lose Flussonic
 +/// path markers after HLS rewrite, so the panel would otherwise keep showing Live + live EPG.
 +pub(in crate::api) fn m3u_catchup_epg_reference_from_session_token(session_token: &str) -> Option<i64> {
 +    let rest = session_token.strip_prefix("m3u-catchup|")?;
@@ -88,7 +72,7 @@ index 9b65185c..807bbc97 100644
 +        || (rel.len() >= 10 && rel.as_bytes().get(4) == Some(&b'/') && rel.starts_with('2'))
 +}
 +
-+/// BitTV / Flussonic date-tree segments: `YYYY/MM/DD/HH/MM/SS-тАж.ts` or `dvr-YYYY/тАж`.
++/// BitTV / Flussonic date-tree segments: `YYYY/MM/DD/HH/MM/SS-╤В╨Р╨╢.ts` or `dvr-YYYY/╤В╨Р╨╢`.
 +pub(in crate::api) fn epg_reference_ts_from_date_tree_path(path: &str) -> Option<i64> {
 +    let owned_path;
 +    let mut rel = path.trim_start_matches('/');
@@ -129,7 +113,7 @@ index 9b65185c..807bbc97 100644
 +/// Join a client-leaked relative DVR/media path against the session's origin URL.
 +///
 +/// When an origin `.m3u8` is force-piped without `rewrite_hls`, players resolve
-+/// `dvr-2026/тАжts?token=` against the proxy playlist URL (`/hls/тАж/{token}.m3u8`).
++/// `dvr-2026/╤В╨Р╨╢ts?token=` against the proxy playlist URL (`/hls/╤В╨Р╨╢/{token}.m3u8`).
 +fn resolve_leaked_hls_relative_origin(
 +    session_stream_url: &str,
 +    relative_path: &str,
@@ -199,7 +183,7 @@ index 9b65185c..807bbc97 100644
 -        if let Ok(ts) = start.parse::<i64>() {
 -            return Some(ts);
 -        }
-+    // BitTV date-tree: /тАж/YYYY/MM/DD/HH/MM/SS-тАж.ts
++    // BitTV date-tree: /╤В╨Р╨╢/YYYY/MM/DD/HH/MM/SS-╤В╨Р╨╢.ts
 +    if let Some(ts) = epg_reference_ts_from_date_tree_path(parsed.path()) {
 +        return Some(ts);
      }
@@ -404,7 +388,7 @@ index 9b65185c..807bbc97 100644
          (user, target)
      };
 +
-+    // Nested path = relative origin segment that leaked past rewrite_hls (e.g. dvr-YYYY/тАж).
++    // Nested path = relative origin segment that leaked past rewrite_hls (e.g. dvr-YYYY/╤В╨Р╨╢).
 +    if params.token.contains('/') {
 +        return hls_api_stream_leaked_relative(
 +            fingerprint,
@@ -891,7 +875,7 @@ index 9b65185c..807bbc97 100644
              &input,
              UserConnectionPermission::Allowed,
 diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
-index 020c0ed3..f9886507 100644
+index 020c0ed3..69a54073 100644
 --- a/backend/src/api/endpoints/m3u_api.rs
 +++ b/backend/src/api/endpoints/m3u_api.rs
 @@ -425,7 +425,10 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
@@ -961,17 +945,6 @@ index 020c0ed3..f9886507 100644
  fn native_live_file_matches_mode(mode: &str, file: &str) -> bool {
      let supported = if mode == "flussonic-ts" {
          &["mpegts", "index.ts", "video.ts", "mono.ts"][..]
-@@ -578,8 +613,8 @@ fn resolve_loaded_m3u_catchup(
-     Ok((catchup_item, resolved.discriminator))
- }
- 
--fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, item_type: PlaylistItemType) -> bool {
--    user.allows_item_type(item_type)
-+fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, pli: &shared::model::M3uPlaylistItem) -> bool {
-+    user.allows_item_type(pli.item_type) && user.allows_group(pli.group.as_ref())
- }
- 
- #[allow(clippy::too_many_lines)]
 @@ -608,7 +643,7 @@ async fn m3u_api_stream(
                  return axum::http::StatusCode::NOT_FOUND.into_response();
              }
@@ -999,91 +972,6 @@ index 020c0ed3..f9886507 100644
              return axum::http::StatusCode::BAD_REQUEST.into_response();
          };
          if !native_live_file_matches_mode(mode, file) {
-@@ -816,7 +851,7 @@ async fn m3u_api_catchup(
-             return axum::http::StatusCode::BAD_REQUEST.into_response();
-         }
-     };
--    if !resolved_m3u_item_is_allowed(user.as_ref(), resolved_pli.item_type) {
-+    if !resolved_m3u_item_is_allowed(user.as_ref(), &resolved_pli) {
-         return axum::http::StatusCode::FORBIDDEN.into_response();
-     }
- 
-@@ -1095,10 +1130,74 @@ mod tests {
- 
-     #[test]
-     fn resolved_catchup_item_requires_rechecked_permissions() {
-+        use shared::utils::Internable;
-+
-         let mut user = ProxyUserCredentials::default();
-         user.output_clusters = ClusterFlags::Live;
- 
--        assert!(!resolved_m3u_item_is_allowed(&user, PlaylistItemType::Catchup));
-+        let item = shared::model::M3uPlaylistItem {
-+            virtual_id: 1,
-+            provider_id: "1".intern(),
-+            input_stream_id: "1".intern(),
-+            name: "ch".intern(),
-+            chno: 0,
-+            logo: "".intern(),
-+            logo_small: "".intern(),
-+            group: "News".intern(),
-+            title: "ch".intern(),
-+            parent_code: "".intern(),
-+            audio_track: "".intern(),
-+            time_shift: "".intern(),
-+            rec: "".intern(),
-+            url: "http://example/live".intern(),
-+            epg_channel_id: None,
-+            input_name: "in".intern(),
-+            item_type: PlaylistItemType::Catchup,
-+            t_stream_url: "".intern(),
-+            t_resource_url: None,
-+            t_catchup_source: None,
-+            t_catchup_mode: None,
-+            source_ordinal: 0,
-+            additional_properties: None,
-+            upstream_user_agent: None,
-+        };
-+        assert!(!resolved_m3u_item_is_allowed(&user, &item));
-+    }
-+
-+    #[test]
-+    fn hide_adult_blocks_adult_group_even_when_cluster_allowed() {
-+        use shared::utils::Internable;
-+
-+        let mut user = ProxyUserCredentials::default();
-+        user.hide_adult = true;
-+
-+        let item = shared::model::M3uPlaylistItem {
-+            virtual_id: 1,
-+            provider_id: "1".intern(),
-+            input_stream_id: "1".intern(),
-+            name: "xxx".intern(),
-+            chno: 0,
-+            logo: "".intern(),
-+            logo_small: "".intern(),
-+            group: "18+ (Adult)".intern(),
-+            title: "xxx".intern(),
-+            parent_code: "".intern(),
-+            audio_track: "".intern(),
-+            time_shift: "".intern(),
-+            rec: "".intern(),
-+            url: "http://example/live".intern(),
-+            epg_channel_id: None,
-+            input_name: "in".intern(),
-+            item_type: PlaylistItemType::LiveHls,
-+            t_stream_url: "".intern(),
-+            t_resource_url: None,
-+            t_catchup_source: None,
-+            t_catchup_mode: None,
-+            source_ordinal: 0,
-+            additional_properties: None,
-+            upstream_user_agent: None,
-+        };
-+        assert!(!resolved_m3u_item_is_allowed(&user, &item));
-     }
- 
-     #[test]
 diff --git a/backend/src/api/endpoints/v1_api.rs b/backend/src/api/endpoints/v1_api.rs
 index 4c7ece90..40f31f80 100644
 --- a/backend/src/api/endpoints/v1_api.rs
@@ -1107,7 +995,7 @@ index 4c7ece90..40f31f80 100644
  }
  
 diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints/xtream_api.rs
-index 9c93b8dd..edc5ce39 100644
+index 9c93b8dd..f7666aa0 100644
 --- a/backend/src/api/endpoints/xtream_api.rs
 +++ b/backend/src/api/endpoints/xtream_api.rs
 @@ -17,7 +17,8 @@ use crate::{
@@ -1120,15 +1008,6 @@ index 9c93b8dd..edc5ce39 100644
              },
              xmltv_api::{get_empty_epg_response, get_epg_path_for_target_by_type, serve_short_epg},
          },
-@@ -310,7 +311,7 @@ async fn xtream_player_api_stream(
-     } else {
-         user.allows_item_type(pli.item_type)
-     };
--    if !output_allowed {
-+    if !output_allowed || !user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref()) {
-         if is_hls_manifest_request {
-             return hls_custom_video_manifest_response(
-                 app_state,
 @@ -636,14 +637,18 @@ async fn xtream_player_api_stream(
              return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
          };
@@ -1173,29 +1052,8 @@ index 9c93b8dd..edc5ce39 100644
                  stream_identity,
                  &input,
                  req_headers,
-@@ -1003,7 +1013,9 @@ async fn xtream_player_api_resource(
-         format!("Failed to read xtream item for stream id {req_virtual_id}")
-     );
- 
--    if !user.allows_item_type(pli.item_type) {
-+    if !user.allows_item_type(pli.item_type)
-+        || !user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref())
-+    {
-         return axum::http::StatusCode::NOT_FOUND.into_response();
-     }
- 
-@@ -1430,6 +1442,9 @@ async fn xtream_player_api_handle_content_action(
-                         if let Some(fltr) = filter {
-                             categories.retain(|c| fltr.contains(&c.category_id));
-                         }
-+                        if user.hide_adult {
-+                            categories.retain(|c| !ProxyUserCredentials::is_adult_group(&c.category_name));
-+                        }
-                         return Some(axum::Json(categories).into_response());
-                     }
-                     Err(err) => error!("Failed to parse json file {}: {err}", file_path.display()),
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
-index 9055e082..9aa54c05 100644
+index 9055e082..6abf2e19 100644
 --- a/backend/src/api/model/active_user_manager.rs
 +++ b/backend/src/api/model/active_user_manager.rs
 @@ -385,9 +385,19 @@ fn create_socket_reentry_guard_key(username: &str, client_ip: &str, virtual_id:
@@ -1210,7 +1068,7 @@ index 9055e082..9aa54c05 100644
 +}
 +
  fn is_stable_session_stream(stream: &StreamInfo) -> bool {
-+    // Catchup-token Live/.ts segment sockets must preserve too тАФ otherwise archive panel rows
++    // Catchup-token Live/.ts segment sockets must preserve too ╤В╨Р╨д otherwise archive panel rows
 +    // hard-remove every HLS chunk and Streams blinks even when frontend soft-preserve is present.
      stream.channel.item_type == PlaylistItemType::Catchup
          || stream.channel.item_type.is_live_adaptive()
@@ -1308,15 +1166,7 @@ index 9055e082..9aa54c05 100644
      }
  
      fn collect_divergence_snapshot(
-@@ -4654,6 +4704,7 @@ mod tests {
-             status: None,
-             output_clusters: shared::model::ClusterFlags::all(),
-             ui_enabled: true,
-+            hide_adult: false,
-             comment: None,
-             priority: 0,
-             soft_connections,
-@@ -7092,7 +7143,14 @@ mod tests {
+@@ -7092,7 +7142,14 @@ mod tests {
          assert!(released.addr_removed);
          assert!(released.removed_streams.is_empty(), "adaptive close should preserve without history removal");
          assert_eq!(manager.user_connections(&user.username).await, 0);
@@ -1483,7 +1333,7 @@ index d254fde7..a69b50ea 100644
  
      #[test]
 diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
-index 6a5d7eb5..323604ef 100644
+index 6a5d7eb5..ea9be88a 100644
 --- a/backend/src/repository/m3u_playlist_iterator.rs
 +++ b/backend/src/repository/m3u_playlist_iterator.rs
 @@ -163,14 +163,31 @@ fn apply_rewrite(
@@ -1526,30 +1376,6 @@ index 6a5d7eb5..323604ef 100644
          let stream_url = flussonic_live_file.map_or_else(
              || {
                  build_rewritten_url(
-@@ -267,6 +284,7 @@ impl M3uPlaylistIterator {
-         let target_id = target.id;
-         let proxy_type = user.proxy;
-         let output_clusters = user.output_clusters;
-+        let hide_adult = user.hide_adult;
-         let target_options = target.options.clone();
-         let input_by_name: HashMap<Arc<str>, Arc<crate::model::ConfigInput>> = cfg
-             .sources
-@@ -312,6 +330,15 @@ impl M3uPlaylistIterator {
-                     continue;
-                 }
- 
-+                if hide_adult
-+                    && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
-+                        || crate::model::ProxyUserCredentials::stream_props_marked_adult(
-+                            item.additional_properties.as_ref(),
-+                        ))
-+                {
-+                    continue;
-+                }
-+
-                 if let Some(set) = &filter {
-                     if !set.contains(item.group.as_ref()) {
-                         continue;
 diff --git a/frontend/src/app/components/dashboard/stream_display/helpers.rs b/frontend/src/app/components/dashboard/stream_display/helpers.rs
 index 449b4ac4..78eb64b6 100644
 --- a/frontend/src/app/components/dashboard/stream_display/helpers.rs
@@ -1693,7 +1519,7 @@ index 64870fc7..c70bf684 100644
                                          html! {
                                              <StreamDisplayItem
 diff --git a/frontend/src/hooks/use_server_status.rs b/frontend/src/hooks/use_server_status.rs
-index 1dcbbc7e..6d529756 100644
+index 1dcbbc7e..afec5dcc 100644
 --- a/frontend/src/hooks/use_server_status.rs
 +++ b/frontend/src/hooks/use_server_status.rs
 @@ -25,14 +25,41 @@ type ServerStatusState =
@@ -1765,7 +1591,7 @@ index 1dcbbc7e..6d529756 100644
  fn should_keep_preserved_stream_visible(stream: &StreamInfo) -> bool {
 -    stream.session_token.is_some() && (stream.channel.item_type.is_live_adaptive() || is_shared_hls_stream(stream))
 +    // Match backend `is_stable_session_stream`: Catchup/HLS/DASH (and shared HLS) stay visible
-+    // while preserved between short segment requests тАФ otherwise archive playback vanishes from Streams.
++    // while preserved between short segment requests ╤В╨Р╨д otherwise archive playback vanishes from Streams.
 +    is_sticky_session_stream(stream)
 +}
 +
@@ -2154,7 +1980,7 @@ index 256e4d25..cebdb375 100644
 +            || stream.channel.item_type == PlaylistItemType::Catchup)
  }
 diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
-index a9ff41cb..bc2cca71 100644
+index a9ff41cb..5df738f6 100644
 --- a/shared/src/model/playlist.rs
 +++ b/shared/src/model/playlist.rs
 @@ -618,6 +618,28 @@ fn append_m3u_catchup_attributes(
@@ -2168,7 +1994,7 @@ index a9ff41cb..bc2cca71 100644
 +    rewritten_source: Option<&Arc<str>>,
 +    emit_source: bool,
 +) {
-+    // Unified export: always `catchup-type=тАж`, never `catchup=`.
++    // Unified export: always `catchup-type=╤В╨Р╨╢`, never `catchup=`.
 +    write_m3u_attr(line, "catchup-type", catchup_type);
 +    append_catchup_attribute(line, "catchup-days", catchup.days.as_ref());
 +    if emit_source {
@@ -2213,7 +2039,7 @@ index a9ff41cb..bc2cca71 100644
 -                    self.t_catchup_source.as_ref(),
 -                );
 +                if let Some(mode) = flussonic_mode {
-+                    // Unify catchup=/catchup-type=flussonic* тЖТ catchup-type only.
++                    // Unify catchup=/catchup-type=flussonic* ╤В╨Ц╨в catchup-type only.
 +                    // No catchup=, no shift-style catchup-source, no invented days.
 +                    append_unified_catchup_type_attributes(
 +                        &mut line,
@@ -2223,7 +2049,7 @@ index a9ff41cb..bc2cca71 100644
 +                        false,
 +                    );
 +                } else if let Some(append_type) = append_type {
-+                    // Unify catchup=/catchup-type=append тЖТ catchup-type="append" only.
++                    // Unify catchup=/catchup-type=append ╤В╨Ц╨в catchup-type="append" only.
 +                    append_unified_catchup_type_attributes(
 +                        &mut line,
 +                        catchup,
