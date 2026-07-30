@@ -1112,65 +1112,7 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
              if channel_tx.blocking_send(Ok(channel)).is_err() {
                  break;
              }
-@@ -524,7 +544,6 @@
-     epg_id: &Arc<str>,
-     programme: &EpgProgramme,
-     epg_processing_options: &EpgProcessingOptions,
--    has_archive: bool,
- ) -> ShortEpgDto {
-     let (start_str, end_str, start_ts, stop_ts) = get_applied_epg_timeshift(programme, epg_processing_options);
- 
-@@ -541,13 +560,12 @@
-         stop_timestamp: stop_ts.to_string(),
-         stream_id: Arc::clone(stream_id),
-         now_playing: None,
--        has_archive: has_archive.then_some(1),
-+        has_archive: None,
-     }
- }
- 
- const DEFAULT_SHORT_EPG_LIMIT: u32 = 4;
- 
--#[allow(clippy::too_many_arguments)]
- pub async fn serve_short_epg(
-     app_state: &Arc<AppState>,
-     epg_path: &Path,
-@@ -556,7 +574,6 @@
-     channel_id: &Arc<str>,
-     stream_id: Arc<str>,
-     limit: u32,
--    has_archive: bool,
- ) -> axum::response::Response {
-     let lowercase_ids = target
-         .options
-@@ -572,13 +589,19 @@
-             if let Some(epg_channel) = get_epg_channel_by_storage_key(app_state, &storage_key, epg_path).await {
-                 let epg_processing_options = get_epg_processing_options(app_state, user, target);
-                 ShortEpgResultDto {
--                    epg_listings: epg_channel
--                        .get_programme_with_limit(limit)
--                        .iter()
--                        .map(|p| {
--                            from_programme(&stream_id, &response_channel_id, p, &epg_processing_options, has_archive)
--                        })
--                        .collect(),
-+                    epg_listings: if limit > 0 {
-+                        epg_channel
-+                            .get_programme_with_limit(limit)
-+                            .iter()
-+                            .map(|p| from_programme(&stream_id, &response_channel_id, p, &epg_processing_options))
-+                            .collect()
-+                    } else {
-+                        epg_channel
-+                            .programmes
-+                            .iter()
-+                            .map(|p| from_programme(&stream_id, &response_channel_id, p, &epg_processing_options))
-+                            .collect()
-+                    },
-                 }
-             } else {
-                 ShortEpgResultDto::default()
-@@ -932,8 +955,8 @@
+@@ -932,8 +952,8 @@
      use shared::{
          foundation::Filter,
          model::{
@@ -1181,48 +1123,10 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
          },
          utils::{concat_path, obfuscate_text, Internable},
      };
-@@ -1419,35 +1442,10 @@
-             encrypt_secret: [0; 16],
-         };
- 
--        let result = from_programme(&stream_id, &epg_id, &programme, &options, false);
-+        let result = from_programme(&stream_id, &epg_id, &programme, &options);
- 
-         assert_eq!(result.epg_id.as_ref(), "example.channel");
-         assert_eq!(result.channel_id.as_ref(), "example.channel");
--    }
--
--    #[test]
--    fn from_programme_sets_has_archive_only_when_capability_true() {
--        let stream_id = "42".intern();
--        let epg_id = "example.channel".intern();
--        let programme = EpgProgramme::new_all(
--            100,
--            200,
--            Arc::clone(&epg_id),
--            Some("News".intern()),
--            None,
--            None,
--        );
--        let options = EpgProcessingOptions {
--            rewrite_urls: false,
--            time_shift: EpgTimeShift::None,
--            encrypt_secret: [0; 16],
--        };
--
--        let archived = from_programme(&stream_id, &epg_id, &programme, &options, true);
--        let live_only = from_programme(&stream_id, &epg_id, &programme, &options, false);
--
--        assert_eq!(archived.has_archive, Some(1));
--        assert_eq!(live_only.has_archive, None);
-     }
- 
-     #[test]
-@@ -1467,6 +1465,114 @@
-         let xml = String::from_utf8(writer.into_inner()).expect("serialized XML should be UTF-8");
+@@ -1468,6 +1488,115 @@
  
          assert_eq!(xml, "<display-name>café network &amp; &lt;hd&gt;</display-name>");
-+    }
+     }
 +
 +    fn blank_m3u_item() -> M3uPlaylistItem {
 +        M3uPlaylistItem {
@@ -1330,25 +1234,11 @@ diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/
 +        clear_adult_epg_id_cache_for_tests();
 +        let xml_all = response_body_text(serve_epg(&app_state, &epg_path, &user, &target, None).await).await;
 +        assert!(xml_all.contains(r#"id="adult.one""#), "adult channel visible when hide_adult=false: {xml_all}");
-     }
++    }
++
  
      #[tokio::test]
-@@ -1743,7 +1849,6 @@
-             &request_id,
-             "42".intern(),
-             4,
--            false,
-         )
-         .await;
-         let body = response_body_text(response).await;
-@@ -1763,7 +1868,6 @@
-             &request_id,
-             "42".intern(),
-             4,
--            false,
-         )
-         .await;
-         let disabled_body = response_body_text(disabled_response).await;
+     async fn xmltv_output_uses_canonical_channel_ids_and_only_lowercases_display_names() {
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
 --- a/backend/src/api/api_utils.rs
 +++ b/backend/src/api/api_utils.rs
