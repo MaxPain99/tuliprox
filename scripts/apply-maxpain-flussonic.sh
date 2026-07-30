@@ -7,7 +7,8 @@
 #   TULIPROX_ROOT=/path/to/tuliprox ./scripts/apply-maxpain-flussonic.sh
 #
 # Note: EPG url-tvg and EXTVLCOPT user-agent are now upstream in v3.3.74+.
-# Patches: Windows build compat, Flussonic catchup deltas, Hide Adult.
+# Windows build compat landed upstream in v3.3.87 (#806) — no longer patched here.
+# Patches: Flussonic catchup deltas, Hide Adult.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,7 +16,6 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TREE="$(cd "${1:-${TULIPROX_ROOT:-${ROOT_DIR}}}" && pwd)"
 
 PATCHES=(
-  "windows-build-compat.patch"
   "m3u-flussonic-tivimate.patch"
   "user-hide-adult.patch"
 )
@@ -172,7 +172,7 @@ for name in "${PATCHES[@]}"; do
   apply_one_patch "${ROOT_DIR}/patches/${name}"
 done
 
-# Sanity checks (v3.3.76 + patches)
+# Sanity checks (upstream Windows #806 + MaxPain patches)
 grep -q 'ProcessHandle' "${TREE}/backend/src/api/sys_usage.rs"
 grep -q 'M3U_APPEND_MODE_DEFAULT_TEMPLATE' "${TREE}/backend/src/iptv/m3u/catchup.rs"
 grep -q 'append_unified_catchup_type_attributes' "${TREE}/shared/src/model/playlist.rs"
@@ -188,6 +188,8 @@ grep -q 'session_token_hint' "${TREE}/backend/src/api/endpoints/hls_api.rs"
 grep -q 'Some(session_key.as_str())' "${TREE}/backend/src/api/endpoints/m3u_api.rs"
 grep -q 'Some(session_key.as_str())' "${TREE}/backend/src/api/endpoints/xtream_api.rs"
 grep -q 'find_latest_session_for_virtual_id' "${TREE}/backend/src/api/model/active_user_manager.rs"
+grep -q 'is_sticky_session_stream' "${TREE}/frontend/src/hooks/use_server_status.rs"
+grep -q 'Connections(0) can arrive before DisconnectedStream' "${TREE}/frontend/src/hooks/use_server_status.rs"
 grep -q 'hide_adult' "${TREE}/shared/src/model/config/api_user.rs"
 grep -q 'is_adult_group' "${TREE}/backend/src/model/config/api_user.rs"
 grep -q 'StoredApiUserV7' "${TREE}/backend/src/repository/bplustree/migration.rs"
@@ -196,4 +198,4 @@ grep -q 'HIDE_ADULT' "${TREE}/frontend/src/app/components/userlist/proxy_user_cr
 grep -q 'adult_epg_id_blocklist' "${TREE}/backend/src/api/endpoints/xmltv_api.rs"
 
 echo "MaxPain patches applied OK (Flussonic catchup deltas + Hide Adult)"
-echo "Rebuild tuliprox and refresh playlists. Note: EPG url-tvg & EXTVLCOPT are upstream."
+echo "Rebuild tuliprox and refresh playlists. Note: EPG url-tvg, EXTVLCOPT, Windows compat are upstream."
