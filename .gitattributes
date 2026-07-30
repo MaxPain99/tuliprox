@@ -1,2 +1,4 @@
 # Shell scripts must use LF line endings to run in Linux containers.
 *.sh text eol=lf
+# Unified diffs must stay LF so `git apply` succeeds in CI.
+patches/*.patch text eol=lf
