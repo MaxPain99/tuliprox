@@ -1,10 +1,11 @@
 # Unified M3U catchup export, default Wink append template, DVR leak fix, panel EPG archive
-# Generated from clean v3.3.76 (diff --git)
+# Generated from clean upstream + Catchup preserve in ensure_hls_cache_stream_registered
 
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
+index 9b65185..04369f0 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
-@@ -103,6 +103,73 @@
+@@ -103,6 +103,73 @@ fn is_m3u_catchup_session_token(session_token: &str) -> bool {
      session_token.starts_with("m3u-catchup|") || session_token.starts_with("catchup|")
  }
  
@@ -78,7 +79,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
  fn legacy_hls_route_allowed_with_cache(
      cache_enabled: bool,
      decoded_session_token: Option<&str>,
-@@ -128,18 +195,16 @@
+@@ -128,18 +195,16 @@ fn query_flag_marks_start_context(key: &str) -> bool {
  }
  
  pub(in crate::api) fn m3u_archive_epg_reference_ts(stream_url: &str) -> Option<i64> {
@@ -106,14 +107,31 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          }
      }
      let mut start_ts = None;
-@@ -166,5 +231,6 @@
+@@ -166,6 +231,7 @@ struct HlsApiPathParams {
      target_id: u16,
      input_id: u16,
      stream_id: u32,
 +    /// Single obfuscated token, or a leaked relative origin path (`dvr-YYYY/...ts`).
      token: String,
  }
-@@ -1359,17 +1379,19 @@ async fn build_hls_cache_stream_channel(
+ 
+@@ -1274,8 +1340,13 @@ async fn ensure_hls_cache_stream_registered(
+         .map_or_else(|| Cow::Borrowed(""), |value| String::from_utf8_lossy(value.as_bytes()));
+ 
+     stream_channel.url = Arc::from(hls_cache_stream_stats_url(&proxy_session_id));
+-    stream_channel.item_type = PlaylistItemType::LiveHls;
+-    stream_channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(stream_channel.cluster);
++    // Shared HLS cache uses LiveHls transport, but archive leases must keep Catchup
++    // + epg_reference_ts so the web panel does not show Live for archive playback.
++    if stream_channel.item_type != PlaylistItemType::Catchup {
++        stream_channel.item_type = PlaylistItemType::LiveHls;
++        stream_channel.cluster =
++            XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(stream_channel.cluster);
++    }
+     let shared_stream_id = hls_cache_shared_stream_id(&proxy_session_id);
+     stream_channel.shared = true;
+     stream_channel.shared_stream_id = Some(shared_stream_id);
+@@ -1359,13 +1430,15 @@ async fn build_hls_cache_stream_channel(
          fallback_hls_cache_stream_channel(0, access.virtual_id, origin_source, proxy_session_id)
      };
  
@@ -134,11 +152,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      } else {
          channel.item_type = PlaylistItemType::LiveHls;
          channel.cluster = XtreamCluster::try_from(PlaylistItemType::LiveHls).unwrap_or(channel.cluster);
-         channel.epg_reference_ts = None;
-     }
-     channel
- }
-@@ -5747,6 +5813,7 @@
+@@ -5747,6 +5820,7 @@ async fn hls_proxy_manifest(
  async fn hls_api_stream(
      fingerprint: Fingerprint,
      req_headers: HeaderMap,
@@ -146,7 +160,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      axum::extract::Path(params): axum::extract::Path<HlsApiPathParams>,
      axum::extract::State(app_state): axum::extract::State<Arc<AppState>>,
  ) -> impl IntoResponse + Send {
-@@ -5765,6 +5832,23 @@
+@@ -5765,6 +5839,23 @@ async fn hls_api_stream(
          }
          (user, target)
      };
@@ -170,12 +184,10 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      hls_api_stream_resolved(
          fingerprint,
          req_headers,
-@@ -5776,6 +5860,58 @@
-         params.token,
-     )
+@@ -5778,6 +5869,58 @@ async fn hls_api_stream(
      .await
-+}
-+
+ }
+ 
 +#[allow(clippy::too_many_arguments)]
 +async fn hls_api_stream_leaked_relative(
 +    fingerprint: Fingerprint,
@@ -226,10 +238,12 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
 +    )
 +    .await
 +    .into_response()
- }
- 
++}
++
  #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-@@ -5839,7 +5975,8 @@
+ async fn hls_api_stream_resolved(
+     fingerprint: Fingerprint,
+@@ -5839,7 +5982,8 @@ async fn hls_api_stream_resolved(
      }
  
      if let Some(session) = &mut user_session {
@@ -239,7 +253,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          if session.permission == UserConnectionPermission::Exhausted {
              let stream_channel = resolve_stream_channel(
                  &app_state,
-@@ -5888,7 +6025,7 @@
+@@ -5888,7 +6032,7 @@ async fn hls_api_stream_resolved(
              _ => return axum::http::StatusCode::BAD_REQUEST.into_response(),
          };
          let hls_url = hls_url.intern();
@@ -248,7 +262,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          session.stream_url = hls_url.clone();
          if session.virtual_id == virtual_id {
              app_state.connection_manager.touch_http_activity(&user.username, &session.token, &fingerprint.addr).await;
-@@ -6062,7 +6199,7 @@
+@@ -6062,7 +6206,7 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
              axum::routing::get(hls_proxy_resource),
          )
          .route(
@@ -257,7 +271,7 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
              axum::routing::get(hls_api_stream),
          )
      //cfg.service(web::resource("/hls/{token}/{stream}").route(web::get().to(xtream_player_api_hls_stream)));
-@@ -6073,7 +6210,8 @@
+@@ -6073,7 +6217,8 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
  mod tests {
      use super::{
          build_hls_manifest_request_headers, extract_hls_provider_session_headers, hls_api_register,
@@ -267,10 +281,11 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
      };
      use crate::{
          api::model::{
-@@ -6157,6 +6295,48 @@
+@@ -6156,6 +6301,48 @@ mod tests {
+         assert_eq!(m3u_archive_epg_reference_ts("http://provider/live/42.m3u8?start=1700000000"), None);
      }
  
-     #[test]
++    #[test]
 +    fn session_token_recovers_archive_epg_reference_when_media_url_lost_markers() {
 +        assert_eq!(
 +            m3u_catchup_epg_reference_from_session_token(
@@ -312,31 +327,55 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
 +        );
 +    }
 +
-+    #[test]
+     #[test]
      fn archive_epg_reference_supports_contextual_start_aliases() {
          assert_eq!(
-             m3u_archive_epg_reference_ts(
+diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
+index ed3ebb5..5f6043c 100644
+--- a/backend/src/api/model/active_user_manager.rs
++++ b/backend/src/api/model/active_user_manager.rs
+@@ -2873,6 +2873,18 @@ impl ActiveUserManager {
+         self.update_user_session(username, token).await
+     }
+ 
++    /// Latest session for `virtual_id` (used to recover leaked relative DVR segment paths).
++    pub async fn find_latest_session_for_virtual_id(&self, username: &str, virtual_id: u32) -> Option<UserSession> {
++        let user_connections = self.connections.read().await;
++        let connection_data = user_connections.by_key.get(username)?;
++        connection_data
++            .sessions
++            .iter()
++            .filter(|session| session.virtual_id == virtual_id)
++            .max_by_key(|session| session.ts)
++            .cloned()
++    }
++
+     pub async fn update_session_provider_headers(
+         &self,
+         username: &str,
 diff --git a/backend/src/iptv/m3u/archive.rs b/backend/src/iptv/m3u/archive.rs
+index a1f6995..f08c71f 100644
 --- a/backend/src/iptv/m3u/archive.rs
 +++ b/backend/src/iptv/m3u/archive.rs
-@@ -26,6 +26,13 @@
-             Self::Archive { extension, .. }
-             | Self::TimeshiftAbs { extension, .. }
+@@ -28,6 +28,13 @@ impl FlussonicArchiveKind {
              | Self::TimeshiftRel { extension, .. } => extension,
-+        }
-+    }
+         }
+     }
 +
 +    pub fn epg_reference_ts(&self) -> Option<i64> {
 +        match self {
 +            Self::Archive { start, .. } | Self::TimeshiftAbs { start, .. } => start.parse().ok(),
 +            Self::TimeshiftRel { .. } => None,
-         }
-     }
++        }
++    }
  }
+ 
+ fn strip_media_suffix(value: &str) -> &str {
 diff --git a/backend/src/iptv/m3u/catchup.rs b/backend/src/iptv/m3u/catchup.rs
+index d254fde..ba6f979 100644
 --- a/backend/src/iptv/m3u/catchup.rs
 +++ b/backend/src/iptv/m3u/catchup.rs
-@@ -12,6 +12,9 @@
+@@ -12,6 +12,9 @@ pub const M3U_CATCHUP_ROUTE_PREFIX: &str = "m3u-catchup";
  pub const M3U_CATCHUP_MARKER: &str = "tuliprox-catchup";
  const COLLECTOR_PREFIX: &str = "v";
  const M3U_APPEND_TEMPLATE: &str = "?utc={utc}&lutc={lutc}";
@@ -346,7 +385,7 @@ diff --git a/backend/src/iptv/m3u/catchup.rs b/backend/src/iptv/m3u/catchup.rs
  const M3U_CATCHUP_PARAM_UTC: &str = "utc";
  const M3U_CATCHUP_PARAM_LUTC: &str = "lutc";
  const XC_START_TEMPLATE: &str = "{Y}-{m}-{d}:{H}-{M}-{S}";
-@@ -164,6 +167,16 @@
+@@ -164,6 +167,16 @@ fn append_siptv_template(source_url: &str) -> String {
      }
  }
  
@@ -363,7 +402,7 @@ diff --git a/backend/src/iptv/m3u/catchup.rs b/backend/src/iptv/m3u/catchup.rs
  fn derive_xc_template(source_url: &str) -> Option<String> {
      let parsed = Url::parse(source_url).ok()?;
      let mut segments = parsed
-@@ -241,6 +254,9 @@
+@@ -241,6 +254,9 @@ fn derived_template_for_mode<'a>(source_url: &'a str, catchup: &'a CatchupProper
  
      match mode_alias(mode) {
          "shift" => Some(Cow::Owned(format!("{source_url}{}", append_siptv_template(source_url)))),
@@ -374,9 +413,10 @@ diff --git a/backend/src/iptv/m3u/catchup.rs b/backend/src/iptv/m3u/catchup.rs
          "fs" => derive_flussonic_template(source_url).map(Cow::Owned),
          "vod" => Some(Cow::Borrowed("{catchup-id}")),
 diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
+index f7b987d..54944a6 100644
 --- a/shared/src/model/playlist.rs
 +++ b/shared/src/model/playlist.rs
-@@ -618,6 +618,28 @@
+@@ -618,6 +618,28 @@ fn append_m3u_catchup_attributes(
      append_extra_catchup_attributes(line, &catchup.extra_attributes);
  }
  
@@ -405,7 +445,7 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
  impl M3uPlaylistItem {
      #[allow(clippy::missing_panics_doc)]
      pub fn to_m3u(&self, target_options: Option<&ConfigTargetOptions>, rewrite_urls: bool) -> String {
-@@ -643,6 +665,15 @@
+@@ -643,6 +665,15 @@ impl M3uPlaylistItem {
          if self.chno != 0 {
              let _ = write!(line, " tvg-chno=\"{}\"", self.chno);
          }
@@ -421,7 +461,7 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
          to_m3u_non_empty_fields!(self, line,
              (parent_code, "parent-code"),
              (audio_track, "audio-track"),
-@@ -650,12 +681,33 @@
+@@ -650,12 +681,33 @@ impl M3uPlaylistItem {
              (rec, "tvg-rec"););
          if let Some(StreamProperties::Live(live)) = self.additional_properties.as_ref() {
              if let Some(catchup) = live.catchup.as_ref() {
@@ -462,13 +502,13 @@ diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
          }
  
 diff --git a/shared/src/model/stream_properties.rs b/shared/src/model/stream_properties.rs
+index 4f3c8b2..d8d389b 100644
 --- a/shared/src/model/stream_properties.rs
 +++ b/shared/src/model/stream_properties.rs
-@@ -62,6 +62,20 @@
-         } else {
+@@ -63,6 +63,20 @@ impl CatchupProperties {
              None
          }
-+    }
+     }
 +
 +    /// Canonical append label for unified M3U export (`catchup-type="append"` only).
 +    pub fn append_player_type(&self) -> Option<&'static str> {
@@ -482,28 +522,7 @@ diff --git a/shared/src/model/stream_properties.rs b/shared/src/model/stream_pro
 +            .filter(|value| !value.is_empty())
 +            .or_else(|| self.catchup_type.as_deref().map(str::trim).filter(|value| !value.is_empty()))?;
 +        mode.eq_ignore_ascii_case("append").then_some("append")
-     }
++    }
  }
  
-diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
---- a/backend/src/api/model/active_user_manager.rs
-+++ b/backend/src/api/model/active_user_manager.rs
-@@ -2873,6 +2873,18 @@
-         self.update_user_session(username, token).await
-     }
- 
-+    /// Latest session for `virtual_id` (used to recover leaked relative DVR segment paths).
-+    pub async fn find_latest_session_for_virtual_id(&self, username: &str, virtual_id: u32) -> Option<UserSession> {
-+        let user_connections = self.connections.read().await;
-+        let connection_data = user_connections.by_key.get(username)?;
-+        connection_data
-+            .sessions
-+            .iter()
-+            .filter(|session| session.virtual_id == virtual_id)
-+            .max_by_key(|session| session.ts)
-+            .cloned()
-+    }
-+
-     pub async fn update_session_provider_headers(
-         &self,
-         username: &str,
+ fn format_episode_code(season: u32, episode: u32) -> Option<String> {
