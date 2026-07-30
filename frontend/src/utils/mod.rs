@@ -65,7 +65,5 @@ pub fn join_non_empty_parts<'a>(parts: impl Iterator<Item = &'a str>, separator:
 }
 
 pub fn is_shared_hls_stream(stream: &StreamInfo) -> bool {
-    stream.channel.shared
-        && (stream.channel.item_type == PlaylistItemType::LiveHls
-            || stream.channel.item_type == PlaylistItemType::Catchup)
+    stream.channel.shared && stream.channel.item_type == PlaylistItemType::LiveHls
 }
