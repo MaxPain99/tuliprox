@@ -1667,10 +1667,16 @@ impl ActiveUserManager {
         sessions: &[UserSession],
     ) -> Option<AdaptiveExpiryEntry> {
         let session_token = stream.session_token.as_deref()?;
-        let session = sessions.iter().find(|session| session.token == session_token)?;
+        // Catchup segment gaps can briefly lose the UserSession row; still preserve the panel
+        // row using the stream timestamp so Streams does not blink between archive chunks.
+        let session_ts = sessions
+            .iter()
+            .find(|session| session.token == session_token)
+            .map(|session| session.ts)
+            .unwrap_or(stream.ts);
 
         let ttl_secs = self.adaptive_session_ttl_secs.load(Ordering::Relaxed);
-        let expires_at = session.ts.saturating_add(ttl_secs);
+        let expires_at = session_ts.saturating_add(ttl_secs);
         Some(AdaptiveExpiryEntry {
             expires_at,
             username: username.to_string(),
@@ -3138,11 +3144,13 @@ impl ActiveUserManager {
             return true;
         };
 
-        let Some(session) = sessions.iter().find(|session| session.token == session_token) else {
-            return true;
-        };
+        let session_ts = sessions
+            .iter()
+            .find(|session| session.token == session_token)
+            .map(|session| session.ts)
+            .unwrap_or(stream.ts);
 
-        now.saturating_sub(session.ts) >= ttl_secs
+        now.saturating_sub(session_ts) >= ttl_secs
     }
 
     fn collect_divergence_snapshot(

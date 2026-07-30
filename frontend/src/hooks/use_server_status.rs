@@ -62,6 +62,19 @@ fn should_keep_preserved_stream_visible(stream: &StreamInfo) -> bool {
             || is_shared_hls_stream(stream))
 }
 
+fn mark_sticky_session_preserved(stream: &mut StreamInfo) -> bool {
+    if stream.session_token.is_some()
+        && (stream.channel.item_type.is_live_adaptive()
+            || stream.channel.item_type == PlaylistItemType::Catchup
+            || is_shared_hls_stream(stream))
+    {
+        stream.preserved = true;
+        true
+    } else {
+        false
+    }
+}
+
 fn should_keep_stream_when_connections_drop_to_zero(stream: &StreamInfo) -> bool {
     stream.preserved && should_keep_preserved_stream_visible(stream)
 }
@@ -224,10 +237,30 @@ fn apply_active_user_change(server_status: &mut StatusCheck, event: ActiveUserCo
             dedupe_streams_by_identity(&mut server_status.active_user_streams);
         }
         ActiveUserConnectionChange::Disconnected(addr) => {
-            server_status.active_user_streams.retain(|stream_info| stream_info.addr != addr);
+            // Archive/HLS session rows are often torn down between short segment requests.
+            // Soft-preserve them for frontend TTL cleanup instead of blanking Streams.
+            for stream in &mut server_status.active_user_streams {
+                if stream.addr == addr {
+                    mark_sticky_session_preserved(stream);
+                }
+            }
+            server_status
+                .active_user_streams
+                .retain(|stream_info| stream_info.addr != addr || should_keep_preserved_stream_visible(stream_info));
         }
         ActiveUserConnectionChange::DisconnectedStream { addr, uid } => {
-            server_status.active_user_streams.retain(|stream_info| stream_info.addr != addr || stream_info.uid != uid);
+            if let Some(stream) = server_status
+                .active_user_streams
+                .iter_mut()
+                .find(|stream_info| stream_info.addr == addr && stream_info.uid == uid)
+            {
+                if mark_sticky_session_preserved(stream) {
+                    return;
+                }
+            }
+            server_status
+                .active_user_streams
+                .retain(|stream_info| stream_info.addr != addr || stream_info.uid != uid);
         }
         ActiveUserConnectionChange::Connections(user_count, connections) => {
             server_status.active_users = user_count;
@@ -609,6 +642,47 @@ mod tests {
         apply_active_user_change(&mut status, ActiveUserConnectionChange::Connections(1, 0));
 
         assert_eq!(status.active_user_streams, vec![preserved]);
+    }
+
+    #[test]
+    fn test_disconnected_stream_soft_preserves_catchup_between_segments() {
+        let active = test_stream(1, "127.0.0.1:1234", Some("tok-catchup"), PlaylistItemType::Catchup);
+        let other = test_stream(2, "127.0.0.1:5678", Some("tok-live"), PlaylistItemType::LiveHls);
+        let mut status = shared::model::StatusCheck {
+            active_users: 2,
+            active_user_connections: 2,
+            active_user_streams: vec![active.clone(), other.clone()],
+            ..Default::default()
+        };
+
+        apply_active_user_change(
+            &mut status,
+            ActiveUserConnectionChange::DisconnectedStream { addr: active.addr, uid: active.uid },
+        );
+
+        assert_eq!(status.active_user_streams.len(), 2);
+        assert!(status.active_user_streams.iter().any(|stream| {
+            stream.uid == active.uid && stream.preserved && stream.channel.item_type == PlaylistItemType::Catchup
+        }));
+        assert!(status.active_user_streams.iter().any(|stream| stream == &other));
+    }
+
+    #[test]
+    fn test_disconnected_addr_soft_preserves_catchup_and_drops_plain_live() {
+        let catchup = test_stream(1, "127.0.0.1:1234", Some("tok-catchup"), PlaylistItemType::Catchup);
+        let live = test_stream(2, "127.0.0.1:1234", Some("tok-live"), PlaylistItemType::Live);
+        let mut status = shared::model::StatusCheck {
+            active_users: 1,
+            active_user_connections: 2,
+            active_user_streams: vec![catchup.clone(), live],
+            ..Default::default()
+        };
+
+        apply_active_user_change(&mut status, ActiveUserConnectionChange::Disconnected(catchup.addr));
+
+        assert_eq!(status.active_user_streams.len(), 1);
+        assert!(status.active_user_streams[0].preserved);
+        assert_eq!(status.active_user_streams[0].channel.item_type, PlaylistItemType::Catchup);
     }
 
     #[test]
