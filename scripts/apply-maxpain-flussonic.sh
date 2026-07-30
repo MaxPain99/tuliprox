@@ -7,7 +7,7 @@
 #   TULIPROX_ROOT=/path/to/tuliprox ./scripts/apply-maxpain-flussonic.sh
 #
 # Note: EPG url-tvg and EXTVLCOPT user-agent are now upstream in v3.3.74+.
-# Only Flussonic catchup deltas and Hide Adult remain as patches.
+# Patches: Windows build compat, Flussonic catchup deltas, Hide Adult.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,6 +15,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TREE="$(cd "${1:-${TULIPROX_ROOT:-${ROOT_DIR}}}" && pwd)"
 
 PATCHES=(
+  "windows-build-compat.patch"
   "m3u-flussonic-tivimate.patch"
   "user-hide-adult.patch"
 )
@@ -171,7 +172,8 @@ for name in "${PATCHES[@]}"; do
   apply_one_patch "${ROOT_DIR}/patches/${name}"
 done
 
-# Sanity checks (v3.3.74 + patches)
+# Sanity checks (v3.3.76 + patches)
+grep -q 'ProcessHandle' "${TREE}/backend/src/api/sys_usage.rs"
 grep -q 'M3U_APPEND_MODE_DEFAULT_TEMPLATE' "${TREE}/backend/src/iptv/m3u/catchup.rs"
 grep -q 'append_unified_catchup_type_attributes' "${TREE}/shared/src/model/playlist.rs"
 grep -q 'append_player_type' "${TREE}/shared/src/model/stream_properties.rs"

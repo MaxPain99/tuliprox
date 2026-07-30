@@ -1,0 +1,162 @@
+# =============================================================================
+# [BitTV fork] windows-build-compat.patch
+# Upstream v3.3.76 does not currently compile for Windows targets:
+# - memmap2::Advice / Mmap::advise are Unix-only
+# - GetDiskFreeSpaceExW expects *mut ULARGE_INTEGER (not &mut u64)
+# - Windows Sampler holds a raw HANDLE and is not Send for tokio::spawn
+# Apply FIRST, before MaxPain feature patches.
+# =============================================================================
+
+diff --git a/backend/src/repository/bplustree/common.rs b/backend/src/repository/bplustree/common.rs
+--- a/backend/src/repository/bplustree/common.rs
++++ b/backend/src/repository/bplustree/common.rs
+@@ -1,5 +1,7 @@
+ use log::warn;
+-use memmap2::{Advice, Mmap};
++use memmap2::Mmap;
++#[cfg(unix)]
++pub(crate) use memmap2::Advice;
+ use std::{
+     ffi::OsString,
+     fs::File,
+@@ -12,11 +14,22 @@
+ #[cfg(unix)]
+ use std::os::unix::fs::FileExt;
+ 
++/// Windows/memmap2 has no madvise-style Advice API; keep a stub so callers stay portable.
++#[cfg(not(unix))]
++#[derive(Debug, Clone, Copy)]
++pub(crate) enum Advice {
++    Normal,
++}
++
++#[cfg(unix)]
+ fn advise_mmap(mmap: &Mmap, advice: Advice, context: &str) {
+     if let Err(err) = mmap.advise(advice) {
+         warn!("Failed to apply mmap advice {advice:?} for {context}: {err}");
+     }
+ }
++
++#[cfg(not(unix))]
++fn advise_mmap(_mmap: &Mmap, _advice: Advice, _context: &str) {}
+ 
+ pub(crate) fn mmap_with_advice(file: &File, advice: Advice, context: &str) -> Option<Mmap> {
+     // SAFETY: Every v3 persisted query holds its shared sidecar lock for the mapping lifetime, and v3 writers require
+diff --git a/backend/src/repository/bplustree/v2.rs b/backend/src/repository/bplustree/v2.rs
+--- a/backend/src/repository/bplustree/v2.rs
++++ b/backend/src/repository/bplustree/v2.rs
+@@ -6,7 +6,7 @@
+ //! live behind an explicit version boundary and a typed migration path.
+ 
+ use crate::{
+-    repository::bplustree::common::{mmap_with_advice, read_exact_at_offset},
++    repository::bplustree::common::{mmap_with_advice, read_exact_at_offset, Advice},
+     utils,
+     utils::binary_deserialize,
+ };
+@@ -15,7 +15,7 @@
+ use crate::utils::binary_serialize_into;
+ #[cfg(test)]
+ use log::error;
+-use memmap2::{Advice, Mmap};
++use memmap2::Mmap;
+ use parking_lot::Mutex;
+ use serde::{Deserialize, Serialize};
+ use shared::error::to_io_error;
+@@ -37,11 +37,6 @@
+ };
+ #[cfg(test)]
+ use tempfile::NamedTempFile;
+-#[cfg(windows)]
+-use windows_sys::Win32::Foundation::CloseHandle;
+-#[cfg(windows)]
+-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+-
+ const PAGE_SIZE: u16 = 4096;
+ pub const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
+ const LEN_SIZE: usize = 4;
+diff --git a/backend/src/repository/bplustree/v3/tree.rs b/backend/src/repository/bplustree/v3/tree.rs
+--- a/backend/src/repository/bplustree/v3/tree.rs
++++ b/backend/src/repository/bplustree/v3/tree.rs
+@@ -14,10 +14,10 @@
+     BPlusTreeMetadata,
+ };
+ use crate::{
+-    repository::bplustree::common::{mmap_with_advice, read_exact_at_offset, BPlusTreeError},
++    repository::bplustree::common::{mmap_with_advice, read_exact_at_offset, Advice, BPlusTreeError},
+     utils::{binary_deserialize, binary_serialize, binary_serialize_into},
+ };
+-use memmap2::{Advice, Mmap};
++use memmap2::Mmap;
+ use parking_lot::Mutex;
+ use serde::{Deserialize, Serialize};
+ use std::{
+diff --git a/backend/src/api/sys_usage.rs b/backend/src/api/sys_usage.rs
+--- a/backend/src/api/sys_usage.rs
++++ b/backend/src/api/sys_usage.rs
+@@ -128,13 +128,13 @@
+             let mut total_bytes: u64 = 0;
+             let mut total_free_bytes: u64 = 0;
+             // SAFETY: `self.path.0` is a NUL-terminated UTF-16 string built from
+-            // the CWD; the three output pointers are valid mutable u64 references.
++            // the CWD; the three output pointers alias ULARGE_INTEGER (= u64).
+             let ok = unsafe {
+                 winapi::um::fileapi::GetDiskFreeSpaceExW(
+                     self.path.0.as_ptr(),
+-                    &mut free_bytes_available,
+-                    &mut total_bytes,
+-                    &mut total_free_bytes,
++                    &mut free_bytes_available as *mut u64 as *mut _,
++                    &mut total_bytes as *mut u64 as *mut _,
++                    &mut total_free_bytes as *mut u64 as *mut _,
+                 )
+             };
+             if ok == 0 {
+@@ -541,7 +541,7 @@
+ #[cfg(target_os = "windows")]
+ mod platform {
+     use super::{CpuTracker, DiskProbe, SystemInfo};
+-    use std::{mem::size_of, ptr::null_mut};
++    use std::mem::size_of;
+     use winapi::{
+         shared::minwindef::FILETIME,
+         um::{
+@@ -551,8 +551,14 @@
+         },
+     };
+ 
++    /// Pseudo-handle from `GetCurrentProcess` is process-wide and safe across threads.
++    #[derive(Clone, Copy)]
++    struct ProcessHandle(winapi::um::winnt::HANDLE);
++    // SAFETY: only stores the current-process pseudo-handle (-1), not an owned HANDLE.
++    unsafe impl Send for ProcessHandle {}
++
+     pub(super) struct Sampler {
+-        process: winapi::um::winnt::HANDLE,
++        process: ProcessHandle,
+         memory_total: u64,
+         disk_probe: Option<DiskProbe>,
+         cpu_tracker: CpuTracker,
+@@ -562,9 +568,9 @@
+ 
+     impl Sampler {
+         pub(super) fn new() -> Option<Self> {
+-            let process = unsafe { GetCurrentProcess() };
++            let process = ProcessHandle(unsafe { GetCurrentProcess() });
+             let memory_total = query_memory_total()?;
+-            let cpu_time_secs = query_process_cpu_time_secs(process)?;
++            let cpu_time_secs = query_process_cpu_time_secs(process.0)?;
+             let networks = sysinfo::Networks::new_with_refreshed_list();
+             Some(Self {
+                 process,
+@@ -577,8 +583,8 @@
+         }
+ 
+         pub(super) fn sample(&mut self) -> Option<SystemInfo> {
+-            let cpu_time_secs = query_process_cpu_time_secs(self.process)?;
+-            let memory_usage = query_process_memory_usage(self.process)?;
++            let cpu_time_secs = query_process_cpu_time_secs(self.process.0)?;
++            let memory_usage = query_process_memory_usage(self.process.0)?;
+             self.networks.refresh(true);
+             let (rx_bytes, tx_bytes) = super::sum_sysinfo_network_bytes(&self.networks);
+             let (received_bps, sent_bps) = self.net_tracker.sample(rx_bytes, tx_bytes);
