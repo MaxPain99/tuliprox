@@ -182,6 +182,8 @@ grep -q 'hls_api_stream_leaked_relative' "${TREE}/backend/src/api/endpoints/hls_
 grep -q '{*token}' "${TREE}/backend/src/api/endpoints/hls_api.rs"
 grep -q 'm3u_catchup_epg_reference_from_session_token' "${TREE}/backend/src/api/endpoints/hls_api.rs"
 grep -q 'is_archive_playback' "${TREE}/backend/src/api/endpoints/hls_api.rs"
+grep -q 'epg_reference_ts_from_date_tree_path' "${TREE}/backend/src/api/endpoints/hls_api.rs"
+grep -q 'looks_like_archive_media_path' "${TREE}/backend/src/api/endpoints/hls_api.rs"
 grep -q 'session_token_hint' "${TREE}/backend/src/api/endpoints/hls_api.rs"
 grep -q 'Some(session_key.as_str())' "${TREE}/backend/src/api/endpoints/m3u_api.rs"
 grep -q 'Some(session_key.as_str())' "${TREE}/backend/src/api/endpoints/xtream_api.rs"

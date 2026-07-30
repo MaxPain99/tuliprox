@@ -72,6 +72,7 @@ jobs:
           cargo test -p tuliprox parses_flat_tivimate_hls_archive --locked
           cargo test -p tuliprox resolve_default_mode_query_template_keeps_base_stream_url --locked
           cargo test -p tuliprox leaked_dvr_relative_joins_against_media_playlist --locked
+          cargo test -p tuliprox date_tree_path_recovers_bittv_archive_epg_reference --locked
           cargo test -p tuliprox adult_group_matcher_covers_bittv_style_names --locked
 
       - name: Build frontend
