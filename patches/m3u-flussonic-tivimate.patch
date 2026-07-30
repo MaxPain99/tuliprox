@@ -1278,10 +1278,10 @@ index 1dcbbc7e..6f0420dc 100644
 +    // Backend active_streams() omits preserved session rows. Merge sticky Catchup/HLS rows from the
 +    // previous frontend state so a StatusResponse cannot blank Streams between archive segments.
 +    if let Some(previous) = status_holder.as_ref() {
-+        let active_tokens: HashSet<&str> = server_status
++        let active_tokens: HashSet<String> = server_status
 +            .active_user_streams
 +            .iter()
-+            .filter_map(|stream| stream.session_token.as_deref())
++            .filter_map(|stream| stream.session_token.clone())
 +            .collect();
 +        let active_keys: HashSet<(SocketAddr, u32)> =
 +            server_status.active_user_streams.iter().map(stream_identity_key).collect();
