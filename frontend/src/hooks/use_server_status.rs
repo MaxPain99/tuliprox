@@ -54,7 +54,12 @@ fn dedupe_streams_by_identity(streams: &mut Vec<StreamInfo>) {
 }
 
 fn should_keep_preserved_stream_visible(stream: &StreamInfo) -> bool {
-    stream.session_token.is_some() && (stream.channel.item_type.is_live_adaptive() || is_shared_hls_stream(stream))
+    // Match backend `is_stable_session_stream`: Catchup/HLS/DASH (and shared HLS) stay visible
+    // while preserved between short segment requests — otherwise archive playback vanishes from Streams.
+    stream.session_token.is_some()
+        && (stream.channel.item_type.is_live_adaptive()
+            || stream.channel.item_type == PlaylistItemType::Catchup
+            || is_shared_hls_stream(stream))
 }
 
 fn should_keep_stream_when_connections_drop_to_zero(stream: &StreamInfo) -> bool {
@@ -560,6 +565,48 @@ mod tests {
         };
 
         apply_active_user_change(&mut status, ActiveUserConnectionChange::Updated(preserved.clone()));
+
+        assert_eq!(status.active_user_streams, vec![preserved]);
+    }
+
+    #[test]
+    fn test_preserved_catchup_update_stays_visible_between_archive_segments() {
+        let mut preserved = test_stream(1, "127.0.0.1:1234", Some("tok-catchup"), PlaylistItemType::Catchup);
+        preserved.preserved = true;
+        let other = test_stream(2, "127.0.0.1:5678", Some("tok-live"), PlaylistItemType::LiveHls);
+        let mut status = shared::model::StatusCheck {
+            active_users: 2,
+            active_user_connections: 2,
+            active_user_streams: vec![
+                test_stream(1, "127.0.0.1:1234", Some("tok-catchup"), PlaylistItemType::Catchup),
+                other.clone(),
+            ],
+            ..Default::default()
+        };
+
+        apply_active_user_change(&mut status, ActiveUserConnectionChange::Updated(preserved.clone()));
+
+        assert_eq!(status.active_user_streams.len(), 2);
+        assert!(status
+            .active_user_streams
+            .iter()
+            .any(|stream| stream.uid == preserved.uid && stream.preserved && stream.channel.item_type == PlaylistItemType::Catchup));
+        assert!(status.active_user_streams.iter().any(|stream| stream == &other));
+    }
+
+    #[test]
+    fn test_connections_zero_keeps_preserved_catchup_rows_for_ttl_cleanup() {
+        let mut preserved = test_stream(1, "127.0.0.1:1234", Some("tok-catchup"), PlaylistItemType::Catchup);
+        preserved.preserved = true;
+        let non_session = test_stream(2, "127.0.0.1:5678", Some("tok-vod"), PlaylistItemType::Video);
+        let mut status = shared::model::StatusCheck {
+            active_users: 1,
+            active_user_connections: 1,
+            active_user_streams: vec![preserved.clone(), non_session],
+            ..Default::default()
+        };
+
+        apply_active_user_change(&mut status, ActiveUserConnectionChange::Connections(1, 0));
 
         assert_eq!(status.active_user_streams, vec![preserved]);
     }

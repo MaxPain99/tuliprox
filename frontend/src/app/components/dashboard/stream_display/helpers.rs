@@ -55,7 +55,10 @@ pub fn get_adaptive_session_ttl_secs(config_ctx: &ConfigContext) -> u64 {
 }
 
 pub fn is_adaptive_session_stream(stream: &StreamInfo) -> bool {
-    stream.session_token.is_some() && stream.channel.item_type.is_live_adaptive()
+    // Catchup uses the same preserved-session TTL path as live adaptive HLS/DASH so archive
+    // rows remain sticky between short segment connections and still expire from the panel.
+    stream.session_token.is_some()
+        && (stream.channel.item_type.is_live_adaptive() || stream.channel.item_type == PlaylistItemType::Catchup)
 }
 
 pub fn is_background_transfer_stream(stream: &StreamInfo) -> bool {
@@ -287,5 +290,40 @@ mod tests {
         let refreshed = compute_adaptive_last_seen(existing, &streams, 999);
 
         assert_eq!(refreshed.get(&2), Some(&999));
+    }
+
+    #[test]
+    fn compute_adaptive_last_seen_tracks_catchup_session_streams() {
+        let existing = HashMap::from([(5, 100)]);
+        let streams = Some(vec![
+            test_stream(5, PlaylistItemType::Catchup, true, true),
+            test_stream(6, PlaylistItemType::Catchup, false, true),
+        ]);
+
+        let refreshed = compute_adaptive_last_seen(existing, &streams, 999);
+
+        // Preserved catchup keeps prior last_seen (sticky between segments).
+        assert_eq!(refreshed.get(&5), Some(&100));
+        assert_eq!(refreshed.get(&6), Some(&999));
+    }
+
+    #[test]
+    fn filter_visible_streams_keeps_catchup_within_adaptive_ttl() {
+        use super::{filter_visible_streams, ADAPTIVE_STREAM_CLEANUP_BUFFER_SECS};
+
+        let streams = Some(vec![
+            test_stream(1, PlaylistItemType::Catchup, true, true),
+            test_stream(2, PlaylistItemType::Video, false, true),
+        ]);
+        let last_seen = HashMap::from([(1, 1_000u64)]);
+        let ttl = 30u64;
+        let visible = filter_visible_streams(streams, &last_seen, 1_000 + ttl, ttl).unwrap();
+        assert_eq!(visible.len(), 2);
+
+        let expired =
+            filter_visible_streams(Some(visible), &last_seen, 1_000 + ttl + ADAPTIVE_STREAM_CLEANUP_BUFFER_SECS + 1, ttl)
+                .unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].channel.item_type, PlaylistItemType::Video);
     }
 }
