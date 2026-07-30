@@ -2,7 +2,7 @@
 # BitTV date-tree leaked DVR segments force Catchup in Streams/History
 
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
-index 9b65185..f83f215 100644
+index 9b65185..d7210f4 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
 @@ -103,6 +103,123 @@ fn is_m3u_catchup_session_token(session_token: &str) -> bool {
@@ -320,7 +320,7 @@ index 9b65185..f83f215 100644
      hls_api_stream_resolved(
          fingerprint,
          req_headers,
-@@ -5778,6 +5955,69 @@ async fn hls_api_stream(
+@@ -5778,6 +5955,71 @@ async fn hls_api_stream(
      .await
  }
  
@@ -354,15 +354,17 @@ index 9b65185..f83f215 100644
 +    let Some(input) = app_state.app_config.get_input_by_id(input_id) else {
 +        return StatusCode::BAD_REQUEST.into_response();
 +    };
-+    session.stream_url = origin_url.intern();
-+    let archive_reference = resolve_m3u_archive_reference(&session.stream_url, Some(session.token.as_str()))
++    let archive_reference = resolve_m3u_archive_reference(&origin_url, Some(session.token.as_str()))
 +        .or_else(|| epg_reference_ts_from_date_tree_path(&relative_path))
 +        .or_else(|| epg_reference_ts_from_date_tree_path(&origin_url));
++    let is_archive_media =
++        looks_like_archive_media_path(&relative_path) || looks_like_archive_media_path(&origin_url);
++    session.stream_url = origin_url.intern();
 +    let mut stream_channel =
 +        resolve_stream_channel(&app_state, &target, &input, stream_id, &session.stream_url, archive_reference).await;
 +    // Leaked DVR/date-tree segments are always archive playback for the panel, even when the
 +    // prior session was live and the date-tree timestamp could not be parsed.
-+    if looks_like_archive_media_path(&relative_path) || looks_like_archive_media_path(&origin_url) {
++    if is_archive_media {
 +        stream_channel.item_type = PlaylistItemType::Catchup;
 +        stream_channel.cluster = XtreamCluster::Video;
 +        if stream_channel.epg_reference_ts.is_none() {
@@ -390,7 +392,7 @@ index 9b65185..f83f215 100644
  #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
  async fn hls_api_stream_resolved(
      fingerprint: Fingerprint,
-@@ -5839,7 +6079,8 @@ async fn hls_api_stream_resolved(
+@@ -5839,7 +6081,8 @@ async fn hls_api_stream_resolved(
      }
  
      if let Some(session) = &mut user_session {
@@ -400,7 +402,7 @@ index 9b65185..f83f215 100644
          if session.permission == UserConnectionPermission::Exhausted {
              let stream_channel = resolve_stream_channel(
                  &app_state,
-@@ -5888,7 +6129,7 @@ async fn hls_api_stream_resolved(
+@@ -5888,7 +6131,7 @@ async fn hls_api_stream_resolved(
              _ => return axum::http::StatusCode::BAD_REQUEST.into_response(),
          };
          let hls_url = hls_url.intern();
@@ -409,7 +411,7 @@ index 9b65185..f83f215 100644
          session.stream_url = hls_url.clone();
          if session.virtual_id == virtual_id {
              app_state.connection_manager.touch_http_activity(&user.username, &session.token, &fingerprint.addr).await;
-@@ -5986,6 +6227,7 @@ async fn hls_api_stream_resolved(
+@@ -5986,6 +6229,7 @@ async fn hls_api_stream_resolved(
                  &user,
                  &target,
                  Some(session),
@@ -417,7 +419,7 @@ index 9b65185..f83f215 100644
                  &session.stream_url,
                  archive_reference,
                  source.stream_identity,
-@@ -6062,7 +6304,7 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
+@@ -6062,7 +6306,7 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
              axum::routing::get(hls_proxy_resource),
          )
          .route(
@@ -426,7 +428,7 @@ index 9b65185..f83f215 100644
              axum::routing::get(hls_api_stream),
          )
      //cfg.service(web::resource("/hls/{token}/{stream}").route(web::get().to(xtream_player_api_hls_stream)));
-@@ -6073,7 +6315,8 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
+@@ -6073,7 +6317,8 @@ pub fn hls_api_register() -> axum::Router<Arc<AppState>> {
  mod tests {
      use super::{
          build_hls_manifest_request_headers, extract_hls_provider_session_headers, hls_api_register,
@@ -436,7 +438,7 @@ index 9b65185..f83f215 100644
      };
      use crate::{
          api::model::{
-@@ -6156,6 +6399,68 @@ mod tests {
+@@ -6156,6 +6401,68 @@ mod tests {
          assert_eq!(m3u_archive_epg_reference_ts("http://provider/live/42.m3u8?start=1700000000"), None);
      }
  
@@ -505,7 +507,7 @@ index 9b65185..f83f215 100644
      #[test]
      fn archive_epg_reference_supports_contextual_start_aliases() {
          assert_eq!(
-@@ -9664,6 +9969,7 @@ mod tests {
+@@ -9664,6 +9971,7 @@ mod tests {
              origin_source,
              12345,
              None,
@@ -513,7 +515,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -9707,6 +10013,7 @@ mod tests {
+@@ -9707,6 +10015,7 @@ mod tests {
              &user,
              &target,
              None,
@@ -521,7 +523,7 @@ index 9b65185..f83f215 100644
              archive_url,
              Some(1_784_898_000),
              stream_identity,
-@@ -9770,6 +10077,7 @@ mod tests {
+@@ -9770,6 +10079,7 @@ mod tests {
              origin_source,
              12345,
              None,
@@ -529,7 +531,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::GracePeriod,
-@@ -9829,6 +10137,7 @@ mod tests {
+@@ -9829,6 +10139,7 @@ mod tests {
              &user,
              &target,
              None,
@@ -537,7 +539,7 @@ index 9b65185..f83f215 100644
              "http://origin.example.com/live/user/pass/1001.m3u8",
              None,
              super::HlsEntryStreamIdentity::new(1001, "80510").expect("valid input stream identity"),
-@@ -9886,6 +10195,7 @@ mod tests {
+@@ -9886,6 +10197,7 @@ mod tests {
              &user,
              &first_target,
              None,
@@ -545,7 +547,7 @@ index 9b65185..f83f215 100644
              "http://origin.example.com/live/user/pass/1001.m3u8",
              None,
              super::HlsEntryStreamIdentity::new(1001, "80510").expect("first input stream identity"),
-@@ -9903,6 +10213,7 @@ mod tests {
+@@ -9903,6 +10215,7 @@ mod tests {
              &user,
              &second_target,
              None,
@@ -553,7 +555,7 @@ index 9b65185..f83f215 100644
              "http://origin.example.com/live/user/pass/9007.m3u8",
              None,
              super::HlsEntryStreamIdentity::new(9007, "80510").expect("second input stream identity"),
-@@ -9989,6 +10300,7 @@ mod tests {
+@@ -9989,6 +10302,7 @@ mod tests {
              &user,
              &target,
              None,
@@ -561,7 +563,7 @@ index 9b65185..f83f215 100644
              "http://origin.example.com/live/user/pass/12345.m3u8",
              None,
              super::HlsEntryStreamIdentity::new(12345, "80510").expect("valid input stream identity"),
-@@ -10162,6 +10474,7 @@ mod tests {
+@@ -10162,6 +10476,7 @@ mod tests {
              origin_source.clone(),
              12345,
              None,
@@ -569,7 +571,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10186,6 +10499,7 @@ mod tests {
+@@ -10186,6 +10501,7 @@ mod tests {
              origin_source,
              12345,
              None,
@@ -577,7 +579,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10376,6 +10690,7 @@ mod tests {
+@@ -10376,6 +10692,7 @@ mod tests {
              origin_source.clone(),
              12345,
              None,
@@ -585,7 +587,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10402,6 +10717,7 @@ mod tests {
+@@ -10402,6 +10719,7 @@ mod tests {
              origin_source,
              12345,
              None,
@@ -593,7 +595,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10443,6 +10759,7 @@ mod tests {
+@@ -10443,6 +10761,7 @@ mod tests {
              origin_source.clone(),
              12345,
              None,
@@ -601,7 +603,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10485,6 +10802,7 @@ mod tests {
+@@ -10485,6 +10804,7 @@ mod tests {
              origin_source,
              12345,
              None,
@@ -609,7 +611,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10525,6 +10843,7 @@ mod tests {
+@@ -10525,6 +10845,7 @@ mod tests {
              origin_source.clone(),
              12345,
              None,
@@ -617,7 +619,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10562,6 +10881,7 @@ mod tests {
+@@ -10562,6 +10883,7 @@ mod tests {
              origin_source,
              12345,
              None,
@@ -625,7 +627,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10632,6 +10952,7 @@ mod tests {
+@@ -10632,6 +10954,7 @@ mod tests {
              origin_source,
              12345,
              None,
@@ -633,7 +635,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10667,6 +10988,7 @@ mod tests {
+@@ -10667,6 +10990,7 @@ mod tests {
              origin_source.clone(),
              12345,
              None,
@@ -641,7 +643,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10695,6 +11017,7 @@ mod tests {
+@@ -10695,6 +11019,7 @@ mod tests {
              origin_source,
              12345,
              None,
@@ -649,7 +651,7 @@ index 9b65185..f83f215 100644
              request_url,
              &input,
              UserConnectionPermission::Allowed,
-@@ -10759,6 +11082,7 @@ mod tests {
+@@ -10759,6 +11084,7 @@ mod tests {
              origin_source,
              80510,
              None,
@@ -657,7 +659,7 @@ index 9b65185..f83f215 100644
              "http://origin.example.com/live/user/pass/80510.m3u8",
              &input,
              UserConnectionPermission::Allowed,
-@@ -10796,6 +11120,7 @@ mod tests {
+@@ -10796,6 +11122,7 @@ mod tests {
              origin_source,
              70001,
              None,
