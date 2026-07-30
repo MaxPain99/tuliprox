@@ -2,7 +2,7 @@
 # Force Catchup on shared HLS register; pass catchup session_key hint into HLS cache
 
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
-index 9b65185..81db70a 100644
+index 9b65185..7268a35 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
 @@ -103,6 +103,73 @@ fn is_m3u_catchup_session_token(session_token: &str) -> bool {
@@ -410,7 +410,15 @@ index 9b65185..81db70a 100644
      #[test]
      fn archive_epg_reference_supports_contextual_start_aliases() {
          assert_eq!(
-@@ -9707,6 +9926,7 @@ mod tests {
+@@ -9664,6 +9883,7 @@ mod tests {
+             origin_source,
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -9707,6 +9927,7 @@ mod tests {
              &user,
              &target,
              None,
@@ -418,7 +426,15 @@ index 9b65185..81db70a 100644
              archive_url,
              Some(1_784_898_000),
              stream_identity,
-@@ -9829,6 +10049,7 @@ mod tests {
+@@ -9770,6 +9991,7 @@ mod tests {
+             origin_source,
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::GracePeriod,
+@@ -9829,6 +10051,7 @@ mod tests {
              &user,
              &target,
              None,
@@ -426,7 +442,7 @@ index 9b65185..81db70a 100644
              "http://origin.example.com/live/user/pass/1001.m3u8",
              None,
              super::HlsEntryStreamIdentity::new(1001, "80510").expect("valid input stream identity"),
-@@ -9886,6 +10107,7 @@ mod tests {
+@@ -9886,6 +10109,7 @@ mod tests {
              &user,
              &first_target,
              None,
@@ -434,7 +450,7 @@ index 9b65185..81db70a 100644
              "http://origin.example.com/live/user/pass/1001.m3u8",
              None,
              super::HlsEntryStreamIdentity::new(1001, "80510").expect("first input stream identity"),
-@@ -9903,6 +10125,7 @@ mod tests {
+@@ -9903,6 +10127,7 @@ mod tests {
              &user,
              &second_target,
              None,
@@ -442,7 +458,7 @@ index 9b65185..81db70a 100644
              "http://origin.example.com/live/user/pass/9007.m3u8",
              None,
              super::HlsEntryStreamIdentity::new(9007, "80510").expect("second input stream identity"),
-@@ -9989,6 +10212,7 @@ mod tests {
+@@ -9989,6 +10214,7 @@ mod tests {
              &user,
              &target,
              None,
@@ -450,7 +466,95 @@ index 9b65185..81db70a 100644
              "http://origin.example.com/live/user/pass/12345.m3u8",
              None,
              super::HlsEntryStreamIdentity::new(12345, "80510").expect("valid input stream identity"),
-@@ -10759,6 +10983,7 @@ mod tests {
+@@ -10162,6 +10388,7 @@ mod tests {
+             origin_source.clone(),
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10186,6 +10413,7 @@ mod tests {
+             origin_source,
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10376,6 +10604,7 @@ mod tests {
+             origin_source.clone(),
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10402,6 +10631,7 @@ mod tests {
+             origin_source,
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10443,6 +10673,7 @@ mod tests {
+             origin_source.clone(),
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10485,6 +10716,7 @@ mod tests {
+             origin_source,
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10525,6 +10757,7 @@ mod tests {
+             origin_source.clone(),
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10562,6 +10795,7 @@ mod tests {
+             origin_source,
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10632,6 +10866,7 @@ mod tests {
+             origin_source,
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10667,6 +10902,7 @@ mod tests {
+             origin_source.clone(),
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10695,6 +10931,7 @@ mod tests {
+             origin_source,
+             12345,
+             None,
++            None,
+             request_url,
+             &input,
+             UserConnectionPermission::Allowed,
+@@ -10759,6 +10996,7 @@ mod tests {
              origin_source,
              80510,
              None,
@@ -458,7 +562,7 @@ index 9b65185..81db70a 100644
              "http://origin.example.com/live/user/pass/80510.m3u8",
              &input,
              UserConnectionPermission::Allowed,
-@@ -10796,6 +11021,7 @@ mod tests {
+@@ -10796,6 +11034,7 @@ mod tests {
              origin_source,
              70001,
              None,
