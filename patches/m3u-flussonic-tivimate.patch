@@ -106,14 +106,14 @@ diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hl
          }
      }
      let mut start_ts = None;
-@@ -166,6 +231,7 @@
+@@ -166,5 +231,6 @@
      target_id: u16,
      input_id: u16,
      stream_id: u32,
-+    /// Single obfuscated token, or a leaked relative origin path (`dvr-YYYY/…ts`).
++    /// Single obfuscated token, or a leaked relative origin path (`dvr-YYYY/...ts`).
      token: String,
  }
-@@ -1359,13 +1379,15 @@ async fn build_hls_cache_stream_channel(
+@@ -1359,17 +1379,19 @@ async fn build_hls_cache_stream_channel(
          fallback_hls_cache_stream_channel(0, access.virtual_id, origin_source, proxy_session_id)
      };
  
