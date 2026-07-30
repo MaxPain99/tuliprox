@@ -1,11 +1,10 @@
 # MaxPain Flussonic / TiviMate catchup + archive Streams sticky panel
-# Fix: Connections never wipes stream rows (archive HLS blink)
-# Align sticky detection with backend is_stable_session_stream (+ catchup tokens)
-# Never drop on Updated(preserved); Catchup never TTL-hidden in Streams filter
-# Include preserved Catchup/HLS in active_streams StatusCheck snapshots
+# Restore v3.3.81: catchup-type-first Flussonic detection, panel_streams(),
+# archive redirect guard, timeshift/catchup-days Flussonic fallback
+# Connections never wipes stream rows; Catchup never TTL-hidden
 
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
-index 4263a498..3ae82330 100644
+index 4263a498..3dc172da 100644
 --- a/backend/src/api/api_utils.rs
 +++ b/backend/src/api/api_utils.rs
 @@ -2535,9 +2535,9 @@ pub async fn force_provider_stream_response(
@@ -30,8 +29,24 @@ index 4263a498..3ae82330 100644
      for addr in cleanup_addrs {
          app_state.connection_manager.release_provider_connection(addr).await;
          if close_client_socket {
+@@ -4590,6 +4590,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
+         status: None,
+         output_clusters: shared::model::ClusterFlags::all(),
+         ui_enabled: false,
++        hide_adult: false,
+         comment: None,
+         priority: 0,
+         soft_connections: 0,
+@@ -9780,6 +9781,7 @@ mod tests {
+             status: None,
+             output_clusters: ClusterFlags::all(),
+             ui_enabled: true,
++            hide_adult: false,
+             comment: None,
+             priority: 0,
+             soft_connections: 0,
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
-index 9b65185c..a032807f 100644
+index 9b65185c..807bbc97 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
 @@ -103,6 +103,123 @@ fn is_m3u_catchup_session_token(session_token: &str) -> bool {
@@ -876,10 +891,38 @@ index 9b65185c..a032807f 100644
              &input,
              UserConnectionPermission::Allowed,
 diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
-index 020c0ed3..ae5332b1 100644
+index 020c0ed3..f9886507 100644
 --- a/backend/src/api/endpoints/m3u_api.rs
 +++ b/backend/src/api/endpoints/m3u_api.rs
-@@ -452,6 +452,7 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
+@@ -425,7 +425,10 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
+     };
+ 
+     if let Some(response) = redirect_response(app_state, &redirect_params).await {
+-        return response.into_response();
++        // Archive/catchup must keep the resolved provider archive URL — do not redirect to live.
++        if archive_discriminator.is_none() && pli.item_type != PlaylistItemType::Catchup {
++            return response.into_response();
++        }
+     }
+ 
+     let is_session_request = is_session_based_playback(pli.item_type, Some(extension));
+@@ -435,7 +438,14 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
+     // branch attaches it to the StreamChannel so the frontend's stream_epg
+     // request can centre its EPG window on the archive timestamp instead of
+     // falling back to `now`.
+-    let archive_reference = m3u_archive_epg_reference_ts(&pli.url);
++    let archive_reference = m3u_archive_epg_reference_ts(&pli.url).or_else(|| {
++        archive_discriminator.and_then(|disc| {
++            disc.strip_prefix("archive|")
++                .or_else(|| disc.strip_prefix("timeshift_abs|"))
++                .and_then(|rest| rest.split('|').next())
++                .and_then(|start| start.parse::<i64>().ok())
++        })
++    });
+     // Reverse proxy mode — only route genuine HLS into the HLS handler, not DASH
+     if is_session_request && extension == shared::defaults::HLS_EXT {
+         let Some(stream_identity) = HlsEntryStreamIdentity::from_playlist_item(&pli) else {
+@@ -452,6 +462,7 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
              &user,
              &target,
              user_session.as_ref(),
@@ -887,8 +930,184 @@ index 020c0ed3..ae5332b1 100644
              &pli.url,
              archive_reference,
              stream_identity,
+@@ -526,6 +537,30 @@ fn playlist_item_native_flussonic_mode(item: &shared::model::M3uPlaylistItem) ->
+     }
+ }
+ 
++/// Accept Flussonic archive routes when catchup-type is Flussonic OR when BitTV-style
++/// rows only have timeshift / catchup-days (v3.3.81 fallback).
++fn playlist_item_allows_flussonic_archive(item: &shared::model::M3uPlaylistItem) -> bool {
++    if playlist_item_native_flussonic_mode(item).is_some() {
++        return true;
++    }
++    if !item.time_shift.trim().is_empty() {
++        return true;
++    }
++    match item.additional_properties.as_ref() {
++        Some(StreamProperties::Live(live)) => live
++            .catchup
++            .as_ref()
++            .is_some_and(|c| c.days.as_ref().is_some_and(|d| !d.is_empty())),
++        _ => false,
++    }
++}
++
++fn playlist_item_flussonic_mode_or_default(item: &shared::model::M3uPlaylistItem) -> Option<&'static str> {
++    playlist_item_native_flussonic_mode(item).or_else(|| {
++        playlist_item_allows_flussonic_archive(item).then_some("flussonic")
++    })
++}
++
+ fn native_live_file_matches_mode(mode: &str, file: &str) -> bool {
+     let supported = if mode == "flussonic-ts" {
+         &["mpegts", "index.ts", "video.ts", "mono.ts"][..]
+@@ -578,8 +613,8 @@ fn resolve_loaded_m3u_catchup(
+     Ok((catchup_item, resolved.discriminator))
+ }
+ 
+-fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, item_type: PlaylistItemType) -> bool {
+-    user.allows_item_type(item_type)
++fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, pli: &shared::model::M3uPlaylistItem) -> bool {
++    user.allows_item_type(pli.item_type) && user.allows_group(pli.group.as_ref())
+ }
+ 
+ #[allow(clippy::too_many_lines)]
+@@ -608,7 +643,7 @@ async fn m3u_api_stream(
+                 return axum::http::StatusCode::NOT_FOUND.into_response();
+             }
+         };
+-        let Some(mode) = playlist_item_native_flussonic_mode(&pli) else {
++        let Some(mode) = playlist_item_flussonic_mode_or_default(&pli) else {
+             return axum::http::StatusCode::BAD_REQUEST.into_response();
+         };
+         if !native_archive_matches_mode(mode, &archive) {
+@@ -720,7 +755,7 @@ async fn m3u_api_stream_nested(
+     );
+     let stream_ext = extract_extension_from_url(file);
+     let resolved = if let Some(archive) = parse_flussonic_archive_file(file) {
+-        let Some(mode) = playlist_item_native_flussonic_mode(&pli) else {
++        let Some(mode) = playlist_item_flussonic_mode_or_default(&pli) else {
+             return axum::http::StatusCode::BAD_REQUEST.into_response();
+         };
+         if !native_archive_matches_mode(mode, &archive) {
+@@ -730,7 +765,7 @@ async fn m3u_api_stream_nested(
+             (item, Some(discriminator))
+         })
+     } else if is_flussonic_live_file(file) {
+-        let Some(mode) = playlist_item_native_flussonic_mode(&pli) else {
++        let Some(mode) = playlist_item_flussonic_mode_or_default(&pli) else {
+             return axum::http::StatusCode::BAD_REQUEST.into_response();
+         };
+         if !native_live_file_matches_mode(mode, file) {
+@@ -816,7 +851,7 @@ async fn m3u_api_catchup(
+             return axum::http::StatusCode::BAD_REQUEST.into_response();
+         }
+     };
+-    if !resolved_m3u_item_is_allowed(user.as_ref(), resolved_pli.item_type) {
++    if !resolved_m3u_item_is_allowed(user.as_ref(), &resolved_pli) {
+         return axum::http::StatusCode::FORBIDDEN.into_response();
+     }
+ 
+@@ -1095,10 +1130,74 @@ mod tests {
+ 
+     #[test]
+     fn resolved_catchup_item_requires_rechecked_permissions() {
++        use shared::utils::Internable;
++
+         let mut user = ProxyUserCredentials::default();
+         user.output_clusters = ClusterFlags::Live;
+ 
+-        assert!(!resolved_m3u_item_is_allowed(&user, PlaylistItemType::Catchup));
++        let item = shared::model::M3uPlaylistItem {
++            virtual_id: 1,
++            provider_id: "1".intern(),
++            input_stream_id: "1".intern(),
++            name: "ch".intern(),
++            chno: 0,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "News".intern(),
++            title: "ch".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "".intern(),
++            rec: "".intern(),
++            url: "http://example/live".intern(),
++            epg_channel_id: None,
++            input_name: "in".intern(),
++            item_type: PlaylistItemType::Catchup,
++            t_stream_url: "".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: None,
++            upstream_user_agent: None,
++        };
++        assert!(!resolved_m3u_item_is_allowed(&user, &item));
++    }
++
++    #[test]
++    fn hide_adult_blocks_adult_group_even_when_cluster_allowed() {
++        use shared::utils::Internable;
++
++        let mut user = ProxyUserCredentials::default();
++        user.hide_adult = true;
++
++        let item = shared::model::M3uPlaylistItem {
++            virtual_id: 1,
++            provider_id: "1".intern(),
++            input_stream_id: "1".intern(),
++            name: "xxx".intern(),
++            chno: 0,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "18+ (Adult)".intern(),
++            title: "xxx".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "".intern(),
++            rec: "".intern(),
++            url: "http://example/live".intern(),
++            epg_channel_id: None,
++            input_name: "in".intern(),
++            item_type: PlaylistItemType::LiveHls,
++            t_stream_url: "".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: None,
++            upstream_user_agent: None,
++        };
++        assert!(!resolved_m3u_item_is_allowed(&user, &item));
+     }
+ 
+     #[test]
+diff --git a/backend/src/api/endpoints/v1_api.rs b/backend/src/api/endpoints/v1_api.rs
+index 4c7ece90..40f31f80 100644
+--- a/backend/src/api/endpoints/v1_api.rs
++++ b/backend/src/api/endpoints/v1_api.rs
+@@ -48,7 +48,7 @@ pub async fn create_status_check(app_state: &Arc<AppState>) -> StatusCheck {
+     let (active_users, active_user_connections, active_user_streams) = {
+         let active_user = &app_state.active_users;
+         let (user_count, connection_count) = active_user.active_users_and_connections().await;
+-        (user_count, connection_count, active_user.active_streams().await)
++        (user_count, connection_count, active_user.panel_streams().await)
+     };
+ 
+     let active_provider_connections =
+@@ -81,7 +81,7 @@ async fn streams(
+     ExtractAcceptHeader(accept): ExtractAcceptHeader,
+     axum::extract::State(app_state): axum::extract::State<Arc<AppState>>,
+ ) -> axum::response::Response {
+-    let streams = app_state.active_users.active_streams().await;
++    let streams = app_state.active_users.panel_streams().await;
+     json_or_bin_response(accept.as_deref(), &streams).into_response()
+ }
+ 
 diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints/xtream_api.rs
-index 9c93b8dd..f7666aa0 100644
+index 9c93b8dd..edc5ce39 100644
 --- a/backend/src/api/endpoints/xtream_api.rs
 +++ b/backend/src/api/endpoints/xtream_api.rs
 @@ -17,7 +17,8 @@ use crate::{
@@ -901,6 +1120,15 @@ index 9c93b8dd..f7666aa0 100644
              },
              xmltv_api::{get_empty_epg_response, get_epg_path_for_target_by_type, serve_short_epg},
          },
+@@ -310,7 +311,7 @@ async fn xtream_player_api_stream(
+     } else {
+         user.allows_item_type(pli.item_type)
+     };
+-    if !output_allowed {
++    if !output_allowed || !user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref()) {
+         if is_hls_manifest_request {
+             return hls_custom_video_manifest_response(
+                 app_state,
 @@ -636,14 +637,18 @@ async fn xtream_player_api_stream(
              return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
          };
@@ -945,8 +1173,29 @@ index 9c93b8dd..f7666aa0 100644
                  stream_identity,
                  &input,
                  req_headers,
+@@ -1003,7 +1013,9 @@ async fn xtream_player_api_resource(
+         format!("Failed to read xtream item for stream id {req_virtual_id}")
+     );
+ 
+-    if !user.allows_item_type(pli.item_type) {
++    if !user.allows_item_type(pli.item_type)
++        || !user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref())
++    {
+         return axum::http::StatusCode::NOT_FOUND.into_response();
+     }
+ 
+@@ -1430,6 +1442,9 @@ async fn xtream_player_api_handle_content_action(
+                         if let Some(fltr) = filter {
+                             categories.retain(|c| fltr.contains(&c.category_id));
+                         }
++                        if user.hide_adult {
++                            categories.retain(|c| !ProxyUserCredentials::is_adult_group(&c.category_name));
++                        }
+                         return Some(axum::Json(categories).into_response());
+                     }
+                     Err(err) => error!("Failed to parse json file {}: {err}", file_path.display()),
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
-index 9055e082..1a539ba1 100644
+index 9055e082..9aa54c05 100644
 --- a/backend/src/api/model/active_user_manager.rs
 +++ b/backend/src/api/model/active_user_manager.rs
 @@ -385,9 +385,19 @@ fn create_socket_reentry_guard_key(username: &str, client_ip: &str, virtual_id:
@@ -1007,19 +1256,41 @@ index 9055e082..1a539ba1 100644
      pub async fn update_session_provider_headers(
          &self,
          username: &str,
-@@ -2933,7 +2961,10 @@ impl ActiveUserManager {
+@@ -2933,6 +2961,8 @@ impl ActiveUserManager {
          let mut streams = Vec::new();
          for connection_data in user_connections.by_key.values() {
              for stream in &connection_data.streams {
--                if !stream.preserved {
-+                // Include preserved Catchup/HLS/DASH session rows in StatusCheck/Streams so the
-+                // panel does not blank between short archive segment sockets. Other preserved
-+                // rows stay internal-only for TTL/history bookkeeping.
-+                if !stream.preserved || is_stable_session_stream(stream) {
++                // Keep active_streams free of preserved rows — shared-HLS join detection and
++                // connection accounting must not see stale archive segment leases (v3.3.81).
+                 if !stream.preserved {
                      streams.push(stream.clone());
                  }
-             }
-@@ -3138,11 +3169,13 @@ impl ActiveUserManager {
+@@ -2941,6 +2971,24 @@ impl ActiveUserManager {
+         streams
+     }
+ 
++    /// Streams for the WebUI / StatusCheck snapshot.
++    ///
++    /// Includes preserved Catchup/HLS/DASH session rows so the panel keeps showing archive
++    /// playback between short segment sockets. Do not use this for shared-HLS accounting.
++    pub async fn panel_streams(&self) -> Vec<StreamInfo> {
++        self.gc();
++        let user_connections = self.connections.read().await;
++        let mut streams = Vec::new();
++        for connection_data in user_connections.by_key.values() {
++            for stream in &connection_data.streams {
++                if !stream.preserved || Self::should_preserve_session_stream(stream) {
++                    streams.push(stream.clone());
++                }
++            }
++        }
++        streams
++    }
++
+     fn log_connection_added(
+         username: &str,
+         addr: &SocketAddr,
+@@ -3138,11 +3186,13 @@ impl ActiveUserManager {
              return true;
          };
  
@@ -1037,15 +1308,27 @@ index 9055e082..1a539ba1 100644
      }
  
      fn collect_divergence_snapshot(
-@@ -7092,7 +7125,10 @@ mod tests {
+@@ -4654,6 +4704,7 @@ mod tests {
+             status: None,
+             output_clusters: shared::model::ClusterFlags::all(),
+             ui_enabled: true,
++            hide_adult: false,
+             comment: None,
+             priority: 0,
+             soft_connections,
+@@ -7092,7 +7143,14 @@ mod tests {
          assert!(released.addr_removed);
          assert!(released.removed_streams.is_empty(), "adaptive close should preserve without history removal");
          assert_eq!(manager.user_connections(&user.username).await, 0);
 -        assert!(manager.active_streams().await.is_empty(), "preserved adaptive streams are hidden from active snapshots");
-+        let active = manager.active_streams().await;
-+        assert_eq!(active.len(), 1, "preserved adaptive/catchup session rows stay in StatusCheck snapshots");
-+        assert!(active[0].preserved);
-+        assert_eq!(active[0].session_token.as_deref(), Some("tok-hls-manifest-touch"));
++        assert!(
++            manager.active_streams().await.is_empty(),
++            "preserved rows stay out of active_streams (use panel_streams for StatusCheck)"
++        );
++        let panel = manager.panel_streams().await;
++        assert_eq!(panel.len(), 1, "preserved adaptive/catchup session rows stay in panel snapshots");
++        assert!(panel[0].preserved);
++        assert_eq!(panel[0].session_token.as_deref(), Some("tok-hls-manifest-touch"));
  
          let connections = manager.connections.read().await;
          let data = connections.by_key.get(&user.username).expect("user should remain for preserved session");
@@ -1199,6 +1482,74 @@ index d254fde7..a69b50ea 100644
      }
  
      #[test]
+diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
+index 6a5d7eb5..323604ef 100644
+--- a/backend/src/repository/m3u_playlist_iterator.rs
++++ b/backend/src/repository/m3u_playlist_iterator.rs
+@@ -163,14 +163,31 @@ fn apply_rewrite(
+     };
+ 
+     if should_rewrite_urls {
+-        let flussonic_live_file = m3u_pli.additional_properties.as_ref().and_then(|properties| match properties {
+-            StreamProperties::Live(live) => live
+-                .catchup
+-                .as_ref()
+-                .and_then(shared::model::CatchupProperties::native_flussonic_player_mode)
+-                .map(flussonic_proxy_live_file),
+-            _ => None,
+-        });
++        let flussonic_live_file = m3u_pli
++            .additional_properties
++            .as_ref()
++            .and_then(|properties| match properties {
++                StreamProperties::Live(live) => live
++                    .catchup
++                    .as_ref()
++                    .and_then(shared::model::CatchupProperties::native_flussonic_player_mode)
++                    .map(flussonic_proxy_live_file),
++                _ => None,
++            })
++            .or_else(|| {
++                // BitTV rows often have timeshift/catchup-days without a Flussonic mode on
++                // catchup=; nested live file is required so TiviMate can rewrite the last
++                // path segment for archive (v3.3.81).
++                let has_timeshift = !m3u_pli.time_shift.trim().is_empty();
++                let has_days = m3u_pli.additional_properties.as_ref().and_then(|props| match props {
++                    StreamProperties::Live(live) => live
++                        .catchup
++                        .as_ref()
++                        .and_then(|c| c.days.as_ref().filter(|d| !d.is_empty())),
++                    _ => None,
++                });
++                (has_timeshift || has_days.is_some()).then_some(flussonic_proxy_live_file("flussonic"))
++            });
+         let stream_url = flussonic_live_file.map_or_else(
+             || {
+                 build_rewritten_url(
+@@ -267,6 +284,7 @@ impl M3uPlaylistIterator {
+         let target_id = target.id;
+         let proxy_type = user.proxy;
+         let output_clusters = user.output_clusters;
++        let hide_adult = user.hide_adult;
+         let target_options = target.options.clone();
+         let input_by_name: HashMap<Arc<str>, Arc<crate::model::ConfigInput>> = cfg
+             .sources
+@@ -312,6 +330,15 @@ impl M3uPlaylistIterator {
+                     continue;
+                 }
+ 
++                if hide_adult
++                    && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
++                        || crate::model::ProxyUserCredentials::stream_props_marked_adult(
++                            item.additional_properties.as_ref(),
++                        ))
++                {
++                    continue;
++                }
++
+                 if let Some(set) = &filter {
+                     if !set.contains(item.group.as_ref()) {
+                         continue;
 diff --git a/frontend/src/app/components/dashboard/stream_display/helpers.rs b/frontend/src/app/components/dashboard/stream_display/helpers.rs
 index 449b4ac4..78eb64b6 100644
 --- a/frontend/src/app/components/dashboard/stream_display/helpers.rs
@@ -1342,7 +1693,7 @@ index 64870fc7..c70bf684 100644
                                          html! {
                                              <StreamDisplayItem
 diff --git a/frontend/src/hooks/use_server_status.rs b/frontend/src/hooks/use_server_status.rs
-index 1dcbbc7e..18a7a6e1 100644
+index 1dcbbc7e..6d529756 100644
 --- a/frontend/src/hooks/use_server_status.rs
 +++ b/frontend/src/hooks/use_server_status.rs
 @@ -25,14 +25,41 @@ type ServerStatusState =
@@ -1803,7 +2154,7 @@ index 256e4d25..cebdb375 100644
 +            || stream.channel.item_type == PlaylistItemType::Catchup)
  }
 diff --git a/shared/src/model/playlist.rs b/shared/src/model/playlist.rs
-index a9ff41cb..d91fe813 100644
+index a9ff41cb..bc2cca71 100644
 --- a/shared/src/model/playlist.rs
 +++ b/shared/src/model/playlist.rs
 @@ -618,6 +618,28 @@ fn append_m3u_catchup_attributes(
@@ -1892,11 +2243,53 @@ index a9ff41cb..d91fe813 100644
          }
  
 diff --git a/shared/src/model/stream_properties.rs b/shared/src/model/stream_properties.rs
-index 4f3c8b28..d8d389b0 100644
+index 4f3c8b28..40571e8e 100644
 --- a/shared/src/model/stream_properties.rs
 +++ b/shared/src/model/stream_properties.rs
-@@ -63,6 +63,20 @@ impl CatchupProperties {
-             None
+@@ -48,21 +48,55 @@ impl CatchupProperties {
+             && self.extra_attributes.is_empty()
+     }
+ 
++    fn is_flussonic_mode_str(mode: Option<&str>) -> bool {
++        mode.is_some_and(|m| {
++            matches!(
++                m.trim().to_ascii_lowercase().as_str(),
++                "flussonic" | "flussonic-hls" | "flussonic-ts" | "fs"
++            )
++        })
++    }
++
++    /// Prefer `catchup-type` when both are set so a leftover `catchup="shift"`/`append`
++    /// from a provider cannot steal Flussonic path-rewrite channels (v3.3.81 behavior).
++    pub fn is_flussonic(&self) -> bool {
++        if let Some(ct) = self.catchup_type.as_deref().filter(|v| !v.is_empty()) {
++            return Self::is_flussonic_mode_str(Some(ct));
++        }
++        Self::is_flussonic_mode_str(self.mode.as_deref())
++    }
++
+     pub fn native_flussonic_player_mode(&self) -> Option<&'static str> {
+-        let mode = self
+-            .mode
++        if !self.is_flussonic() {
++            return None;
++        }
++        let raw = self
++            .catchup_type
+             .as_deref()
+             .map(str::trim)
+             .filter(|value| !value.is_empty())
+-            .or_else(|| self.catchup_type.as_deref().map(str::trim).filter(|value| !value.is_empty()))?;
+-        if mode.eq_ignore_ascii_case("flussonic-ts") {
++            .or_else(|| self.mode.as_deref().map(str::trim).filter(|value| !value.is_empty()))
++            .unwrap_or("flussonic");
++        if raw.eq_ignore_ascii_case("flussonic-ts") {
+             Some("flussonic-ts")
+-        } else if ["fs", "flussonic", "flussonic-hls"].iter().any(|alias| mode.eq_ignore_ascii_case(alias)) {
+-            Some("flussonic")
+         } else {
+-            None
++            Some("flussonic")
          }
      }
 +
@@ -1916,3 +2309,27 @@ index 4f3c8b28..d8d389b0 100644
  }
  
  fn format_episode_code(season: u32, episode: u32) -> Option<String> {
+@@ -1176,11 +1210,22 @@ mod tests {
+             assert_eq!(catchup.native_flussonic_player_mode(), expected);
+         }
+ 
++        // BitTV often ships catchup="append"/"shift" with catchup-type="flussonic".
++        // catchup-type must win so path-rewrite archive stays Flussonic (v3.3.81).
+         let conflicting = CatchupProperties {
+             mode: Some("append".into()),
+             catchup_type: Some("flussonic".into()),
+             ..CatchupProperties::default()
+         };
+-        assert_eq!(conflicting.native_flussonic_player_mode(), None);
++        assert!(conflicting.is_flussonic());
++        assert_eq!(conflicting.native_flussonic_player_mode(), Some("flussonic"));
++
++        let shift_type_wins = CatchupProperties {
++            mode: Some("flussonic".into()),
++            catchup_type: Some("shift".into()),
++            ..CatchupProperties::default()
++        };
++        assert!(!shift_type_wins.is_flussonic());
++        assert_eq!(shift_type_wins.native_flussonic_player_mode(), None);
+     }
+ }
