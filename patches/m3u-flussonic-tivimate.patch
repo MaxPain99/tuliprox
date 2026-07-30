@@ -1,9 +1,9 @@
-# Flussonic/TiviMate/BitTV catchup + panel archive type (Catchup not Live/HLS)
-# BitTV date-tree leaked DVR + append/shift Catchup panel typing
-# Soft-preserve Catchup in Streams between HLS segment downloads
-# Fix Connections(0) race + StatusResponse merge + stable Streams row keys
+# MaxPain Flussonic / TiviMate catchup + archive Streams sticky panel
+# Fix: Connections never wipes stream rows (archive HLS blink)
+# Align sticky detection with backend is_stable_session_stream (+ catchup tokens)
+# Never drop on Updated(preserved); Catchup never TTL-hidden in Streams filter
 # Include preserved Catchup/HLS in active_streams StatusCheck snapshots
-# Apply before user-hide-adult.patch
+
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
 index 4263a498..3ae82330 100644
 --- a/backend/src/api/api_utils.rs
@@ -38,9 +38,9 @@ index 9b65185c..a032807f 100644
      session_token.starts_with("m3u-catchup|") || session_token.starts_with("catchup|")
  }
  
-+/// Recover archive EPG reference from `m3u-catchup|…|archive|{start}|{duration}` session keys.
++/// Recover archive EPG reference from `m3u-catchup|тАж|archive|{start}|{duration}` session keys.
 +///
-+/// BitTV archive media URLs look like `…/2026/07/24/14/13/38-06800.ts` and lose Flussonic
++/// BitTV archive media URLs look like `тАж/2026/07/24/14/13/38-06800.ts` and lose Flussonic
 +/// path markers after HLS rewrite, so the panel would otherwise keep showing Live + live EPG.
 +pub(in crate::api) fn m3u_catchup_epg_reference_from_session_token(session_token: &str) -> Option<i64> {
 +    let rest = session_token.strip_prefix("m3u-catchup|")?;
@@ -73,7 +73,7 @@ index 9b65185c..a032807f 100644
 +        || (rel.len() >= 10 && rel.as_bytes().get(4) == Some(&b'/') && rel.starts_with('2'))
 +}
 +
-+/// BitTV / Flussonic date-tree segments: `YYYY/MM/DD/HH/MM/SS-….ts` or `dvr-YYYY/…`.
++/// BitTV / Flussonic date-tree segments: `YYYY/MM/DD/HH/MM/SS-тАж.ts` or `dvr-YYYY/тАж`.
 +pub(in crate::api) fn epg_reference_ts_from_date_tree_path(path: &str) -> Option<i64> {
 +    let owned_path;
 +    let mut rel = path.trim_start_matches('/');
@@ -114,7 +114,7 @@ index 9b65185c..a032807f 100644
 +/// Join a client-leaked relative DVR/media path against the session's origin URL.
 +///
 +/// When an origin `.m3u8` is force-piped without `rewrite_hls`, players resolve
-+/// `dvr-2026/…ts?token=` against the proxy playlist URL (`/hls/…/{token}.m3u8`).
++/// `dvr-2026/тАжts?token=` against the proxy playlist URL (`/hls/тАж/{token}.m3u8`).
 +fn resolve_leaked_hls_relative_origin(
 +    session_stream_url: &str,
 +    relative_path: &str,
@@ -184,7 +184,7 @@ index 9b65185c..a032807f 100644
 -        if let Ok(ts) = start.parse::<i64>() {
 -            return Some(ts);
 -        }
-+    // BitTV date-tree: /…/YYYY/MM/DD/HH/MM/SS-….ts
++    // BitTV date-tree: /тАж/YYYY/MM/DD/HH/MM/SS-тАж.ts
 +    if let Some(ts) = epg_reference_ts_from_date_tree_path(parsed.path()) {
 +        return Some(ts);
      }
@@ -389,7 +389,7 @@ index 9b65185c..a032807f 100644
          (user, target)
      };
 +
-+    // Nested path = relative origin segment that leaked past rewrite_hls (e.g. dvr-YYYY/…).
++    // Nested path = relative origin segment that leaked past rewrite_hls (e.g. dvr-YYYY/тАж).
 +    if params.token.contains('/') {
 +        return hls_api_stream_leaked_relative(
 +            fingerprint,
@@ -946,10 +946,30 @@ index 9c93b8dd..f7666aa0 100644
                  &input,
                  req_headers,
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
-index 9055e082..7c539ab0 100644
+index 9055e082..1a539ba1 100644
 --- a/backend/src/api/model/active_user_manager.rs
 +++ b/backend/src/api/model/active_user_manager.rs
-@@ -1667,10 +1667,16 @@ impl ActiveUserManager {
+@@ -385,9 +385,19 @@ fn create_socket_reentry_guard_key(username: &str, client_ip: &str, virtual_id:
+     shared::concat_string!(username, "|", client_ip, "|", &virtual_id.to_string())
+ }
+ 
++fn is_catchup_session_token(session_token: &str) -> bool {
++    session_token.starts_with("m3u-catchup|")
++        || session_token.starts_with("catchup|")
++        || session_token.contains("|archive|")
++        || session_token.contains("|timeshift_abs|")
++}
++
+ fn is_stable_session_stream(stream: &StreamInfo) -> bool {
++    // Catchup-token Live/.ts segment sockets must preserve too тАФ otherwise archive panel rows
++    // hard-remove every HLS chunk and Streams blinks even when frontend soft-preserve is present.
+     stream.channel.item_type == PlaylistItemType::Catchup
+         || stream.channel.item_type.is_live_adaptive()
++        || stream.session_token.as_deref().is_some_and(is_catchup_session_token)
+         || matches!(
+             extract_extension_from_url(stream.channel.url.as_ref()),
+             Some(ext) if ext == HLS_EXT || ext == DASH_EXT
+@@ -1667,10 +1677,16 @@ impl ActiveUserManager {
          sessions: &[UserSession],
      ) -> Option<AdaptiveExpiryEntry> {
          let session_token = stream.session_token.as_deref()?;
@@ -968,7 +988,7 @@ index 9055e082..7c539ab0 100644
          Some(AdaptiveExpiryEntry {
              expires_at,
              username: username.to_string(),
-@@ -2873,6 +2879,18 @@ impl ActiveUserManager {
+@@ -2873,6 +2889,18 @@ impl ActiveUserManager {
          self.update_user_session(username, token).await
      }
  
@@ -987,7 +1007,7 @@ index 9055e082..7c539ab0 100644
      pub async fn update_session_provider_headers(
          &self,
          username: &str,
-@@ -2933,7 +2951,10 @@ impl ActiveUserManager {
+@@ -2933,7 +2961,10 @@ impl ActiveUserManager {
          let mut streams = Vec::new();
          for connection_data in user_connections.by_key.values() {
              for stream in &connection_data.streams {
@@ -999,7 +1019,7 @@ index 9055e082..7c539ab0 100644
                      streams.push(stream.clone());
                  }
              }
-@@ -3138,11 +3159,13 @@ impl ActiveUserManager {
+@@ -3138,11 +3169,13 @@ impl ActiveUserManager {
              return true;
          };
  
@@ -1017,7 +1037,7 @@ index 9055e082..7c539ab0 100644
      }
  
      fn collect_divergence_snapshot(
-@@ -7092,7 +7115,10 @@ mod tests {
+@@ -7092,7 +7125,10 @@ mod tests {
          assert!(released.addr_removed);
          assert!(released.removed_streams.is_empty(), "adaptive close should preserve without history removal");
          assert_eq!(manager.user_connections(&user.username).await, 0);
@@ -1180,7 +1200,7 @@ index d254fde7..a69b50ea 100644
  
      #[test]
 diff --git a/frontend/src/app/components/dashboard/stream_display/helpers.rs b/frontend/src/app/components/dashboard/stream_display/helpers.rs
-index 449b4ac4..c56ad1ce 100644
+index 449b4ac4..78eb64b6 100644
 --- a/frontend/src/app/components/dashboard/stream_display/helpers.rs
 +++ b/frontend/src/app/components/dashboard/stream_display/helpers.rs
 @@ -55,7 +55,10 @@ pub fn get_adaptive_session_ttl_secs(config_ctx: &ConfigContext) -> u64 {
@@ -1195,16 +1215,17 @@ index 449b4ac4..c56ad1ce 100644
  }
  
  pub fn is_background_transfer_stream(stream: &StreamInfo) -> bool {
-@@ -72,6 +75,16 @@ pub fn filter_visible_streams(
+@@ -72,6 +75,17 @@ pub fn filter_visible_streams(
          streams
              .into_iter()
              .filter(|stream| {
-+                // Preserved archive/HLS session rows must remain visible between segment downloads.
-+                // Do not TTL-hide them just because Catchup was added to the adaptive path.
++                // Archive Catchup (active or preserved) and preserved HLS/DASH must stay visible
++                // between short segment sockets. UID churn must not TTL-hide the row.
++                if stream.channel.item_type == PlaylistItemType::Catchup {
++                    return true;
++                }
 +                if stream.preserved
-+                    && (stream.channel.item_type == PlaylistItemType::Catchup
-+                        || stream.channel.item_type.is_live_adaptive()
-+                        || is_shared_hls_stream(stream))
++                    && (stream.channel.item_type.is_live_adaptive() || is_shared_hls_stream(stream))
 +                {
 +                    return true;
 +                }
@@ -1212,7 +1233,7 @@ index 449b4ac4..c56ad1ce 100644
                  if !is_adaptive_session_stream(stream) {
                      return true;
                  }
-@@ -288,4 +301,65 @@ mod tests {
+@@ -288,4 +302,66 @@ mod tests {
  
          assert_eq!(refreshed.get(&2), Some(&999));
      }
@@ -1258,7 +1279,7 @@ index 449b4ac4..c56ad1ce 100644
 +    }
 +
 +    #[test]
-+    fn filter_visible_streams_expires_non_preserved_catchup_after_adaptive_ttl() {
++    fn filter_visible_streams_keeps_active_catchup_past_adaptive_ttl() {
 +        use super::{filter_visible_streams, ADAPTIVE_STREAM_CLEANUP_BUFFER_SECS};
 +
 +        let streams = Some(vec![
@@ -1267,15 +1288,16 @@ index 449b4ac4..c56ad1ce 100644
 +        ]);
 +        let last_seen = HashMap::from([(1, 1_000u64)]);
 +        let ttl = 30u64;
-+        let expired = filter_visible_streams(
++        let visible = filter_visible_streams(
 +            streams,
 +            &last_seen,
 +            1_000 + ttl + ADAPTIVE_STREAM_CLEANUP_BUFFER_SECS + 1,
 +            ttl,
 +        )
 +        .unwrap();
-+        assert_eq!(expired.len(), 1);
-+        assert_eq!(expired[0].channel.item_type, PlaylistItemType::Video);
++        // Active archive rows must not TTL-blink between HLS segments; expiry is disconnect-driven.
++        assert_eq!(visible.len(), 2);
++        assert!(visible.iter().any(|stream| stream.channel.item_type == PlaylistItemType::Catchup));
 +    }
  }
 diff --git a/frontend/src/app/components/dashboard/stream_display/mod.rs b/frontend/src/app/components/dashboard/stream_display/mod.rs
@@ -1320,10 +1342,10 @@ index 64870fc7..c70bf684 100644
                                          html! {
                                              <StreamDisplayItem
 diff --git a/frontend/src/hooks/use_server_status.rs b/frontend/src/hooks/use_server_status.rs
-index 1dcbbc7e..f572d9c7 100644
+index 1dcbbc7e..18a7a6e1 100644
 --- a/frontend/src/hooks/use_server_status.rs
 +++ b/frontend/src/hooks/use_server_status.rs
-@@ -25,14 +25,35 @@ type ServerStatusState =
+@@ -25,14 +25,41 @@ type ServerStatusState =
  
  fn stream_identity_key(stream: &StreamInfo) -> (SocketAddr, u32) { (stream.addr, stream.uid) }
  
@@ -1334,18 +1356,24 @@ index 1dcbbc7e..f572d9c7 100644
 +        || session_token.contains("|timeshift_abs|")
 +}
 +
++fn stream_url_looks_adaptive(url: &str) -> bool {
++    let lower = url.to_ascii_lowercase();
++    lower.contains(".m3u8") || lower.contains(".mpd")
++}
++
 +fn is_sticky_session_stream(stream: &StreamInfo) -> bool {
-+    // Archive Catchup rows stay sticky even if session_token is briefly missing between segments.
++    // Match backend `is_stable_session_stream`, plus Catchup without a token so soft-preserve
++    // still wins when archive segments briefly lose session metadata.
 +    if stream.channel.item_type == PlaylistItemType::Catchup {
 +        return true;
 +    }
-+    let Some(session_token) = stream.session_token.as_deref() else {
-+        return false;
-+    };
-+    // Keep HLS/DASH (and catchup-token Live rows) sticky between short segment sockets.
-+    stream.channel.item_type.is_live_adaptive()
-+        || is_shared_hls_stream(stream)
-+        || is_catchup_session_token(session_token)
++    if stream.channel.item_type.is_live_adaptive() || is_shared_hls_stream(stream) {
++        return true;
++    }
++    if stream_url_looks_adaptive(stream.channel.url.as_ref()) {
++        return true;
++    }
++    stream.session_token.as_deref().is_some_and(is_catchup_session_token)
 +}
 +
  fn find_stream_update_index(streams: &[StreamInfo], updated_stream: &StreamInfo) -> Option<usize> {
@@ -1361,7 +1389,7 @@ index 1dcbbc7e..f572d9c7 100644
              if let Some(index) =
                  streams.iter().position(|stream| stream.session_token.as_deref() == Some(session_token))
              {
-@@ -41,6 +62,18 @@ fn find_stream_update_index(streams: &[StreamInfo], updated_stream: &StreamInfo)
+@@ -41,6 +68,18 @@ fn find_stream_update_index(streams: &[StreamInfo], updated_stream: &StreamInfo)
          }
      }
  
@@ -1380,13 +1408,13 @@ index 1dcbbc7e..f572d9c7 100644
      if updated_stream.session_token.is_none() {
          return streams.iter().position(|stream| stream.addr == updated_stream.addr && stream.session_token.is_none());
      }
-@@ -54,7 +87,18 @@ fn dedupe_streams_by_identity(streams: &mut Vec<StreamInfo>) {
+@@ -54,9 +93,21 @@ fn dedupe_streams_by_identity(streams: &mut Vec<StreamInfo>) {
  }
  
  fn should_keep_preserved_stream_visible(stream: &StreamInfo) -> bool {
 -    stream.session_token.is_some() && (stream.channel.item_type.is_live_adaptive() || is_shared_hls_stream(stream))
 +    // Match backend `is_stable_session_stream`: Catchup/HLS/DASH (and shared HLS) stay visible
-+    // while preserved between short segment requests — otherwise archive playback vanishes from Streams.
++    // while preserved between short segment requests тАФ otherwise archive playback vanishes from Streams.
 +    is_sticky_session_stream(stream)
 +}
 +
@@ -1399,8 +1427,11 @@ index 1dcbbc7e..f572d9c7 100644
 +    }
  }
  
++#[allow(dead_code)] // retained for documentation of the old Connections(0) wipe predicate
  fn should_keep_stream_when_connections_drop_to_zero(stream: &StreamInfo) -> bool {
-@@ -138,6 +182,33 @@ fn replace_server_status_snapshot(
+     stream.preserved && should_keep_preserved_stream_visible(stream)
+ }
+@@ -138,6 +189,41 @@ fn replace_server_status_snapshot(
      mut server_status: StatusCheck,
      download_streams: &[StreamInfo],
  ) -> Rc<StatusCheck> {
@@ -1414,6 +1445,12 @@ index 1dcbbc7e..f572d9c7 100644
 +            .collect();
 +        let active_keys: HashSet<(SocketAddr, u32)> =
 +            server_status.active_user_streams.iter().map(stream_identity_key).collect();
++        let active_catchup_keys: HashSet<(String, u32)> = server_status
++            .active_user_streams
++            .iter()
++            .filter(|stream| stream.channel.item_type == PlaylistItemType::Catchup)
++            .map(|stream| (stream.username.clone(), stream.channel.virtual_id))
++            .collect();
 +        for previous_stream in &previous.active_user_streams {
 +            if !is_sticky_session_stream(previous_stream) {
 +                continue;
@@ -1423,7 +1460,9 @@ index 1dcbbc7e..f572d9c7 100644
 +                .as_deref()
 +                .is_some_and(|token| active_tokens.contains(token));
 +            let represented_by_identity = active_keys.contains(&stream_identity_key(previous_stream));
-+            if represented_by_token || represented_by_identity {
++            let represented_by_catchup = previous_stream.channel.item_type == PlaylistItemType::Catchup
++                && active_catchup_keys.contains(&(previous_stream.username.clone(), previous_stream.channel.virtual_id));
++            if represented_by_token || represented_by_identity || represented_by_catchup {
 +                continue;
 +            }
 +            let mut kept = previous_stream.clone();
@@ -1434,7 +1473,26 @@ index 1dcbbc7e..f572d9c7 100644
      dedupe_streams_by_identity(&mut server_status.active_user_streams);
      merge_aux_streams(&mut server_status, download_streams);
      let server_status = Rc::new(server_status);
-@@ -219,15 +290,40 @@ fn apply_active_user_change(server_status: &mut StatusCheck, event: ActiveUserCo
+@@ -199,6 +285,9 @@ fn apply_active_user_change(server_status: &mut StatusCheck, event: ActiveUserCo
+     match event {
+         ActiveUserConnectionChange::Updated(stream_info) => {
+             if stream_info.preserved {
++                // Never drop on Updated(preserved): backend already decided the session row should
++                // linger between HLS segments. Removing here blanked archive Streams when sticky
++                // detection lagged behind backend `is_stable_session_stream`.
+                 if should_keep_preserved_stream_visible(&stream_info) {
+                     if let Some(pos) = find_stream_update_index(&server_status.active_user_streams, &stream_info) {
+                         server_status.active_user_streams[pos] = stream_info;
+@@ -206,8 +295,6 @@ fn apply_active_user_change(server_status: &mut StatusCheck, event: ActiveUserCo
+                         server_status.active_user_streams.push(stream_info);
+                     }
+                     dedupe_streams_by_identity(&mut server_status.active_user_streams);
+-                } else if let Some(pos) = find_stream_update_index(&server_status.active_user_streams, &stream_info) {
+-                    server_status.active_user_streams.remove(pos);
+                 }
+                 return;
+             }
+@@ -219,17 +306,37 @@ fn apply_active_user_change(server_status: &mut StatusCheck, event: ActiveUserCo
              dedupe_streams_by_identity(&mut server_status.active_user_streams);
          }
          ActiveUserConnectionChange::Disconnected(addr) => {
@@ -1466,18 +1524,86 @@ index 1dcbbc7e..f572d9c7 100644
 +                .retain(|stream_info| stream_info.addr != addr || stream_info.uid != uid);
          }
          ActiveUserConnectionChange::Connections(user_count, connections) => {
++            // Counters only. Never mutate active_user_streams here: backend emits Connections(0)
++            // between archive HLS segments before Updated(preserved)/Disconnected*, and wiping
++            // the list is what made Streams blink every ~1s.
              server_status.active_users = user_count;
              server_status.active_user_connections = connections;
-             if connections == 0 {
-+                // Backend often emits Connections(0) before DisconnectedStream/Updated(preserved)
-+                // when an archive segment socket closes. Soft-preserve first or Streams blanks.
-+                for stream in &mut server_status.active_user_streams {
-+                    mark_sticky_session_preserved(stream);
-+                }
-                 server_status.active_user_streams.retain(should_keep_stream_when_connections_drop_to_zero);
-             }
+-            if connections == 0 {
+-                server_status.active_user_streams.retain(should_keep_stream_when_connections_drop_to_zero);
+-            }
          }
-@@ -564,6 +660,186 @@ mod tests {
+     }
+ }
+@@ -461,7 +568,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_connections_zero_clears_stale_stream_rows() {
++    fn test_connections_zero_does_not_mutate_stream_rows() {
+         let mut status = shared::model::StatusCheck {
+             active_users: 1,
+             active_user_connections: 1,
+@@ -472,22 +579,23 @@ mod tests {
+             ..Default::default()
+         };
+ 
++        let streams = status.active_user_streams.clone();
+         apply_active_user_change(&mut status, ActiveUserConnectionChange::Connections(0, 0));
+ 
+         assert_eq!(status.active_users, 0);
+         assert_eq!(status.active_user_connections, 0);
+-        assert!(status.active_user_streams.is_empty());
++        assert_eq!(status.active_user_streams, streams);
+     }
+ 
+     #[test]
+-    fn test_connections_zero_keeps_preserved_adaptive_rows_for_ttl_cleanup() {
++    fn test_connections_zero_keeps_all_rows_including_non_adaptive() {
+         let mut preserved = test_stream(1, "127.0.0.1:1234", Some("tok-hls"), PlaylistItemType::LiveHls);
+         preserved.preserved = true;
+         let non_adaptive = test_stream(2, "127.0.0.1:5678", Some("tok-vod"), PlaylistItemType::Video);
+         let mut status = shared::model::StatusCheck {
+             active_users: 1,
+             active_user_connections: 1,
+-            active_user_streams: vec![preserved.clone(), non_adaptive],
++            active_user_streams: vec![preserved.clone(), non_adaptive.clone()],
+             ..Default::default()
+         };
+ 
+@@ -495,7 +603,7 @@ mod tests {
+ 
+         assert_eq!(status.active_users, 1);
+         assert_eq!(status.active_user_connections, 0);
+-        assert_eq!(status.active_user_streams, vec![preserved]);
++        assert_eq!(status.active_user_streams, vec![preserved, non_adaptive]);
+     }
+ 
+     #[test]
+@@ -527,7 +635,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_preserved_non_adaptive_update_removes_active_stream_without_clearing_other_rows() {
++    fn test_preserved_non_adaptive_update_is_ignored_without_clearing_other_rows() {
+         let mut preserved = test_stream(1, "127.0.0.1:1234", Some("tok-vod"), PlaylistItemType::Video);
+         preserved.preserved = true;
+         let other = test_stream(2, "127.0.0.1:5678", Some("tok-other"), PlaylistItemType::LiveHls);
+@@ -540,10 +648,12 @@ mod tests {
+             ],
+             ..Default::default()
+         };
++        let before = status.active_user_streams.clone();
+ 
+         apply_active_user_change(&mut status, ActiveUserConnectionChange::Updated(preserved));
+ 
+-        assert_eq!(status.active_user_streams, vec![other]);
++        // Non-sticky preserved updates must not delete panel rows (that path blanked archive Streams).
++        assert_eq!(status.active_user_streams, before);
+         assert_eq!(status.active_users, 2);
+         assert_eq!(status.active_user_connections, 2);
+     }
+@@ -564,6 +674,185 @@ mod tests {
          assert_eq!(status.active_user_streams, vec![preserved]);
      }
  
@@ -1520,7 +1646,8 @@ index 1dcbbc7e..f572d9c7 100644
 +
 +        apply_active_user_change(&mut status, ActiveUserConnectionChange::Connections(1, 0));
 +
-+        assert_eq!(status.active_user_streams, vec![preserved]);
++        assert_eq!(status.active_user_streams.len(), 2);
++        assert!(status.active_user_streams.iter().any(|s| s.uid == preserved.uid));
 +    }
 +
 +    #[test]
@@ -1537,10 +1664,9 @@ index 1dcbbc7e..f572d9c7 100644
 +
 +        apply_active_user_change(&mut status, ActiveUserConnectionChange::Connections(1, 0));
 +
-+        assert_eq!(status.active_user_streams.len(), 1);
-+        assert!(status.active_user_streams[0].preserved);
-+        assert_eq!(status.active_user_streams[0].uid, active.uid);
-+        assert_eq!(status.active_user_streams[0].channel.item_type, PlaylistItemType::Catchup);
++        assert_eq!(status.active_user_streams.len(), 2);
++        assert_eq!(status.active_user_connections, 0);
++        assert!(status.active_user_streams.iter().any(|s| s.uid == active.uid));
 +    }
 +
 +    #[test]
@@ -1555,8 +1681,8 @@ index 1dcbbc7e..f572d9c7 100644
 +
 +        apply_active_user_change(&mut status, ActiveUserConnectionChange::Connections(1, 0));
 +
-+        assert_eq!(status.active_user_streams.len(), 1);
-+        assert!(status.active_user_streams[0].preserved);
++        assert_eq!(status.active_user_streams, vec![active]);
++        assert_eq!(status.active_user_connections, 0);
 +    }
 +
 +    #[test]
@@ -1595,9 +1721,8 @@ index 1dcbbc7e..f572d9c7 100644
 +
 +        apply_active_user_change(&mut status, ActiveUserConnectionChange::Connections(1, 0));
 +
-+        assert_eq!(status.active_user_streams.len(), 1);
-+        assert!(status.active_user_streams[0].preserved);
-+        assert_eq!(status.active_user_streams[0].channel.item_type, PlaylistItemType::Catchup);
++        assert_eq!(status.active_user_streams, vec![active]);
++        assert_eq!(status.active_user_connections, 0);
 +    }
 +
 +    #[test]
@@ -1692,7 +1817,7 @@ index a9ff41cb..d91fe813 100644
 +    rewritten_source: Option<&Arc<str>>,
 +    emit_source: bool,
 +) {
-+    // Unified export: always `catchup-type=…`, never `catchup=`.
++    // Unified export: always `catchup-type=тАж`, never `catchup=`.
 +    write_m3u_attr(line, "catchup-type", catchup_type);
 +    append_catchup_attribute(line, "catchup-days", catchup.days.as_ref());
 +    if emit_source {
@@ -1737,7 +1862,7 @@ index a9ff41cb..d91fe813 100644
 -                    self.t_catchup_source.as_ref(),
 -                );
 +                if let Some(mode) = flussonic_mode {
-+                    // Unify catchup=/catchup-type=flussonic* → catchup-type only.
++                    // Unify catchup=/catchup-type=flussonic* тЖТ catchup-type only.
 +                    // No catchup=, no shift-style catchup-source, no invented days.
 +                    append_unified_catchup_type_attributes(
 +                        &mut line,
@@ -1747,7 +1872,7 @@ index a9ff41cb..d91fe813 100644
 +                        false,
 +                    );
 +                } else if let Some(append_type) = append_type {
-+                    // Unify catchup=/catchup-type=append → catchup-type="append" only.
++                    // Unify catchup=/catchup-type=append тЖТ catchup-type="append" only.
 +                    append_unified_catchup_type_attributes(
 +                        &mut line,
 +                        catchup,
