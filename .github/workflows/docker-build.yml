@@ -152,7 +152,8 @@ jobs:
         run: |
           git config user.name "euzu"
           git config user.email "euzu@proton.me"
-          git add .
+          # Only stage version files — never commit the applied MaxPain patch tree into develop.
+          git add Cargo.toml Cargo.lock frontend/Cargo.toml
           if git diff --cached --quiet; then
             echo "did_commit=false" >> "$GITHUB_OUTPUT"
           else
@@ -163,6 +164,15 @@ jobs:
             git tag -a "v$VERSION" -m "v$VERSION"
             echo "did_commit=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # Apply after the version commit so patched sources never land on develop.
+      # Without this step Docker images are stock upstream and archive Streams sticky fixes never ship.
+      - name: Apply MaxPain patches
+        run: |
+          set -euo pipefail
+          chmod +x scripts/apply-maxpain-flussonic.sh
+          ./scripts/apply-maxpain-flussonic.sh .
+          echo "Applied: m3u-flussonic-tivimate.patch, user-hide-adult.patch"
 
       - name: Build and push Docker images
         env:
