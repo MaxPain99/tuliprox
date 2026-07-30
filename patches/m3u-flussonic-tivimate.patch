@@ -1,7 +1,7 @@
 # MaxPain Flussonic / TiviMate catchup + archive Streams sticky panel
-# Restore v3.3.81: catchup-type-first Flussonic detection, panel_streams(),
-# archive redirect guard, timeshift/catchup-days Flussonic fallback
-# Connections never wipes stream rows; Catchup never TTL-hidden
+# Synced to upstream euzu/develop (v3.3.78 tip) and regenerated against that tree.
+# Includes v3.3.81 routing: catchup-type-first, panel_streams(), archive guards.
+# Connections never wipes stream rows; Catchup never TTL-hidden.
 
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
 index 4263a498..3ae82330 100644

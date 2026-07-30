@@ -1,75 +1,385 @@
-# =============================================================================
-# [BitTV fork] user-hide-adult.patch
-# Apply AFTER m3u-flussonic-tivimate.patch on v3.3.76+.
-# =============================================================================
+# MaxPain Hide Adult feature
+# Regenerated against upstream-synced develop tree.
 
-diff --git a/shared/src/model/config/api_user.rs b/shared/src/model/config/api_user.rs
---- a/shared/src/model/config/api_user.rs
-+++ b/shared/src/model/config/api_user.rs
-@@ -1,5 +1,7 @@
- use crate::{
--    defaults::{default_as_true, default_user_priority, is_cluster_optional, is_default_user_priority, is_true},
-+    defaults::{
-+        default_as_true, default_user_priority, is_cluster_optional, is_default_user_priority, is_false, is_true,
-+    },
-     error::TuliproxError,
-     model::{ClusterFlags, NetworkAccessDto, ProxyType, ProxyUserStatus, XtreamCluster},
-     utils::{deserialize_timestamp, is_blank_optional_string},
-@@ -39,6 +41,9 @@
-     pub output_clusters: Option<ClusterFlags>,
-     #[serde(default = "default_as_true", skip_serializing_if = "is_true")]
-     pub ui_enabled: bool,
-+    /// When true, Adult / 18+ / XXX categories and channels are omitted from playlists.
-+    #[serde(default, skip_serializing_if = "is_false")]
-+    pub hide_adult: bool,
-     #[serde(default, skip_serializing_if = "is_blank_optional_string")]
-     pub comment: Option<String>,
-     #[serde(default = "default_user_priority", skip_serializing_if = "is_default_user_priority")]
-@@ -130,6 +135,7 @@
+diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
+index 4263a498..38b1420c 100644
+--- a/backend/src/api/api_utils.rs
++++ b/backend/src/api/api_utils.rs
+@@ -4590,6 +4590,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
+         status: None,
+         output_clusters: shared::model::ClusterFlags::all(),
+         ui_enabled: false,
++        hide_adult: false,
+         comment: None,
+         priority: 0,
+         soft_connections: 0,
+@@ -9780,6 +9781,7 @@ mod tests {
              status: None,
-             output_clusters: None,
-             ui_enabled: default_as_true(),
+             output_clusters: ClusterFlags::all(),
+             ui_enabled: true,
 +            hide_adult: false,
              comment: None,
-             priority: default_user_priority(),
+             priority: 0,
              soft_connections: 0,
-@@ -269,4 +275,31 @@
-                 .is_some_and(|networks| networks.iter().any(|n| n == "192.168.1.0/24")));
+diff --git a/backend/src/api/endpoints/hdhomerun_api.rs b/backend/src/api/endpoints/hdhomerun_api.rs
+index de5042f4..218ad75d 100644
+--- a/backend/src/api/endpoints/hdhomerun_api.rs
++++ b/backend/src/api/endpoints/hdhomerun_api.rs
+@@ -275,7 +275,8 @@ async fn lineup_status(
+                             let cred = Arc::clone(&cred);
+                             async move {
+                                 let item = res.ok()?;
+-                                cred.allows_item_type(item.item_type).then_some(item)
++                                (cred.allows_item_type(item.item_type) && cred.allows_group(item.group.as_ref()))
++                                    .then_some(item)
+                             }
+                         })
+                         .count()
+diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
+index 020c0ed3..653264f9 100644
+--- a/backend/src/api/endpoints/m3u_api.rs
++++ b/backend/src/api/endpoints/m3u_api.rs
+@@ -578,8 +578,8 @@ fn resolve_loaded_m3u_catchup(
+     Ok((catchup_item, resolved.discriminator))
+ }
+ 
+-fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, item_type: PlaylistItemType) -> bool {
+-    user.allows_item_type(item_type)
++fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, pli: &shared::model::M3uPlaylistItem) -> bool {
++    user.allows_item_type(pli.item_type) && user.allows_group(pli.group.as_ref())
+ }
+ 
+ #[allow(clippy::too_many_lines)]
+@@ -816,7 +816,7 @@ async fn m3u_api_catchup(
+             return axum::http::StatusCode::BAD_REQUEST.into_response();
          }
+     };
+-    if !resolved_m3u_item_is_allowed(user.as_ref(), resolved_pli.item_type) {
++    if !resolved_m3u_item_is_allowed(user.as_ref(), &resolved_pli) {
+         return axum::http::StatusCode::FORBIDDEN.into_response();
      }
--}
+ 
+@@ -1095,10 +1095,74 @@ mod tests {
+ 
+     #[test]
+     fn resolved_catchup_item_requires_rechecked_permissions() {
++        use shared::utils::Internable;
++
+         let mut user = ProxyUserCredentials::default();
+         user.output_clusters = ClusterFlags::Live;
+ 
+-        assert!(!resolved_m3u_item_is_allowed(&user, PlaylistItemType::Catchup));
++        let item = shared::model::M3uPlaylistItem {
++            virtual_id: 1,
++            provider_id: "1".intern(),
++            input_stream_id: "1".intern(),
++            name: "ch".intern(),
++            chno: 0,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "News".intern(),
++            title: "ch".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "".intern(),
++            rec: "".intern(),
++            url: "http://example/live".intern(),
++            epg_channel_id: None,
++            input_name: "in".intern(),
++            item_type: PlaylistItemType::Catchup,
++            t_stream_url: "".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: None,
++            upstream_user_agent: None,
++        };
++        assert!(!resolved_m3u_item_is_allowed(&user, &item));
++    }
 +
 +    #[test]
-+    fn proxy_user_credentials_roundtrip_preserves_hide_adult() {
-+        let user = ProxyUserCredentialsDto {
-+            username: "alice".to_string(),
-+            password: "secret".to_string(),
-+            hide_adult: true,
-+            ..ProxyUserCredentialsDto::default()
++    fn hide_adult_blocks_adult_group_even_when_cluster_allowed() {
++        use shared::utils::Internable;
++
++        let mut user = ProxyUserCredentials::default();
++        user.hide_adult = true;
++
++        let item = shared::model::M3uPlaylistItem {
++            virtual_id: 1,
++            provider_id: "1".intern(),
++            input_stream_id: "1".intern(),
++            name: "xxx".intern(),
++            chno: 0,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "18+ (Adult)".intern(),
++            title: "xxx".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "".intern(),
++            rec: "".intern(),
++            url: "http://example/live".intern(),
++            epg_channel_id: None,
++            input_name: "in".intern(),
++            item_type: PlaylistItemType::LiveHls,
++            t_stream_url: "".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: None,
++            upstream_user_agent: None,
++        };
++        assert!(!resolved_m3u_item_is_allowed(&user, &item));
+     }
+ 
+     #[test]
+diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/xmltv_api.rs
+index e3107f8b..121e3cbc 100644
+--- a/backend/src/api/endpoints/xmltv_api.rs
++++ b/backend/src/api/endpoints/xmltv_api.rs
+@@ -11,9 +11,10 @@ use crate::{
+     auth::Fingerprint,
+     model::{Config, ConfigTarget, ProxyUserCredentials, EPG_ATTRIB_ID, EPG_TAG_CHANNEL},
+     repository::{
+-        epg_query_channels_by_storage_key, get_target_storage_path, m3u_get_epg_file_path_for_target,
+-        storage_const, xtream_get_epg_file_path_for_target, xtream_get_storage_path, BPlusTreeQuery,
+-        LockedReceiverStream, XML_PREAMBLE,
++        adult_epg_id_blocklist, epg_channel_hidden_by_adult_blocklist, epg_query_channels_by_storage_key,
++        get_target_storage_path, m3u_get_epg_file_path_for_target, storage_const,
++        xtream_get_epg_file_path_for_target, xtream_get_storage_path, BPlusTreeQuery, LockedReceiverStream,
++        XML_PREAMBLE,
+     },
+     utils,
+     utils::{
+@@ -34,7 +35,7 @@ use shared::{
+     },
+     utils::{concat_path, concat_path_leading_slash, obfuscate_text, Internable},
+ };
+-use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc};
++use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::Arc};
+ use tokio::{io::{AsyncWrite, AsyncWriteExt}, sync::mpsc, task};
+ use tokio_stream::StreamExt;
+ use tokio_util::io::ReaderStream;
+@@ -242,6 +243,19 @@ async fn serve_epg_with_rewrites(
+         .as_ref()
+         .is_some_and(ConfigTargetOptions::lowercase_xmltv_display_names);
+ 
++    // Cheap Hide Adult filter: shared cached blocklist of adult live tvg-ids only.
++    // Empty / None => no per-channel check (zero overhead for hide_adult=false).
++    let adult_epg_ids: Option<Arc<HashSet<Arc<str>>>> = if user.hide_adult {
++        let ids = adult_epg_id_blocklist(app_state, target).await;
++        if ids.is_empty() {
++            None
++        } else {
++            Some(ids)
++        }
++    } else {
++        None
++    };
++
+     let server_info = app_state.app_config.get_user_server_info(user);
+     let base_url =
+         if !matches!(epg_processing_options.time_shift, EpgTimeShift::None) || epg_processing_options.rewrite_urls {
+@@ -268,6 +282,7 @@ async fn serve_epg_with_rewrites(
+ 
+     let epg_path_for_log = epg_path.clone();
+     let join_error_tx = channel_tx.clone();
++    let adult_epg_ids_for_scan = adult_epg_ids.clone();
+     let spawn_handle = task::spawn_blocking(move || {
+         let _guard = bg_lock;
+         let mut query = match BPlusTreeQuery::<Arc<str>, EpgChannel>::try_new(&epg_path) {
+@@ -290,6 +305,11 @@ async fn serve_epg_with_rewrites(
+                     break;
+                 }
+             };
++            if let Some(blocked) = adult_epg_ids_for_scan.as_ref() {
++                if epg_channel_hidden_by_adult_blocklist(blocked, &channel.id) {
++                    continue;
++                }
++            }
+             if channel_tx.blocking_send(Ok(channel)).is_err() {
+                 break;
+             }
+@@ -932,8 +952,8 @@ mod tests {
+     use shared::{
+         foundation::Filter,
+         model::{
+-            ConfigTargetOptions, EpgCategory, EpgChannel, EpgOutputOptions, EpgProgramme, ProcessingOrder,
+-            StreamEpgItemRequest, StreamEpgRequest, TargetType,
++            ConfigTargetOptions, EpgCategory, EpgChannel, EpgOutputOptions, EpgProgramme, M3uPlaylistItem,
++            PlaylistItemType, ProcessingOrder, StreamEpgItemRequest, StreamEpgRequest, TargetType,
+         },
+         utils::{concat_path, obfuscate_text, Internable},
+     };
+@@ -1469,6 +1489,115 @@ mod tests {
+         assert_eq!(xml, "<display-name>café network &amp; &lt;hd&gt;</display-name>");
+     }
+ 
++    fn blank_m3u_item() -> M3uPlaylistItem {
++        M3uPlaylistItem {
++            virtual_id: 0,
++            provider_id: "".intern(),
++            input_stream_id: "".intern(),
++            name: "".intern(),
++            chno: 0,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "".intern(),
++            title: "".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "".intern(),
++            rec: "".intern(),
++            url: "".intern(),
++            epg_channel_id: None,
++            input_name: "".intern(),
++            item_type: PlaylistItemType::Live,
++            t_stream_url: "".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: None,
++            upstream_user_agent: None,
++        }
++    }
++
++    #[tokio::test]
++    async fn hide_adult_skips_adult_channels_in_xmltv_output() {
++        use crate::repository::{
++            clear_adult_epg_id_cache_for_tests, get_target_storage_path, m3u_get_file_path_for_db, BPlusTree,
 +        };
 +
-+        let serialized = serde_json::to_value(&user).expect("user should serialize");
-+        let deserialized: ProxyUserCredentialsDto =
-+            serde_json::from_value(serialized).expect("user should deserialize");
++        clear_adult_epg_id_cache_for_tests();
++        let dir = tempdir().expect("temp dir");
++        let storage_dir = dir.path().to_string_lossy().to_string();
++        let app_state = create_test_app_state(test_config_with_storage(&storage_dir));
 +
-+        assert!(deserialized.hide_adult);
++        let mut target = test_target_with_xtream_and_m3u();
++        target.name = "hide-adult-epg".to_string();
++        target.id = 42;
++        let target = Arc::new(target);
++
++        let target_path = get_target_storage_path(&app_state.app_config.config.load(), target.name.as_str())
++            .expect("target storage path");
++        fs::create_dir_all(target_path.join("m3u")).expect("m3u dir");
++        let m3u_db = m3u_get_file_path_for_db(&target_path);
++        let mut playlist = BPlusTree::<u32, M3uPlaylistItem>::new();
++        playlist.insert(
++            1,
++            M3uPlaylistItem {
++                virtual_id: 1,
++                group: "XXX".intern(),
++                item_type: PlaylistItemType::Live,
++                epg_channel_id: Some("adult.one".intern()),
++                title: "Adult One".intern(),
++                name: "Adult One".intern(),
++                ..blank_m3u_item()
++            },
++        );
++        playlist.insert(
++            2,
++            M3uPlaylistItem {
++                virtual_id: 2,
++                group: "News".intern(),
++                item_type: PlaylistItemType::Live,
++                epg_channel_id: Some("news.one".intern()),
++                title: "News One".intern(),
++                name: "News One".intern(),
++                ..blank_m3u_item()
++            },
++        );
++        playlist.store(&m3u_db).expect("store m3u playlist");
++
++        let epg_path = dir.path().join("epg.db");
++        write_test_epg_channels(
++            &epg_path,
++            [
++                EpgChannel {
++                    id: "adult.one".intern(),
++                    title: Some("Adult One".intern()),
++                    icon: None,
++                    programmes: vec![EpgProgramme::new(100, 200, "adult.one".intern())],
++                },
++                EpgChannel {
++                    id: "news.one".intern(),
++                    title: Some("News One".intern()),
++                    icon: None,
++                    programmes: vec![EpgProgramme::new(100, 200, "news.one".intern())],
++                },
++            ],
++        );
++
++        let mut user = ProxyUserCredentials::default();
++        user.hide_adult = true;
++        let xml = response_body_text(serve_epg(&app_state, &epg_path, &user, &target, None).await).await;
++        assert!(!xml.contains(r#"id="adult.one""#), "adult channel must be filtered: {xml}");
++        assert!(!xml.contains(r#"channel="adult.one""#), "adult programmes must be filtered: {xml}");
++        assert!(xml.contains(r#"id="news.one""#), "non-adult channel must remain: {xml}");
++
++        user.hide_adult = false;
++        clear_adult_epg_id_cache_for_tests();
++        let xml_all = response_body_text(serve_epg(&app_state, &epg_path, &user, &target, None).await).await;
++        assert!(xml_all.contains(r#"id="adult.one""#), "adult channel visible when hide_adult=false: {xml_all}");
 +    }
 +
-+    #[test]
-+    fn proxy_user_credentials_default_hides_adult_false() {
-+        let value = serde_json::json!({
-+            "username": "alice",
-+            "password": "secret"
-+        });
 +
-+        let user: ProxyUserCredentialsDto = serde_json::from_value(value).expect("user should deserialize");
-+        assert!(!user.hide_adult);
-+    }
-+}
+     #[tokio::test]
+     async fn xmltv_output_uses_canonical_channel_ids_and_only_lowercases_display_names() {
+         let dir = tempdir().expect("temp dir");
+diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints/xtream_api.rs
+index 9c93b8dd..e87a89d5 100644
+--- a/backend/src/api/endpoints/xtream_api.rs
++++ b/backend/src/api/endpoints/xtream_api.rs
+@@ -310,7 +310,7 @@ async fn xtream_player_api_stream(
+     } else {
+         user.allows_item_type(pli.item_type)
+     };
+-    if !output_allowed {
++    if !output_allowed || !user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref()) {
+         if is_hls_manifest_request {
+             return hls_custom_video_manifest_response(
+                 app_state,
+@@ -1003,7 +1003,9 @@ async fn xtream_player_api_resource(
+         format!("Failed to read xtream item for stream id {req_virtual_id}")
+     );
+ 
+-    if !user.allows_item_type(pli.item_type) {
++    if !user.allows_item_type(pli.item_type)
++        || !user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref())
++    {
+         return axum::http::StatusCode::NOT_FOUND.into_response();
+     }
+ 
+@@ -1430,6 +1432,9 @@ async fn xtream_player_api_handle_content_action(
+                         if let Some(fltr) = filter {
+                             categories.retain(|c| fltr.contains(&c.category_id));
+                         }
++                        if user.hide_adult {
++                            categories.retain(|c| !ProxyUserCredentials::is_adult_group(&c.category_name));
++                        }
+                         return Some(axum::Json(categories).into_response());
+                     }
+                     Err(err) => error!("Failed to parse json file {}: {err}", file_path.display()),
+diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
+index 9055e082..36f817dd 100644
+--- a/backend/src/api/model/active_user_manager.rs
++++ b/backend/src/api/model/active_user_manager.rs
+@@ -4654,6 +4654,7 @@ mod tests {
+             status: None,
+             output_clusters: shared::model::ClusterFlags::all(),
+             ui_enabled: true,
++            hide_adult: false,
+             comment: None,
+             priority: 0,
+             soft_connections,
 diff --git a/backend/src/model/config/api_user.rs b/backend/src/model/config/api_user.rs
+index c9e89dfb..798a0d52 100644
 --- a/backend/src/model/config/api_user.rs
 +++ b/backend/src/model/config/api_user.rs
-@@ -107,6 +107,7 @@
+@@ -107,6 +107,7 @@ pub struct ProxyUserCredentials {
      pub status: Option<ProxyUserStatus>,
      pub output_clusters: ClusterFlags,
      pub ui_enabled: bool,
@@ -77,7 +387,7 @@ diff --git a/backend/src/model/config/api_user.rs b/backend/src/model/config/api
      pub comment: Option<String>,
      pub priority: i8,
      pub soft_connections: u16,
-@@ -132,6 +133,7 @@
+@@ -132,6 +133,7 @@ impl From<&ProxyUserCredentialsDto> for ProxyUserCredentials {
              status: dto.status,
              output_clusters: dto.output_clusters.unwrap_or_else(ClusterFlags::all),
              ui_enabled: dto.ui_enabled,
@@ -85,7 +395,7 @@ diff --git a/backend/src/model/config/api_user.rs b/backend/src/model/config/api
              comment: dto.comment.clone(),
              priority: dto.priority,
              soft_connections: dto.soft_connections,
-@@ -162,6 +164,7 @@
+@@ -162,6 +164,7 @@ impl From<&ProxyUserCredentials> for ProxyUserCredentialsDto {
              status: instance.status,
              output_clusters: if instance.output_clusters.is_all() { None } else { Some(instance.output_clusters) },
              ui_enabled: instance.ui_enabled,
@@ -93,7 +403,7 @@ diff --git a/backend/src/model/config/api_user.rs b/backend/src/model/config/api
              comment: instance.comment.clone(),
              priority: instance.priority,
              soft_connections: instance.soft_connections,
-@@ -237,6 +240,48 @@
+@@ -237,6 +240,48 @@ impl ProxyUserCredentials {
          self.output_clusters.has_cluster(item_type)
      }
  
@@ -142,7 +452,7 @@ diff --git a/backend/src/model/config/api_user.rs b/backend/src/model/config/api
      pub async fn connection_permission(&self, app_state: &AppState) -> UserConnectionPermission {
          let config = <Arc<ArcSwap<Config>> as Access<Config>>::load(&app_state.app_config.config);
          if (self.max_connections > 0 || self.soft_connections > 0) && config.user_access_control {
-@@ -296,3 +341,44 @@
+@@ -296,3 +341,44 @@ impl TargetUser {
              .map(|credentials| (Arc::clone(credentials), self.target.as_str()))
      }
  }
@@ -187,45 +497,11 @@ diff --git a/backend/src/model/config/api_user.rs b/backend/src/model/config/api
 +        assert!(!user.allows_playlist_item("XXX", Some(&clean)));
 +    }
 +}
-diff --git a/backend/src/repository/user_repository.rs b/backend/src/repository/user_repository.rs
---- a/backend/src/repository/user_repository.rs
-+++ b/backend/src/repository/user_repository.rs
-@@ -34,6 +34,7 @@
-     pub status: Option<ProxyUserStatus>,
-     pub output_clusters: ClusterFlags,
-     pub ui_enabled: bool,
-+    pub hide_adult: bool,
-     pub comment: Option<String>,
-     pub priority: Option<i8>,
-     pub soft_connections: Option<u16>,
-@@ -59,6 +60,7 @@
-             status: proxy.status,
-             output_clusters: proxy.output_clusters,
-             ui_enabled: proxy.ui_enabled,
-+            hide_adult: proxy.hide_adult,
-             comment: proxy.comment.clone(),
-             priority: if proxy.priority != 0 { Some(proxy.priority) } else { None },
-             soft_connections: if proxy.soft_connections > 0 { Some(proxy.soft_connections) } else { None },
-@@ -82,6 +84,7 @@
-             status: stored.status,
-             output_clusters: stored.output_clusters,
-             ui_enabled: stored.ui_enabled,
-+            hide_adult: stored.hide_adult,
-             comment: stored.comment.clone(),
-             priority: stored.priority.unwrap_or(0),
-             soft_connections: stored.soft_connections.unwrap_or(0),
-@@ -518,6 +521,7 @@
-             status: Some(status),
-             output_clusters: ClusterFlags::all(),
-             ui_enabled: true,
-+            hide_adult: false,
-             comment: None,
-             priority: 0,
-             soft_connections: 0,
 diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/repository/bplustree/migration.rs
+index 7391f0a2..5d3d938f 100644
 --- a/backend/src/repository/bplustree/migration.rs
 +++ b/backend/src/repository/bplustree/migration.rs
-@@ -474,16 +474,18 @@
+@@ -474,16 +474,18 @@ pub fn migrate_bplustree_databases_with_marker(
  fn marker_file_name() -> String { format!("{MARKER_FILE_GUARD_PREFIX}{STORAGE_VERSION}") }
  
  //
@@ -247,7 +523,7 @@ diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/reposit
  // `migrate_user_db_schema` detects this, converts every record in-place, and
  // writes a merge-guard marker so that config-driven user merges cannot
  // overwrite the freshly migrated data.
-@@ -757,6 +759,69 @@
+@@ -757,6 +759,69 @@ impl StoredApiUserV6 {
      fn from_v1(v1: &StoredApiUserV1) -> Self { Self::from_v5(&StoredApiUserV5::from_v1(v1)) }
  }
  
@@ -317,7 +593,7 @@ diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/reposit
  fn create_user_db_merge_guard(merge_guard_path: &Path) -> io::Result<()> {
      if !merge_guard_path.exists() {
          std::fs::write(merge_guard_path, b"")?;
-@@ -773,9 +838,9 @@
+@@ -773,9 +838,9 @@ fn migrate_legacy_user_schema<SourceV, Map>(
  ) -> io::Result<bool>
  where
      SourceV: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone,
@@ -329,7 +605,7 @@ diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/reposit
      {
          return Ok(false);
      }
-@@ -790,26 +855,26 @@
+@@ -790,26 +855,26 @@ fn migrate_current_user_schema<SourceV, Map>(
  ) -> io::Result<bool>
  where
      SourceV: for<'de> serde::Deserialize<'de>,
@@ -343,10 +619,9 @@ diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/reposit
 +    let mut v7_tree = BPlusTree::new();
      for (key, user) in &tree {
 -        v6_tree.insert(key.clone(), map(user));
--    }
--    v6_tree.store(db_path)?;
 +        v7_tree.insert(key.clone(), map(user));
-+    }
+     }
+-    v6_tree.store(db_path)?;
 +    v7_tree.store(db_path)?;
      create_user_db_merge_guard(merge_guard_path)?;
      Ok(true)
@@ -363,7 +638,7 @@ diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/reposit
  fn migrate_user_db_schema(db_path: &Path, merge_guard_path: &Path) -> io::Result<bool> {
      if !db_path.exists() {
          return Ok(false);
-@@ -818,31 +883,36 @@
+@@ -818,31 +883,36 @@ fn migrate_user_db_schema(db_path: &Path, merge_guard_path: &Path) -> io::Result
      let storage_version = super::v3::migration::storage_version(db_path)?
          .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "user database is not a B+Tree"))?;
      if storage_version <= 2 {
@@ -371,46 +646,42 @@ diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/reposit
 +        if super::v3::migration::migrate_v2_typed::<String, StoredApiUserV7>(db_path).is_ok() {
              return Ok(false);
          }
--        if migrate_legacy_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, |user| {
--            StoredApiUserV6::from_v5(&user)
 +        if migrate_legacy_user_schema::<StoredApiUserV6, _>(db_path, merge_guard_path, |user| {
 +            StoredApiUserV7::from_v6(&user)
-         })? {
-             return Ok(true);
-         }
--        if migrate_legacy_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, |user| {
--            StoredApiUserV6::from_v4(&user)
-+        if migrate_legacy_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, |user| {
++        })? {
++            return Ok(true);
++        }
+         if migrate_legacy_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, |user| {
+-            StoredApiUserV6::from_v5(&user)
 +            StoredApiUserV7::from_v5(&user)
          })? {
              return Ok(true);
          }
--        if migrate_legacy_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, |user| {
--            StoredApiUserV6::from_v3(&user)
-+        if migrate_legacy_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, |user| {
+         if migrate_legacy_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, |user| {
+-            StoredApiUserV6::from_v4(&user)
 +            StoredApiUserV7::from_v4(&user)
          })? {
              return Ok(true);
          }
--        if migrate_legacy_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, |user| {
--            StoredApiUserV6::from_v2(&user)
-+        if migrate_legacy_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, |user| {
+         if migrate_legacy_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, |user| {
+-            StoredApiUserV6::from_v3(&user)
 +            StoredApiUserV7::from_v3(&user)
          })? {
              return Ok(true);
          }
-+        if migrate_legacy_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, |user| {
+         if migrate_legacy_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, |user| {
+-            StoredApiUserV6::from_v2(&user)
 +            StoredApiUserV7::from_v2(&user)
-+        })? {
-+            return Ok(true);
-+        }
+         })? {
+             return Ok(true);
+         }
          if migrate_legacy_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, |user| {
 -            StoredApiUserV6::from_v1(&user)
 +            StoredApiUserV7::from_v1(&user)
          })? {
              return Ok(true);
          }
-@@ -858,22 +928,25 @@
+@@ -858,22 +928,25 @@ fn migrate_user_db_schema(db_path: &Path, merge_guard_path: &Path) -> io::Result
          ));
      }
  
@@ -420,32 +691,33 @@ diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/reposit
      }
 -    if migrate_current_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, StoredApiUserV6::from_v5)? {
 +    if migrate_current_user_schema::<StoredApiUserV6, _>(db_path, merge_guard_path, StoredApiUserV7::from_v6)? {
-         return Ok(true);
-     }
--    if migrate_current_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, StoredApiUserV6::from_v4)? {
++        return Ok(true);
++    }
 +    if migrate_current_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, StoredApiUserV7::from_v5)? {
          return Ok(true);
      }
--    if migrate_current_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, StoredApiUserV6::from_v3)? {
+-    if migrate_current_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, StoredApiUserV6::from_v4)? {
 +    if migrate_current_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, StoredApiUserV7::from_v4)? {
          return Ok(true);
      }
--    if migrate_current_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, StoredApiUserV6::from_v2)? {
+-    if migrate_current_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, StoredApiUserV6::from_v3)? {
 +    if migrate_current_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, StoredApiUserV7::from_v3)? {
          return Ok(true);
      }
--    if migrate_current_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, StoredApiUserV6::from_v1)? {
+-    if migrate_current_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, StoredApiUserV6::from_v2)? {
 +    if migrate_current_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, StoredApiUserV7::from_v2)? {
-+        return Ok(true);
-+    }
+         return Ok(true);
+     }
+-    if migrate_current_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, StoredApiUserV6::from_v1)? {
 +    if migrate_current_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, StoredApiUserV7::from_v1)? {
          return Ok(true);
      }
  
 diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
+index 6a5d7eb5..89cef580 100644
 --- a/backend/src/repository/m3u_playlist_iterator.rs
 +++ b/backend/src/repository/m3u_playlist_iterator.rs
-@@ -267,6 +267,7 @@
+@@ -267,6 +267,7 @@ impl M3uPlaylistIterator {
          let target_id = target.id;
          let proxy_type = user.proxy;
          let output_clusters = user.output_clusters;
@@ -453,26 +725,82 @@ diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repos
          let target_options = target.options.clone();
          let input_by_name: HashMap<Arc<str>, Arc<crate::model::ConfigInput>> = cfg
              .sources
-@@ -309,6 +310,15 @@
-                 };
+@@ -312,6 +313,15 @@ impl M3uPlaylistIterator {
+                     continue;
+                 }
  
-                 if !output_clusters.has_cluster(item.item_type) {
-+                    continue;
-+                }
-+
 +                if hide_adult
 +                    && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
 +                        || crate::model::ProxyUserCredentials::stream_props_marked_adult(
 +                            item.additional_properties.as_ref(),
 +                        ))
 +                {
-                     continue;
-                 }
++                    continue;
++                }
++
+                 if let Some(set) = &filter {
+                     if !set.contains(item.group.as_ref()) {
+                         continue;
+diff --git a/backend/src/repository/mod.rs b/backend/src/repository/mod.rs
+index c903b1dc..c1e68f48 100644
+--- a/backend/src/repository/mod.rs
++++ b/backend/src/repository/mod.rs
+@@ -1,5 +1,6 @@
+ mod storage;
+ mod target_id_mapping;
++mod adult_epg_ids;
+ mod bplustree;
+ mod playlist_repository;
+ mod m3u_repository;
+@@ -23,6 +24,7 @@ pub mod stalker_generation_repository;
  
+ pub use storage::*;
+ pub use target_id_mapping::*;
++pub use adult_epg_ids::*;
+ pub use bplustree::*;
+ pub use playlist_repository::*;
+ pub use m3u_repository::*;
+diff --git a/backend/src/repository/user_repository.rs b/backend/src/repository/user_repository.rs
+index 9ecf3b59..85409bb3 100644
+--- a/backend/src/repository/user_repository.rs
++++ b/backend/src/repository/user_repository.rs
+@@ -34,6 +34,7 @@ struct StoredProxyUserCredentials {
+     pub status: Option<ProxyUserStatus>,
+     pub output_clusters: ClusterFlags,
+     pub ui_enabled: bool,
++    pub hide_adult: bool,
+     pub comment: Option<String>,
+     pub priority: Option<i8>,
+     pub soft_connections: Option<u16>,
+@@ -59,6 +60,7 @@ impl StoredProxyUserCredentials {
+             status: proxy.status,
+             output_clusters: proxy.output_clusters,
+             ui_enabled: proxy.ui_enabled,
++            hide_adult: proxy.hide_adult,
+             comment: proxy.comment.clone(),
+             priority: if proxy.priority != 0 { Some(proxy.priority) } else { None },
+             soft_connections: if proxy.soft_connections > 0 { Some(proxy.soft_connections) } else { None },
+@@ -82,6 +84,7 @@ impl StoredProxyUserCredentials {
+             status: stored.status,
+             output_clusters: stored.output_clusters,
+             ui_enabled: stored.ui_enabled,
++            hide_adult: stored.hide_adult,
+             comment: stored.comment.clone(),
+             priority: stored.priority.unwrap_or(0),
+             soft_connections: stored.soft_connections.unwrap_or(0),
+@@ -518,6 +521,7 @@ mod tests {
+             status: Some(status),
+             output_clusters: ClusterFlags::all(),
+             ui_enabled: true,
++            hide_adult: false,
+             comment: None,
+             priority: 0,
+             soft_connections: 0,
 diff --git a/backend/src/repository/xtream_playlist_iterator.rs b/backend/src/repository/xtream_playlist_iterator.rs
+index 7e68b6e6..c5f61f13 100644
 --- a/backend/src/repository/xtream_playlist_iterator.rs
 +++ b/backend/src/repository/xtream_playlist_iterator.rs
-@@ -70,6 +70,7 @@
+@@ -70,6 +70,7 @@ impl XtreamPlaylistIterator {
                      })
                      .collect()
              });
@@ -480,7 +808,7 @@ diff --git a/backend/src/repository/xtream_playlist_iterator.rs b/backend/src/re
  
              let xtream_path = xtream_path.clone();
              let index_path = get_file_path_for_db_index(&xtream_path);
-@@ -105,7 +106,7 @@
+@@ -105,7 +106,7 @@ impl XtreamPlaylistIterator {
                          }
                      };
  
@@ -489,7 +817,7 @@ diff --git a/backend/src/repository/xtream_playlist_iterator.rs b/backend/src/re
                          continue;
                      }
  
-@@ -141,7 +142,12 @@
+@@ -141,7 +142,12 @@ impl XtreamPlaylistIterator {
          }
      }
  
@@ -503,20 +831,171 @@ diff --git a/backend/src/repository/xtream_playlist_iterator.rs b/backend/src/re
          // We can't serve episodes within series
          if cluster == XtreamCluster::Series
              && !matches!(item.item_type, PlaylistItemType::SeriesInfo | PlaylistItemType::LocalSeriesInfo)
-@@ -154,6 +160,13 @@
-             if !set.contains(&item.category_id) {
-                 return false;
+@@ -156,6 +162,13 @@ impl XtreamPlaylistIterator {
              }
-+        }
-+
+         }
+ 
 +        if hide_adult
 +            && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
 +                || crate::model::ProxyUserCredentials::stream_props_marked_adult(item.additional_properties.as_ref()))
 +        {
 +            return false;
-         }
- 
++        }
++
          true
+     }
+ }
+diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
+index 015aef61..62e8251b 100644
+--- a/frontend/public/assets/i18n/ar.json
++++ b/frontend/public/assets/i18n/ar.json
+@@ -672,6 +672,7 @@
+       "STATUS": "الحالة النشطة أو المعطلة لبيانات اعتماد وكيل المستخدم.",
+       "TOKEN": "رمز API فريد يمكن استخدامه بدلاً من اسم المستخدم/كلمة المرور.",
+       "UI_ENABLED": "إذا كان صحيحًا، يمكن لهذا المستخدم تسجيل الدخول إلى محرر باقة WebUI المبسط (الافتراضي صحيح).",
++      "HIDE_ADULT": "عند التفعيل، تُخفى فئات وقنوات Adult / 18+ / XXX من قوائم وبث هذا المستخدم.",
+       "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
+     },
+     "RATE_LIMIT_CONFIG": {
+@@ -1549,6 +1550,7 @@
+     "USER_STATUS_TRIAL": "تجريبي",
+     "USER_UI": "واجهة المستخدم",
+     "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
++    "HIDE_ADULT": "إخفاء Adult",
+     "COMBINE_VIEWS_STATS_STREAMS": "دمج الإحصائيات والبث",
+     "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
+     "USE_OUTPUT": "استخدام المخرج",
+diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
+index 78abbefe..b8adc317 100644
+--- a/frontend/public/assets/i18n/en.json
++++ b/frontend/public/assets/i18n/en.json
+@@ -676,6 +676,7 @@
+       "STATUS": "The active or disabled state of the user proxy credential.",
+       "TOKEN": "Unique API token that can be used instead of username/password.",
+       "UI_ENABLED": "If true, this user can log into the simplified WebUI bouquet editor (default true).",
++      "HIDE_ADULT": "When enabled, Adult / 18+ / XXX categories and channels are hidden from this user's playlists and streams.",
+       "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
+     },
+     "RATE_LIMIT_CONFIG": {
+@@ -1556,6 +1557,7 @@
+     "USER_STATUS_TRIAL": "Trial",
+     "USER_UI": "User UI",
+     "USER_UI_ENABLED": "User-UI Enabled",
++    "HIDE_ADULT": "Hide Adult",
+     "COMBINE_VIEWS_STATS_STREAMS": "Combine Stats & Streams",
+     "USE_MEMORY_CACHE": "Mem-Cache",
+     "USE_OUTPUT": "Use output",
+diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
+index 26e3b72a..2e95fb76 100644
+--- a/frontend/public/assets/i18n/ru.json
++++ b/frontend/public/assets/i18n/ru.json
+@@ -633,6 +633,7 @@
+       "STATUS": "Активное или отключенное состояние учетных данных прокси пользователя.",
+       "TOKEN": "Уникальный токен API, который можно использовать вместо имени пользователя/пароля.",
+       "UI_ENABLED": "Если true, этот пользователь может войти в упрощенный редактор букетов WebUI (по умолчанию true).",
++      "HIDE_ADULT": "Если включено, категории и каналы Adult / 18+ / XXX скрываются из плейлистов и потоков этого пользователя.",
+       "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
+     },
+     "RATE_LIMIT_CONFIG": {
+@@ -1444,6 +1445,7 @@
+     "USER_STATUS_TRIAL": "Пробный",
+     "USER_UI": "Пользовательский UI",
+     "USER_UI_ENABLED": "User-UI включен",
++    "HIDE_ADULT": "Скрыть Adult",
+     "COMBINE_VIEWS_STATS_STREAMS": "Объединить статистику и потоки",
+     "USE_MEMORY_CACHE": "Mem-кэш",
+     "USE_OUTPUT": "Использовать вывод",
+diff --git a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
+index da335508..d2034efa 100644
+--- a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
++++ b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
+@@ -112,6 +112,7 @@ generate_form_reducer!(
+         SoftPriority => soft_priority: i8,
+         ExpDate => exp_date: Option<i64>,
+         UiEnabled => ui_enabled: bool,
++        HideAdult => hide_adult: bool,
+         EpgTimeshift => epg_timeshift: Option<String>,
+         EpgRequestTimeshift => epg_request_timeshift: Option<String>,
+         Comment => comment: Option<String>,
+@@ -208,6 +209,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
+                 user.status = Some(ProxyUserStatus::Active);
+                 user.output_clusters = None;
+                 user.ui_enabled = true;
++                user.hide_adult = false;
+                 let now = Utc::now();
+                 user.created_at = Some(now.timestamp());
+                 let in_one_year = now + Duration::days(DEFAULT_EXPIRATION_DAYS);
+@@ -394,6 +396,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
+             { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_TIMESHIFT"), epg_timeshift, UserFormAction::EpgTimeshift) }
+             { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_REQUEST_TIMESHIFT"), epg_request_timeshift, UserFormAction::EpgRequestTimeshift) }
+             { edit_field_bool!(form_state,  translate.t("LABEL.USER_UI_ENABLED"), ui_enabled, UserFormAction::UiEnabled) }
++            { edit_field_bool!(form_state,  translate.t("LABEL.HIDE_ADULT"), hide_adult, UserFormAction::HideAdult) }
+             { edit_field_text_option!(form_state,  translate.t("LABEL.COMMENT"), comment, UserFormAction::Comment) }
+             {edit_field_list_option!(allowed_countries, translate.t("LABEL.ALLOWED_COUNTRIES"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_COUNTRIES", translate.t("LABEL.ADD_COUNTRY"), create_country_tag)}
+             {edit_field_list_option!(allowed_networks, translate.t("LABEL.ALLOWED_NETWORKS"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_NETWORKS", translate.t("LABEL.ADD_NETWORK"), create_network_tag)}
+diff --git a/shared/src/model/config/api_user.rs b/shared/src/model/config/api_user.rs
+index ec50b019..613e96a0 100644
+--- a/shared/src/model/config/api_user.rs
++++ b/shared/src/model/config/api_user.rs
+@@ -1,5 +1,7 @@
+ use crate::{
+-    defaults::{default_as_true, default_user_priority, is_cluster_optional, is_default_user_priority, is_true},
++    defaults::{
++        default_as_true, default_user_priority, is_cluster_optional, is_default_user_priority, is_false, is_true,
++    },
+     error::TuliproxError,
+     model::{ClusterFlags, NetworkAccessDto, ProxyType, ProxyUserStatus, XtreamCluster},
+     utils::{deserialize_timestamp, is_blank_optional_string},
+@@ -39,6 +41,9 @@ pub struct ProxyUserCredentialsDto {
+     pub output_clusters: Option<ClusterFlags>,
+     #[serde(default = "default_as_true", skip_serializing_if = "is_true")]
+     pub ui_enabled: bool,
++    /// When true, Adult / 18+ / XXX categories and channels are omitted from playlists.
++    #[serde(default, skip_serializing_if = "is_false")]
++    pub hide_adult: bool,
+     #[serde(default, skip_serializing_if = "is_blank_optional_string")]
+     pub comment: Option<String>,
+     #[serde(default = "default_user_priority", skip_serializing_if = "is_default_user_priority")]
+@@ -130,6 +135,7 @@ impl Default for ProxyUserCredentialsDto {
+             status: None,
+             output_clusters: None,
+             ui_enabled: default_as_true(),
++            hide_adult: false,
+             comment: None,
+             priority: default_user_priority(),
+             soft_connections: 0,
+@@ -269,4 +275,31 @@ mod tests {
+                 .is_some_and(|networks| networks.iter().any(|n| n == "192.168.1.0/24")));
+         }
+     }
++
++    #[test]
++    fn proxy_user_credentials_roundtrip_preserves_hide_adult() {
++        let user = ProxyUserCredentialsDto {
++            username: "alice".to_string(),
++            password: "secret".to_string(),
++            hide_adult: true,
++            ..ProxyUserCredentialsDto::default()
++        };
++
++        let serialized = serde_json::to_value(&user).expect("user should serialize");
++        let deserialized: ProxyUserCredentialsDto =
++            serde_json::from_value(serialized).expect("user should deserialize");
++
++        assert!(deserialized.hide_adult);
++    }
++
++    #[test]
++    fn proxy_user_credentials_default_hides_adult_false() {
++        let value = serde_json::json!({
++            "username": "alice",
++            "password": "secret"
++        });
++
++        let user: ProxyUserCredentialsDto = serde_json::from_value(value).expect("user should deserialize");
++        assert!(!user.hide_adult);
++    }
+ }
 diff --git a/backend/src/repository/adult_epg_ids.rs b/backend/src/repository/adult_epg_ids.rs
 new file mode 100644
 --- /dev/null
@@ -883,473 +1362,3 @@ new file mode 100644
 +        assert!(!epg_channel_hidden_by_adult_blocklist(&HashSet::new(), &"mix.case".intern()));
 +    }
 +}
-diff --git a/backend/src/repository/mod.rs b/backend/src/repository/mod.rs
---- a/backend/src/repository/mod.rs
-+++ b/backend/src/repository/mod.rs
-@@ -1,5 +1,6 @@
- mod storage;
- mod target_id_mapping;
-+mod adult_epg_ids;
- mod bplustree;
- mod playlist_repository;
- mod m3u_repository;
-@@ -23,6 +24,7 @@
- 
- pub use storage::*;
- pub use target_id_mapping::*;
-+pub use adult_epg_ids::*;
- pub use bplustree::*;
- pub use playlist_repository::*;
- pub use m3u_repository::*;
-diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
---- a/backend/src/api/endpoints/m3u_api.rs
-+++ b/backend/src/api/endpoints/m3u_api.rs
-@@ -578,8 +578,8 @@
-     Ok((catchup_item, resolved.discriminator))
- }
- 
--fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, item_type: PlaylistItemType) -> bool {
--    user.allows_item_type(item_type)
-+fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, pli: &shared::model::M3uPlaylistItem) -> bool {
-+    user.allows_item_type(pli.item_type) && user.allows_group(pli.group.as_ref())
- }
- 
- #[allow(clippy::too_many_lines)]
-@@ -816,7 +816,7 @@
-             return axum::http::StatusCode::BAD_REQUEST.into_response();
-         }
-     };
--    if !resolved_m3u_item_is_allowed(user.as_ref(), resolved_pli.item_type) {
-+    if !resolved_m3u_item_is_allowed(user.as_ref(), &resolved_pli) {
-         return axum::http::StatusCode::FORBIDDEN.into_response();
-     }
- 
-@@ -1095,10 +1095,74 @@
- 
-     #[test]
-     fn resolved_catchup_item_requires_rechecked_permissions() {
-+        use shared::utils::Internable;
-+
-         let mut user = ProxyUserCredentials::default();
-         user.output_clusters = ClusterFlags::Live;
- 
--        assert!(!resolved_m3u_item_is_allowed(&user, PlaylistItemType::Catchup));
-+        let item = shared::model::M3uPlaylistItem {
-+            virtual_id: 1,
-+            provider_id: "1".intern(),
-+            input_stream_id: "1".intern(),
-+            name: "ch".intern(),
-+            chno: 0,
-+            logo: "".intern(),
-+            logo_small: "".intern(),
-+            group: "News".intern(),
-+            title: "ch".intern(),
-+            parent_code: "".intern(),
-+            audio_track: "".intern(),
-+            time_shift: "".intern(),
-+            rec: "".intern(),
-+            url: "http://example/live".intern(),
-+            epg_channel_id: None,
-+            input_name: "in".intern(),
-+            item_type: PlaylistItemType::Catchup,
-+            t_stream_url: "".intern(),
-+            t_resource_url: None,
-+            t_catchup_source: None,
-+            t_catchup_mode: None,
-+            source_ordinal: 0,
-+            additional_properties: None,
-+            upstream_user_agent: None,
-+        };
-+        assert!(!resolved_m3u_item_is_allowed(&user, &item));
-+    }
-+
-+    #[test]
-+    fn hide_adult_blocks_adult_group_even_when_cluster_allowed() {
-+        use shared::utils::Internable;
-+
-+        let mut user = ProxyUserCredentials::default();
-+        user.hide_adult = true;
-+
-+        let item = shared::model::M3uPlaylistItem {
-+            virtual_id: 1,
-+            provider_id: "1".intern(),
-+            input_stream_id: "1".intern(),
-+            name: "xxx".intern(),
-+            chno: 0,
-+            logo: "".intern(),
-+            logo_small: "".intern(),
-+            group: "18+ (Adult)".intern(),
-+            title: "xxx".intern(),
-+            parent_code: "".intern(),
-+            audio_track: "".intern(),
-+            time_shift: "".intern(),
-+            rec: "".intern(),
-+            url: "http://example/live".intern(),
-+            epg_channel_id: None,
-+            input_name: "in".intern(),
-+            item_type: PlaylistItemType::LiveHls,
-+            t_stream_url: "".intern(),
-+            t_resource_url: None,
-+            t_catchup_source: None,
-+            t_catchup_mode: None,
-+            source_ordinal: 0,
-+            additional_properties: None,
-+            upstream_user_agent: None,
-+        };
-+        assert!(!resolved_m3u_item_is_allowed(&user, &item));
-     }
- 
-     #[test]
-diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints/xtream_api.rs
---- a/backend/src/api/endpoints/xtream_api.rs
-+++ b/backend/src/api/endpoints/xtream_api.rs
-@@ -310,7 +310,7 @@
-     } else {
-         user.allows_item_type(pli.item_type)
-     };
--    if !output_allowed {
-+    if !output_allowed || !user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref()) {
-         if is_hls_manifest_request {
-             return hls_custom_video_manifest_response(
-                 app_state,
-@@ -1003,7 +1003,9 @@
-         format!("Failed to read xtream item for stream id {req_virtual_id}")
-     );
- 
--    if !user.allows_item_type(pli.item_type) {
-+    if !user.allows_item_type(pli.item_type)
-+        || !user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref())
-+    {
-         return axum::http::StatusCode::NOT_FOUND.into_response();
-     }
- 
-@@ -1429,6 +1431,9 @@
-                     Ok(mut categories) => {
-                         if let Some(fltr) = filter {
-                             categories.retain(|c| fltr.contains(&c.category_id));
-+                        }
-+                        if user.hide_adult {
-+                            categories.retain(|c| !ProxyUserCredentials::is_adult_group(&c.category_name));
-                         }
-                         return Some(axum::Json(categories).into_response());
-                     }
-diff --git a/backend/src/api/endpoints/hdhomerun_api.rs b/backend/src/api/endpoints/hdhomerun_api.rs
---- a/backend/src/api/endpoints/hdhomerun_api.rs
-+++ b/backend/src/api/endpoints/hdhomerun_api.rs
-@@ -275,7 +275,8 @@
-                             let cred = Arc::clone(&cred);
-                             async move {
-                                 let item = res.ok()?;
--                                cred.allows_item_type(item.item_type).then_some(item)
-+                                (cred.allows_item_type(item.item_type) && cred.allows_group(item.group.as_ref()))
-+                                    .then_some(item)
-                             }
-                         })
-                         .count()
-diff --git a/backend/src/api/endpoints/xmltv_api.rs b/backend/src/api/endpoints/xmltv_api.rs
---- a/backend/src/api/endpoints/xmltv_api.rs
-+++ b/backend/src/api/endpoints/xmltv_api.rs
-@@ -11,9 +11,10 @@
-     auth::Fingerprint,
-     model::{Config, ConfigTarget, ProxyUserCredentials, EPG_ATTRIB_ID, EPG_TAG_CHANNEL},
-     repository::{
--        epg_query_channels_by_storage_key, get_target_storage_path, m3u_get_epg_file_path_for_target,
--        storage_const, xtream_get_epg_file_path_for_target, xtream_get_storage_path, BPlusTreeQuery,
--        LockedReceiverStream, XML_PREAMBLE,
-+        adult_epg_id_blocklist, epg_channel_hidden_by_adult_blocklist, epg_query_channels_by_storage_key,
-+        get_target_storage_path, m3u_get_epg_file_path_for_target, storage_const,
-+        xtream_get_epg_file_path_for_target, xtream_get_storage_path, BPlusTreeQuery, LockedReceiverStream,
-+        XML_PREAMBLE,
-     },
-     utils,
-     utils::{
-@@ -34,7 +35,7 @@
-     },
-     utils::{concat_path, concat_path_leading_slash, obfuscate_text, Internable},
- };
--use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc};
-+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::Arc};
- use tokio::{io::{AsyncWrite, AsyncWriteExt}, sync::mpsc, task};
- use tokio_stream::StreamExt;
- use tokio_util::io::ReaderStream;
-@@ -242,6 +243,19 @@
-         .as_ref()
-         .is_some_and(ConfigTargetOptions::lowercase_xmltv_display_names);
- 
-+    // Cheap Hide Adult filter: shared cached blocklist of adult live tvg-ids only.
-+    // Empty / None => no per-channel check (zero overhead for hide_adult=false).
-+    let adult_epg_ids: Option<Arc<HashSet<Arc<str>>>> = if user.hide_adult {
-+        let ids = adult_epg_id_blocklist(app_state, target).await;
-+        if ids.is_empty() {
-+            None
-+        } else {
-+            Some(ids)
-+        }
-+    } else {
-+        None
-+    };
-+
-     let server_info = app_state.app_config.get_user_server_info(user);
-     let base_url =
-         if !matches!(epg_processing_options.time_shift, EpgTimeShift::None) || epg_processing_options.rewrite_urls {
-@@ -268,6 +282,7 @@
- 
-     let epg_path_for_log = epg_path.clone();
-     let join_error_tx = channel_tx.clone();
-+    let adult_epg_ids_for_scan = adult_epg_ids.clone();
-     let spawn_handle = task::spawn_blocking(move || {
-         let _guard = bg_lock;
-         let mut query = match BPlusTreeQuery::<Arc<str>, EpgChannel>::try_new(&epg_path) {
-@@ -290,6 +305,11 @@
-                     break;
-                 }
-             };
-+            if let Some(blocked) = adult_epg_ids_for_scan.as_ref() {
-+                if epg_channel_hidden_by_adult_blocklist(blocked, &channel.id) {
-+                    continue;
-+                }
-+            }
-             if channel_tx.blocking_send(Ok(channel)).is_err() {
-                 break;
-             }
-@@ -932,8 +952,8 @@
-     use shared::{
-         foundation::Filter,
-         model::{
--            ConfigTargetOptions, EpgCategory, EpgChannel, EpgOutputOptions, EpgProgramme, ProcessingOrder,
--            StreamEpgItemRequest, StreamEpgRequest, TargetType,
-+            ConfigTargetOptions, EpgCategory, EpgChannel, EpgOutputOptions, EpgProgramme, M3uPlaylistItem,
-+            PlaylistItemType, ProcessingOrder, StreamEpgItemRequest, StreamEpgRequest, TargetType,
-         },
-         utils::{concat_path, obfuscate_text, Internable},
-     };
-@@ -1468,6 +1488,115 @@
- 
-         assert_eq!(xml, "<display-name>café network &amp; &lt;hd&gt;</display-name>");
-     }
-+
-+    fn blank_m3u_item() -> M3uPlaylistItem {
-+        M3uPlaylistItem {
-+            virtual_id: 0,
-+            provider_id: "".intern(),
-+            input_stream_id: "".intern(),
-+            name: "".intern(),
-+            chno: 0,
-+            logo: "".intern(),
-+            logo_small: "".intern(),
-+            group: "".intern(),
-+            title: "".intern(),
-+            parent_code: "".intern(),
-+            audio_track: "".intern(),
-+            time_shift: "".intern(),
-+            rec: "".intern(),
-+            url: "".intern(),
-+            epg_channel_id: None,
-+            input_name: "".intern(),
-+            item_type: PlaylistItemType::Live,
-+            t_stream_url: "".intern(),
-+            t_resource_url: None,
-+            t_catchup_source: None,
-+            t_catchup_mode: None,
-+            source_ordinal: 0,
-+            additional_properties: None,
-+            upstream_user_agent: None,
-+        }
-+    }
-+
-+    #[tokio::test]
-+    async fn hide_adult_skips_adult_channels_in_xmltv_output() {
-+        use crate::repository::{
-+            clear_adult_epg_id_cache_for_tests, get_target_storage_path, m3u_get_file_path_for_db, BPlusTree,
-+        };
-+
-+        clear_adult_epg_id_cache_for_tests();
-+        let dir = tempdir().expect("temp dir");
-+        let storage_dir = dir.path().to_string_lossy().to_string();
-+        let app_state = create_test_app_state(test_config_with_storage(&storage_dir));
-+
-+        let mut target = test_target_with_xtream_and_m3u();
-+        target.name = "hide-adult-epg".to_string();
-+        target.id = 42;
-+        let target = Arc::new(target);
-+
-+        let target_path = get_target_storage_path(&app_state.app_config.config.load(), target.name.as_str())
-+            .expect("target storage path");
-+        fs::create_dir_all(target_path.join("m3u")).expect("m3u dir");
-+        let m3u_db = m3u_get_file_path_for_db(&target_path);
-+        let mut playlist = BPlusTree::<u32, M3uPlaylistItem>::new();
-+        playlist.insert(
-+            1,
-+            M3uPlaylistItem {
-+                virtual_id: 1,
-+                group: "XXX".intern(),
-+                item_type: PlaylistItemType::Live,
-+                epg_channel_id: Some("adult.one".intern()),
-+                title: "Adult One".intern(),
-+                name: "Adult One".intern(),
-+                ..blank_m3u_item()
-+            },
-+        );
-+        playlist.insert(
-+            2,
-+            M3uPlaylistItem {
-+                virtual_id: 2,
-+                group: "News".intern(),
-+                item_type: PlaylistItemType::Live,
-+                epg_channel_id: Some("news.one".intern()),
-+                title: "News One".intern(),
-+                name: "News One".intern(),
-+                ..blank_m3u_item()
-+            },
-+        );
-+        playlist.store(&m3u_db).expect("store m3u playlist");
-+
-+        let epg_path = dir.path().join("epg.db");
-+        write_test_epg_channels(
-+            &epg_path,
-+            [
-+                EpgChannel {
-+                    id: "adult.one".intern(),
-+                    title: Some("Adult One".intern()),
-+                    icon: None,
-+                    programmes: vec![EpgProgramme::new(100, 200, "adult.one".intern())],
-+                },
-+                EpgChannel {
-+                    id: "news.one".intern(),
-+                    title: Some("News One".intern()),
-+                    icon: None,
-+                    programmes: vec![EpgProgramme::new(100, 200, "news.one".intern())],
-+                },
-+            ],
-+        );
-+
-+        let mut user = ProxyUserCredentials::default();
-+        user.hide_adult = true;
-+        let xml = response_body_text(serve_epg(&app_state, &epg_path, &user, &target, None).await).await;
-+        assert!(!xml.contains(r#"id="adult.one""#), "adult channel must be filtered: {xml}");
-+        assert!(!xml.contains(r#"channel="adult.one""#), "adult programmes must be filtered: {xml}");
-+        assert!(xml.contains(r#"id="news.one""#), "non-adult channel must remain: {xml}");
-+
-+        user.hide_adult = false;
-+        clear_adult_epg_id_cache_for_tests();
-+        let xml_all = response_body_text(serve_epg(&app_state, &epg_path, &user, &target, None).await).await;
-+        assert!(xml_all.contains(r#"id="adult.one""#), "adult channel visible when hide_adult=false: {xml_all}");
-+    }
-+
- 
-     #[tokio::test]
-     async fn xmltv_output_uses_canonical_channel_ids_and_only_lowercases_display_names() {
-diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
---- a/backend/src/api/api_utils.rs
-+++ b/backend/src/api/api_utils.rs
-@@ -4553,6 +4553,7 @@
-         status: None,
-         output_clusters: shared::model::ClusterFlags::all(),
-         ui_enabled: false,
-+        hide_adult: false,
-         comment: None,
-         priority: 0,
-         soft_connections: 0,
-@@ -9743,6 +9744,7 @@
-             status: None,
-             output_clusters: ClusterFlags::all(),
-             ui_enabled: true,
-+            hide_adult: false,
-             comment: None,
-             priority: 0,
-             soft_connections: 0,
-diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
---- a/backend/src/api/model/active_user_manager.rs
-+++ b/backend/src/api/model/active_user_manager.rs
-@@ -4666,6 +4666,7 @@
-             status: None,
-             output_clusters: shared::model::ClusterFlags::all(),
-             ui_enabled: true,
-+            hide_adult: false,
-             comment: None,
-             priority: 0,
-             soft_connections,
-diff --git a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
---- a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-+++ b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-@@ -112,6 +112,7 @@
-         SoftPriority => soft_priority: i8,
-         ExpDate => exp_date: Option<i64>,
-         UiEnabled => ui_enabled: bool,
-+        HideAdult => hide_adult: bool,
-         EpgTimeshift => epg_timeshift: Option<String>,
-         EpgRequestTimeshift => epg_request_timeshift: Option<String>,
-         Comment => comment: Option<String>,
-@@ -208,6 +209,7 @@
-                 user.status = Some(ProxyUserStatus::Active);
-                 user.output_clusters = None;
-                 user.ui_enabled = true;
-+                user.hide_adult = false;
-                 let now = Utc::now();
-                 user.created_at = Some(now.timestamp());
-                 let in_one_year = now + Duration::days(DEFAULT_EXPIRATION_DAYS);
-@@ -394,6 +396,7 @@
-             { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_TIMESHIFT"), epg_timeshift, UserFormAction::EpgTimeshift) }
-             { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_REQUEST_TIMESHIFT"), epg_request_timeshift, UserFormAction::EpgRequestTimeshift) }
-             { edit_field_bool!(form_state,  translate.t("LABEL.USER_UI_ENABLED"), ui_enabled, UserFormAction::UiEnabled) }
-+            { edit_field_bool!(form_state,  translate.t("LABEL.HIDE_ADULT"), hide_adult, UserFormAction::HideAdult) }
-             { edit_field_text_option!(form_state,  translate.t("LABEL.COMMENT"), comment, UserFormAction::Comment) }
-             {edit_field_list_option!(allowed_countries, translate.t("LABEL.ALLOWED_COUNTRIES"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_COUNTRIES", translate.t("LABEL.ADD_COUNTRY"), create_country_tag)}
-             {edit_field_list_option!(allowed_networks, translate.t("LABEL.ALLOWED_NETWORKS"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_NETWORKS", translate.t("LABEL.ADD_NETWORK"), create_network_tag)}
-diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
---- a/frontend/public/assets/i18n/en.json
-+++ b/frontend/public/assets/i18n/en.json
-@@ -676,6 +676,7 @@
-       "STATUS": "The active or disabled state of the user proxy credential.",
-       "TOKEN": "Unique API token that can be used instead of username/password.",
-       "UI_ENABLED": "If true, this user can log into the simplified WebUI bouquet editor (default true).",
-+      "HIDE_ADULT": "When enabled, Adult / 18+ / XXX categories and channels are hidden from this user's playlists and streams.",
-       "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
-     },
-     "RATE_LIMIT_CONFIG": {
-@@ -1556,6 +1557,7 @@
-     "USER_STATUS_TRIAL": "Trial",
-     "USER_UI": "User UI",
-     "USER_UI_ENABLED": "User-UI Enabled",
-+    "HIDE_ADULT": "Hide Adult",
-     "COMBINE_VIEWS_STATS_STREAMS": "Combine Stats & Streams",
-     "USE_MEMORY_CACHE": "Mem-Cache",
-     "USE_OUTPUT": "Use output",
-diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
---- a/frontend/public/assets/i18n/ru.json
-+++ b/frontend/public/assets/i18n/ru.json
-@@ -633,6 +633,7 @@
-       "STATUS": "Активное или отключенное состояние учетных данных прокси пользователя.",
-       "TOKEN": "Уникальный токен API, который можно использовать вместо имени пользователя/пароля.",
-       "UI_ENABLED": "Если true, этот пользователь может войти в упрощенный редактор букетов WebUI (по умолчанию true).",
-+      "HIDE_ADULT": "Если включено, категории и каналы Adult / 18+ / XXX скрываются из плейлистов и потоков этого пользователя.",
-       "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
-     },
-     "RATE_LIMIT_CONFIG": {
-@@ -1444,6 +1445,7 @@
-     "USER_STATUS_TRIAL": "Пробный",
-     "USER_UI": "Пользовательский UI",
-     "USER_UI_ENABLED": "User-UI включен",
-+    "HIDE_ADULT": "Скрыть Adult",
-     "COMBINE_VIEWS_STATS_STREAMS": "Объединить статистику и потоки",
-     "USE_MEMORY_CACHE": "Mem-кэш",
-     "USE_OUTPUT": "Использовать вывод",
-diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
---- a/frontend/public/assets/i18n/ar.json
-+++ b/frontend/public/assets/i18n/ar.json
-@@ -672,6 +672,7 @@
-       "STATUS": "الحالة النشطة أو المعطلة لبيانات اعتماد وكيل المستخدم.",
-       "TOKEN": "رمز API فريد يمكن استخدامه بدلاً من اسم المستخدم/كلمة المرور.",
-       "UI_ENABLED": "إذا كان صحيحًا، يمكن لهذا المستخدم تسجيل الدخول إلى محرر باقة WebUI المبسط (الافتراضي صحيح).",
-+      "HIDE_ADULT": "عند التفعيل، تُخفى فئات وقنوات Adult / 18+ / XXX من قوائم وبث هذا المستخدم.",
-       "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
-     },
-     "RATE_LIMIT_CONFIG": {
-@@ -1549,6 +1550,7 @@
-     "USER_STATUS_TRIAL": "تجريبي",
-     "USER_UI": "واجهة المستخدم",
-     "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
-+    "HIDE_ADULT": "إخفاء Adult",
-     "COMBINE_VIEWS_STATS_STREAMS": "دمج الإحصائيات والبث",
-     "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
-     "USE_OUTPUT": "استخدام المخرج",

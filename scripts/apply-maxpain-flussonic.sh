@@ -1,6 +1,6 @@
 #!/bin/bash
 # Apply MaxPain tuliprox patches (Flussonic catchup enhancements + Hide Adult).
-# Used by .github/workflows/build.yml and local builds.
+# Regenerated against upstream euzu/develop (synced tip). Used by build.yml + docker-build.yml.
 #
 # Usage:
 #   ./scripts/apply-maxpain-flussonic.sh [TREE]
