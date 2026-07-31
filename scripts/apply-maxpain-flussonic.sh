@@ -191,6 +191,7 @@ grep -q 'find_latest_session_for_virtual_id' "${TREE}/backend/src/api/model/acti
 grep -q 'is_sticky_session_stream' "${TREE}/frontend/src/hooks/use_server_status.rs"
 grep -q 'Connections(0) often arrives before Disconnected' "${TREE}/frontend/src/hooks/use_server_status.rs"
 grep -q 'Backend session TTL expiry' "${TREE}/frontend/src/hooks/use_server_status.rs"
+grep -q 'prune_zapped_preserved_streams' "${TREE}/frontend/src/hooks/use_server_status.rs"
 grep -q 'stream_display_key' "${TREE}/frontend/src/app/components/dashboard/stream_display/mod.rs"
 grep -q 'panel_streams' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'panel_streams' "${TREE}/backend/src/api/endpoints/v1_api.rs"
