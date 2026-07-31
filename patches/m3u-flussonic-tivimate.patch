@@ -1,6 +1,6 @@
 # MaxPain Flussonic / TiviMate catchup + archive Streams sticky panel
 # Soft-preserve between HLS segments; Connections(0) freezes sticky last_seen for TTL hide.
-# StatusCheck trusts backend panel_streams (no FE ghost merge).
+# StatusCheck trusts backend panel_streams (no FE ghost merge). Dedupes HLS type+container chips.
 # Includes v3.3.81 routing: catchup-type-first, panel_streams(), archive guards.
 # Apply with: scripts/apply-maxpain-flussonic.sh (also applies user-hide-adult.patch).
 
@@ -1378,7 +1378,7 @@ index 6a5d7eb5..ea9be88a 100644
              || {
                  build_rewritten_url(
 diff --git a/frontend/src/app/components/dashboard/stream_display/helpers.rs b/frontend/src/app/components/dashboard/stream_display/helpers.rs
-index 449b4ac4..774371a4 100644
+index 449b4ac4..0424210a 100644
 --- a/frontend/src/app/components/dashboard/stream_display/helpers.rs
 +++ b/frontend/src/app/components/dashboard/stream_display/helpers.rs
 @@ -54,8 +54,28 @@ pub fn get_adaptive_session_ttl_secs(config_ctx: &ConfigContext) -> u64 {
@@ -1411,7 +1411,27 @@ index 449b4ac4..774371a4 100644
  }
  
  pub fn is_background_transfer_stream(stream: &StreamInfo) -> bool {
-@@ -288,4 +308,78 @@ mod tests {
+@@ -140,11 +160,17 @@ pub fn build_technical_chips(
+         return chips;
+     };
+ 
+-    if let Some(label) = adaptive_tech_label(item_type) {
++    let type_label = adaptive_tech_label(item_type);
++    if let Some(label) = type_label {
+         chips.push((label.to_string(), "tp__stream-display__chip--container"));
+     }
+     if !tech.container.is_empty() {
+-        chips.push((tech.container.to_ascii_uppercase(), "tp__stream-display__chip--container"));
++        let container = tech.container.to_ascii_uppercase();
++        // LiveHls/Dash already add HLS/DASH from item_type; metrics often repeat the same container.
++        let duplicate_type_label = type_label.is_some_and(|label| label.eq_ignore_ascii_case(&container));
++        if !duplicate_type_label {
++            chips.push((container, "tp__stream-display__chip--container"));
++        }
+     }
+     if !tech.video_codec.is_empty() {
+         chips.push((tech.video_codec.clone(), "tp__stream-display__chip--video-codec"));
+@@ -288,4 +314,93 @@ mod tests {
  
          assert_eq!(refreshed.get(&2), Some(&999));
      }
@@ -1488,6 +1508,21 @@ index 449b4ac4..774371a4 100644
 +        // Active rows refresh last_seen in the UI; a frozen last_seen past TTL must hide.
 +        assert_eq!(visible.len(), 1);
 +        assert_eq!(visible[0].channel.item_type, PlaylistItemType::Video);
++    }
++
++    #[test]
++    fn build_technical_chips_dedupes_hls_type_and_container() {
++        use super::build_technical_chips;
++        use shared::model::StreamTechnicalInfo;
++
++        let tech = StreamTechnicalInfo {
++            container: "hls".to_string(),
++            video_codec: "h264".to_string(),
++            ..Default::default()
++        };
++        let chips = build_technical_chips(PlaylistItemType::LiveHls, Some(&tech));
++        let labels: Vec<_> = chips.iter().map(|(label, _)| label.as_str()).collect();
++        assert_eq!(labels, vec!["HLS", "h264"]);
 +    }
  }
 diff --git a/frontend/src/app/components/dashboard/stream_display/mod.rs b/frontend/src/app/components/dashboard/stream_display/mod.rs
