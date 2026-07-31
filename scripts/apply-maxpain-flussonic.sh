@@ -195,6 +195,7 @@ grep -q 'stream_display_key' "${TREE}/frontend/src/app/components/dashboard/stre
 grep -q 'panel_streams' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'panel_streams' "${TREE}/backend/src/api/endpoints/v1_api.rs"
 grep -q 'Catchup-token Live/.ts segment sockets must preserve' "${TREE}/backend/src/api/model/active_user_manager.rs"
+grep -q 'overflow-y: auto' "${TREE}/frontend/scss/app/components/dashboard/_streams_view.scss"
 grep -q 'Soft-preserve is for segment gaps only' "${TREE}/frontend/src/app/components/dashboard/stream_display/helpers.rs"
 grep -q 'Trust backend `panel_streams` as authoritative' "${TREE}/frontend/src/hooks/use_server_status.rs"
 grep -q 'Prefer `catchup-type` when both are set' "${TREE}/shared/src/model/stream_properties.rs"
