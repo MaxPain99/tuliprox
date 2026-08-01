@@ -2,7 +2,10 @@
 # Apply MaxPain tuliprox patches for Release/Docker builds.
 #
 # Upstream euzu/tuliprox#807 landed Flussonic/BitTV archive catchup + Streams sticky panel.
-# This script now applies only Hide Adult. The flussonic patch file is kept as a stub.
+# This script applies:
+#   1) zap-close-old-sessions — terminate other-channel soft-preserved sessions on Activate
+#   2) user-hide-adult — per-user adult filtering
+# The flussonic patch file is kept as a stub (do not apply).
 #
 # Usage:
 #   ./scripts/apply-maxpain-flussonic.sh [TREE]
@@ -16,6 +19,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TREE="$(cd "${1:-${TULIPROX_ROOT:-${ROOT_DIR}}}" && pwd)"
 
 PATCHES=(
+  "zap-close-old-sessions.patch"
   "user-hide-adult.patch"
 )
 
@@ -191,5 +195,10 @@ grep -q 'HIDE_ADULT' "${TREE}/frontend/src/app/components/userlist/proxy_user_cr
 grep -q 'adult_epg_id_blocklist' "${TREE}/backend/src/api/endpoints/xmltv_api.rs"
 grep -q 'let hide_adult = user.hide_adult' "${TREE}/backend/src/repository/m3u_playlist_iterator.rs"
 
-echo "MaxPain patches applied OK (Hide Adult only; Flussonic/Streams #807 is upstream)"
+# Sanity: zap-close-old-sessions applied.
+grep -q 'terminate_other_channel_sessions_for_client_ip' "${TREE}/backend/src/api/model/active_user_manager.rs"
+grep -q 'terminate_other_channel_sessions_for_client' "${TREE}/backend/src/api/model/connection_manager.rs"
+grep -q 'Channel zap: drop soft-preserved' "${TREE}/backend/src/api/api_utils.rs"
+
+echo "MaxPain patches applied OK (zap-close-old-sessions + Hide Adult; Flussonic/Streams #807 is upstream)"
 echo "Rebuild tuliprox and refresh playlists."

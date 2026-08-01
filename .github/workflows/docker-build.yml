@@ -166,13 +166,13 @@ jobs:
           fi
 
       # Apply after the version commit so patched sources never land on develop.
-      # Hide Adult stays patch-based; Flussonic/Streams sticky landed upstream in #807.
+      # Zap + Hide Adult stay patch-based; Flussonic/Streams sticky landed upstream in #807.
       - name: Apply MaxPain patches
         run: |
           set -euo pipefail
           chmod +x scripts/apply-maxpain-flussonic.sh
           ./scripts/apply-maxpain-flussonic.sh .
-          echo "Applied: user-hide-adult.patch (Flussonic/Streams #807 is upstream)"
+          echo "Applied: zap-close-old-sessions.patch + user-hide-adult.patch (Flussonic/Streams #807 is upstream)"
 
       - name: Build and push Docker images
         env:
