@@ -1,15 +1,17 @@
 # Close soft-preserved / HLS-origin sessions for other channels on Activate (zap).
 # After #807 soft-preserve, flipping channels left adaptive/HLS/Catchup sessions and
-# hls-cache origin bindings until TTL. This terminates other virtual_ids for the same
-# username+client (IP/fingerprint), clears provider + hls-cache reservations, and
-# hard-removes Streams panel rows (DisconnectedStream / Disconnected).
+# hls-cache origin bindings until TTL. Restores 3.3.78-like immediate close:
+# - terminate other virtual_ids for same user+client IP (sessions + orphan streams)
+# - auto-close on update_connection (upstream 4dae6dae intent)
+# - refuse soft-preserve when another channel is already active for this client
+# - tear down HLS origin leases (fingerprint / IP family match)
+# - hard-remove Streams panel rows (DisconnectedStream / Disconnected)
 # Apply BEFORE user-hide-adult.patch.
 
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
-index d2d1ab90..733d905d 100644
 --- a/backend/src/api/api_utils.rs
 +++ b/backend/src/api/api_utils.rs
-@@ -125,12 +125,42 @@ pub(crate) fn classify_playback_request(facts: PlaybackRequestFacts<'_>) -> Play
+@@ -125,12 +125,42 @@
      PlaybackRequestClass::Activate
  }
  
@@ -52,21 +54,24 @@ index d2d1ab90..733d905d 100644
      user_session: Option<&UserSession>,
      session_token: &str,
      activate_unbound_session: bool,
-@@ -180,6 +210,13 @@ pub(crate) async fn resolve_playback_request_admission(
+@@ -178,6 +208,16 @@
+             None,
+             request_class,
          );
-     }
- 
++    }
++
 +    // Channel zap: drop soft-preserved (and still-open) sessions for other virtual_ids on
 +    // this user+IP before admission, so capacity is freed immediately instead of waiting
 +    // for hls_session_ttl. Same-channel FollowUp / same virtual_id Activate is a no-op.
-+    if request_class == PlaybackRequestClass::Activate {
++    if !matches!(
++        request_class,
++        PlaybackRequestClass::Prepare | PlaybackRequestClass::Terminate
++    ) {
 +        zap_close_other_channel_playback(app_state, &user.username, fingerprint, virtual_id).await;
-+    }
-+
+     }
+ 
      if request_class == PlaybackRequestClass::FollowUp || !limits_enabled {
-         return (
-             crate::api::model::ConnectionAdmission {
-@@ -1164,6 +1201,9 @@ async fn activate_session_before_stream_open(
+@@ -1164,6 +1204,9 @@
              terminate: false,
          })
      };
@@ -76,7 +81,7 @@ index d2d1ab90..733d905d 100644
      let limits_enabled = app_state.app_config.config.load().user_access_control
          && (user.max_connections > 0 || user.soft_connections > 0);
      // Prepare: session setup without admission cost. The caller handles the actual activation.
-@@ -6617,6 +6657,7 @@ mod tests {
+@@ -6617,6 +6660,7 @@
              &user,
              &fingerprint,
              PlaylistItemType::LiveHls,
@@ -84,7 +89,7 @@ index d2d1ab90..733d905d 100644
              None,
              "tok-prepare-only",
              false,
-@@ -6682,6 +6723,7 @@ mod tests {
+@@ -6682,6 +6726,7 @@
              &user,
              &fingerprint,
              PlaylistItemType::LiveHls,
@@ -92,7 +97,7 @@ index d2d1ab90..733d905d 100644
              before.as_ref(),
              session_token,
              false,
-@@ -9473,6 +9515,7 @@ mod tests {
+@@ -9473,6 +9518,7 @@
              &user,
              &ts_fingerprint,
              PlaylistItemType::Live,
@@ -101,10 +106,9 @@ index d2d1ab90..733d905d 100644
              &ts_token,
              false,
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
-index 233919a5..0bad49df 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
-@@ -4396,6 +4396,9 @@ async fn prepare_hls_cache_user_session(
+@@ -4396,6 +4396,9 @@
      connection_permission: UserConnectionPermission,
      connection_kind: Option<crate::api::model::ConnectionKind>,
  ) -> String {
@@ -114,7 +118,7 @@ index 233919a5..0bad49df 100644
      app_state
          .active_users
          .create_user_session(crate::api::model::CreateUserSessionParams {
-@@ -5115,6 +5118,7 @@ async fn try_reserve_hls_virtual_entry_origin_account_for_redirect(
+@@ -5115,6 +5118,7 @@
          user,
          fingerprint,
          PlaylistItemType::LiveHls,
@@ -122,7 +126,7 @@ index 233919a5..0bad49df 100644
          None,
          &session_token,
          false,
-@@ -7646,6 +7650,7 @@ async fn admit_recovered_archive_stream(
+@@ -7646,6 +7650,7 @@
          user,
          fingerprint,
          PlaylistItemType::Catchup,
@@ -130,7 +134,7 @@ index 233919a5..0bad49df 100644
          Some(&session),
          &session.token,
          true,
-@@ -7909,6 +7914,7 @@ async fn hls_api_stream_resolved(
+@@ -7909,6 +7914,7 @@
                  } else {
                      PlaylistItemType::LiveHls
                  },
@@ -139,10 +143,9 @@ index 233919a5..0bad49df 100644
                  &session.token,
                  true,
 diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
-index 50bb34b0..f986194a 100644
 --- a/backend/src/api/endpoints/m3u_api.rs
 +++ b/backend/src/api/endpoints/m3u_api.rs
-@@ -215,6 +215,7 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
+@@ -215,6 +215,7 @@
              &user,
              fingerprint,
              pli.item_type,
@@ -150,7 +153,7 @@ index 50bb34b0..f986194a 100644
              user_session.as_ref(),
              playback_session_token.as_str(),
              false,
-@@ -358,6 +359,7 @@ pub(in crate::api) async fn m3u_api_stream_loaded(
+@@ -358,6 +359,7 @@
          &user,
          fingerprint,
          pli.item_type,
@@ -159,10 +162,9 @@ index 50bb34b0..f986194a 100644
          &session_key,
          false,
 diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints/xtream_api.rs
-index 04103c3b..9a009e9a 100644
 --- a/backend/src/api/endpoints/xtream_api.rs
 +++ b/backend/src/api/endpoints/xtream_api.rs
-@@ -391,6 +391,7 @@ async fn xtream_player_api_stream(
+@@ -391,6 +391,7 @@
              &user,
              fingerprint,
              pli.item_type,
@@ -170,7 +172,7 @@ index 04103c3b..9a009e9a 100644
              user_session.as_ref(),
              playback_session_token.as_str(),
              false,
-@@ -558,6 +559,7 @@ async fn xtream_player_api_stream(
+@@ -558,6 +559,7 @@
          &user,
          fingerprint,
          item_type,
@@ -179,10 +181,9 @@ index 04103c3b..9a009e9a 100644
          &session_key,
          false,
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
-index 72bab640..508bad5f 100644
 --- a/backend/src/api/model/active_user_manager.rs
 +++ b/backend/src/api/model/active_user_manager.rs
-@@ -28,7 +28,7 @@ use std::{
+@@ -28,7 +28,7 @@
      borrow::Cow,
      cmp::Reverse,
      collections::{BinaryHeap, HashMap, HashSet},
@@ -191,7 +192,39 @@ index 72bab640..508bad5f 100644
      num::NonZeroUsize,
      sync::{
          atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-@@ -2534,6 +2534,159 @@ impl ActiveUserManager {
+@@ -959,6 +959,16 @@
+                     let mut removed_session_tokens = HashSet::new();
+                     let mut preserved_session_tokens = Vec::new();
+                     let now = current_time_secs();
++                    // If this client already has another live channel, do not soft-preserve the
++                    // channel being closed (zap / dual-open). Matches 3.3.78 "old channel gone".
++                    let other_active_by_client: HashSet<(String, u32)> = connection_data
++                        .streams
++                        .iter()
++                        .filter(|stream| stream.addr != *addr && !stream.preserved)
++                        .map(|stream| {
++                            (Self::normalize_client_ip(&stream.client_ip), stream.channel.virtual_id)
++                        })
++                        .collect();
+                     for mut stream_info in connection_data.streams.drain(..) {
+                         if stream_info.addr == *addr {
+                             let migrated_addr = stream_info
+@@ -971,7 +981,13 @@
+                                 stream_info.addr = next_addr;
+                                 stream_info.ts = now;
+                                 remaining_streams.push(stream_info);
+-                            } else if preserve_session_streams && Self::should_preserve_session_stream(&stream_info) {
++                            } else if preserve_session_streams
++                                && Self::should_preserve_session_stream(&stream_info)
++                                && !other_active_by_client.iter().any(|(ip, vid)| {
++                                    *vid != stream_info.channel.virtual_id
++                                        && ip == &Self::normalize_client_ip(&stream_info.client_ip)
++                                })
++                            {
+                                 if let Some(entry) = self.build_preserved_stream_expiry(
+                                     username,
+                                     &stream_info,
+@@ -2534,6 +2550,257 @@
          debug!("GraceActive expired for session {token} in {username}, released {removed_count} streams");
      }
  
@@ -200,11 +233,11 @@ index 72bab640..508bad5f 100644
 +    /// rows and provider pins do not linger until `hls_session_ttl`.
 +    ///
 +    /// Same-channel segment gaps keep the same `virtual_id` and are not terminated.
-+    /// Other devices (different client IP / fingerprint) are left alone.
++    /// Other devices (different client IP) are left alone.
 +    ///
 +    /// Returns `(session_token, socket addrs, removed stream addr/uid pairs)` for each
-+    /// removed session so the caller can close sockets, clear provider reservations, and
-+    /// hard-remove Streams panel rows.
++    /// removed session/orphan group so the caller can close sockets, clear provider
++    /// reservations, and hard-remove Streams panel rows.
 +    pub async fn terminate_other_channel_sessions_for_client_ip(
 +        &self,
 +        username: &str,
@@ -212,8 +245,8 @@ index 72bab640..508bad5f 100644
 +        client_fingerprint: Option<&str>,
 +        keep_virtual_id: u32,
 +    ) -> Vec<(String, Vec<SocketAddr>, Vec<(SocketAddr, u32)>)> {
-+        let client_ip_addr = client_ip.parse::<IpAddr>().ok();
-+        let normalized_client_ip = strip_port(client_ip);
++        let client_ip_addr = Self::parse_client_ip(client_ip);
++        let normalized_client_ip = Self::normalize_client_ip(client_ip);
 +
 +        let (terminated, connection_changed, promotions) = {
 +            let mut user_connections = self.connections.write().await;
@@ -231,18 +264,14 @@ index 72bab640..508bad5f 100644
 +                            &connection_data.streams,
 +                            client_ip,
 +                            client_ip_addr,
-+                            normalized_client_ip.as_ref(),
++                            &normalized_client_ip,
 +                            client_fingerprint,
 +                        )
 +                })
 +                .map(|session| session.token.clone())
 +                .collect();
 +
-+            if tokens_to_remove.is_empty() {
-+                return Vec::new();
-+            }
-+
-+            let mut terminated = Vec::with_capacity(tokens_to_remove.len());
++            let mut terminated = Vec::with_capacity(tokens_to_remove.len().saturating_add(1));
 +            let mut connection_changed = false;
 +
 +            for token in &tokens_to_remove {
@@ -283,6 +312,53 @@ index 72bab640..508bad5f 100644
 +                terminated.push((token.clone(), addrs, removed_streams));
 +            }
 +
++            // Plain / orphan streams (no session row, or leftover after session remove) for other
++            // virtual_ids on this client IP - same auto-close intent as upstream zap connection fix.
++            let orphan_idxs: Vec<usize> = connection_data
++                .streams
++                .iter()
++                .enumerate()
++                .filter(|(_, stream)| {
++                    stream.channel.virtual_id != keep_virtual_id
++                        && Self::stream_matches_client_ip(stream, client_ip, client_ip_addr, &normalized_client_ip)
++                })
++                .map(|(idx, _)| idx)
++                .collect();
++            if !orphan_idxs.is_empty() {
++                let mut addrs = Vec::new();
++                let mut removed_streams = Vec::new();
++                let mut reservation_tokens: Vec<String> = Vec::new();
++                for idx in orphan_idxs.into_iter().rev() {
++                    let stream = connection_data.streams.swap_remove(idx);
++                    if let Some(kind) = connection_data.stream_kinds.remove(&stream.uid) {
++                        connection_data.decrement_kind(kind);
++                        connection_changed = true;
++                    }
++                    connection_data.stream_normal_priorities.remove(&stream.uid);
++                    if let Some(token) = stream.session_token.as_ref() {
++                        if !reservation_tokens.iter().any(|existing| existing == token) {
++                            reservation_tokens.push(token.clone());
++                        }
++                        Self::clear_session_counted(connection_data, token);
++                    }
++                    if !addrs.contains(&stream.addr) {
++                        addrs.push(stream.addr);
++                    }
++                    removed_streams.push((stream.addr, stream.uid));
++                }
++                if reservation_tokens.is_empty() {
++                    terminated.push((String::new(), addrs, removed_streams));
++                } else {
++                    for token in reservation_tokens {
++                        terminated.push((token, addrs.clone(), removed_streams.clone()));
++                    }
++                }
++            }
++
++            if terminated.is_empty() {
++                return Vec::new();
++            }
++
 +            if connection_data.connections == 0 && connection_data.streams.is_empty() {
 +                connection_data.granted_grace = false;
 +                connection_data.grace_ts = 0;
@@ -304,11 +380,57 @@ index 72bab640..508bad5f 100644
 +        }
 +        if !terminated.is_empty() {
 +            debug!(
-+                "Zap-terminated {} other-channel session(s) for user {username} at client_ip {client_ip} (keep virtual_id {keep_virtual_id})",
++                "Zap-terminated {} other-channel session/stream group(s) for user {username} at client_ip {client_ip} (keep virtual_id {keep_virtual_id})",
 +                terminated.len()
 +            );
 +        }
 +        terminated
++    }
++
++    fn parse_client_ip(client_ip: &str) -> Option<IpAddr> {
++        let primary = client_ip.split(',').next().unwrap_or(client_ip).trim();
++        let primary = strip_port(primary);
++        primary
++            .parse::<IpAddr>()
++            .ok()
++            .map(|ip| match ip {
++                IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
++                other => other,
++            })
++    }
++
++    fn normalize_client_ip(client_ip: &str) -> String {
++        let primary = client_ip.split(',').next().unwrap_or(client_ip).trim();
++        let stripped = strip_port(primary);
++        match stripped.parse::<IpAddr>() {
++            Ok(IpAddr::V6(v6)) => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_else(|| stripped.into_owned()),
++            _ => stripped.into_owned(),
++        }
++    }
++
++    fn stream_matches_client_ip(
++        stream: &StreamInfo,
++        client_ip: &str,
++        client_ip_addr: Option<IpAddr>,
++        normalized_client_ip: &str,
++    ) -> bool {
++        let stream_normalized = Self::normalize_client_ip(&stream.client_ip);
++        if stream.client_ip == client_ip
++            || stream.client_ip == normalized_client_ip
++            || stream_normalized == normalized_client_ip
++            || strip_port(&stream.client_ip) == normalized_client_ip
++        {
++            return true;
++        }
++        if let Some(ip) = client_ip_addr {
++            if stream.addr.ip() == ip {
++                return true;
++            }
++            if let Ok(stream_ip) = stream_normalized.parse::<IpAddr>() {
++                return stream_ip == ip;
++            }
++        }
++        false
 +    }
 +
 +    fn session_matches_client(
@@ -324,11 +446,22 @@ index 72bab640..508bad5f 100644
 +            if session.token.contains(fingerprint) {
 +                return true;
 +            }
++            // Fingerprint is `{client_ip}|{ua}` - match by IP prefix when UA differs slightly.
++            if let Some((fp_ip, _)) = fingerprint.split_once('|') {
++                let fp_ip_norm = Self::normalize_client_ip(fp_ip);
++                if !fp_ip_norm.is_empty() && fp_ip_norm == normalized_client_ip {
++                    // Fall through to stream/IP checks rather than treating as automatic match.
++                }
++            }
 +        }
 +
 +        let addr_matches = |addr: &SocketAddr| {
 +            if let Some(ip) = client_ip_addr {
-+                if addr.ip() == ip {
++                let addr_ip = match addr.ip() {
++                    IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
++                    other => other,
++                };
++                if addr_ip == ip {
 +                    return true;
 +                }
 +            }
@@ -340,18 +473,16 @@ index 72bab640..508bad5f 100644
 +        }
 +
 +        streams.iter().any(|stream| {
-+            stream.session_token.as_deref() == Some(session.token.as_str())
-+                && (stream.client_ip == client_ip
-+                    || stream.client_ip == normalized_client_ip
-+                    || strip_port(&stream.client_ip) == normalized_client_ip
-+                    || addr_matches(&stream.addr))
++            let linked = stream.session_token.as_deref() == Some(session.token.as_str())
++                || stream.channel.virtual_id == session.virtual_id;
++            linked && Self::stream_matches_client_ip(stream, client_ip, client_ip_addr, normalized_client_ip)
 +        })
 +    }
 +
      /// Terminates the session and all associated streams for a playback.
      ///
      /// This is the explicit `Terminate` path from the playback state machine:
-@@ -3960,6 +4113,189 @@ mod tests {
+@@ -3960,6 +4227,189 @@
          assert!(connection_data.sessions.iter().all(|session| session.token != token));
      }
  
@@ -542,10 +673,9 @@ index 72bab640..508bad5f 100644
      #[tokio::test]
      async fn terminate_session_promotes_soft_stream_after_releasing_capacity() {
 diff --git a/backend/src/api/model/connection_manager.rs b/backend/src/api/model/connection_manager.rs
-index c5c127b8..7fe57c9e 100644
 --- a/backend/src/api/model/connection_manager.rs
 +++ b/backend/src/api/model/connection_manager.rs
-@@ -16,7 +16,7 @@ use shared::{
+@@ -16,7 +16,7 @@
  use std::{
      borrow::Cow,
      cmp::Reverse,
@@ -554,7 +684,7 @@ index c5c127b8..7fe57c9e 100644
      net::SocketAddr,
      str::FromStr,
      sync::{
-@@ -1008,6 +1008,51 @@ impl ConnectionManager {
+@@ -1008,6 +1008,53 @@
          }
      }
  
@@ -583,7 +713,9 @@ index c5c127b8..7fe57c9e 100644
 +
 +        let mut closed_addrs = HashSet::new();
 +        for (session_token, addrs, removed_streams) in terminated {
-+            self.provider_manager.clear_provider_reservation(&session_token).await;
++            if !session_token.is_empty() {
++                self.provider_manager.clear_provider_reservation(&session_token).await;
++            }
 +            for (addr, uid) in removed_streams {
 +                self.event_manager.send_event(EventMessage::ActiveUser(
 +                    ActiveUserConnectionChange::DisconnectedStream { addr, uid },
@@ -606,27 +738,75 @@ index c5c127b8..7fe57c9e 100644
      pub fn next_stream_uid(&self) -> u32 {
          self.stream_uid_counter
              .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+@@ -1123,6 +1170,17 @@
+             }
+             self.event_manager
+                 .send_event(EventMessage::ActiveUser(ActiveUserConnectionChange::Updated(stream_info.clone())));
++            // Channel zap / dual-open: when a new stream registers, close other virtual_ids for
++            // this user+client immediately (provider slots + soft-preserved rows), not after TTL.
++            if stream_info.channel.virtual_id != 0 {
++                self.terminate_other_channel_sessions_for_client(
++                    username,
++                    &fingerprint.client_ip,
++                    Some(fingerprint.key.as_str()),
++                    stream_info.channel.virtual_id,
++                )
++                .await;
++            }
+             Some(stream_info)
+         } else {
+             warn!("Failed to register connection for user {username} at {}; disconnecting client", fingerprint.addr);
 diff --git a/backend/src/api/model/hls_cache/lease.rs b/backend/src/api/model/hls_cache/lease.rs
-index fdb408ea..bb3ef6f8 100644
 --- a/backend/src/api/model/hls_cache/lease.rs
 +++ b/backend/src/api/model/hls_cache/lease.rs
-@@ -1034,6 +1034,24 @@ impl HlsAccessLeaseStore {
+@@ -1034,6 +1034,55 @@
          lease_ids.into_iter().filter_map(|lease_id| self.by_lease_id.remove(&lease_id)).collect()
      }
  
 +    /// Leases for the same user/player family on a different channel (`virtual_id`).
++    /// Matches exact fingerprint, or the same client IP prefix of `{ip}|{ua}` fingerprint keys.
 +    pub fn other_channel_leases_for_client(
 +        &self,
 +        username: &str,
 +        client_fingerprint: &str,
 +        keep_virtual_id: u32,
 +    ) -> Vec<(HlsAccessLeaseId, ProxySessionId)> {
++        let fingerprint_ip = client_fingerprint
++            .split_once('|')
++            .map(|(ip, _)| ip.trim())
++            .unwrap_or(client_fingerprint)
++            .split(',')
++            .next()
++            .unwrap_or(client_fingerprint)
++            .trim();
 +        self.by_lease_id
 +            .values()
 +            .filter(|lease| {
-+                lease.username == username
-+                    && lease.family_key.client_fingerprint == client_fingerprint
-+                    && lease.virtual_id != keep_virtual_id
++                if lease.username != username || lease.virtual_id == keep_virtual_id {
++                    return false;
++                }
++                if lease.family_key.client_fingerprint == client_fingerprint {
++                    return true;
++                }
++                if client_fingerprint.is_empty() {
++                    return false;
++                }
++                let lease_fp = lease.family_key.client_fingerprint.as_str();
++                if lease_fp.contains(client_fingerprint) || client_fingerprint.contains(lease_fp) {
++                    return true;
++                }
++                if !fingerprint_ip.is_empty() {
++                    let lease_ip = lease_fp
++                        .split_once('|')
++                        .map(|(ip, _)| ip.trim())
++                        .unwrap_or(lease_fp)
++                        .split(',')
++                        .next()
++                        .unwrap_or(lease_fp)
++                        .trim();
++                    return lease_ip == fingerprint_ip;
++                }
++                false
 +            })
 +            .map(|lease| (lease.lease_id.clone(), lease.proxy_session_id.clone()))
 +            .collect()
@@ -636,10 +816,9 @@ index fdb408ea..bb3ef6f8 100644
          let removed = self.by_lease_id.len();
          self.by_lease_id.clear();
 diff --git a/backend/src/api/model/hls_cache/manager.rs b/backend/src/api/model/hls_cache/manager.rs
-index f1b6a901..81c9cd71 100644
 --- a/backend/src/api/model/hls_cache/manager.rs
 +++ b/backend/src/api/model/hls_cache/manager.rs
-@@ -58,14 +58,14 @@ use super::{
+@@ -58,14 +58,14 @@
      HlsTerminalTailProtectionRemoval, ProxySessionId, SegmentFetchPolicy, TransientResourceStore,
  };
  use crate::{
@@ -656,7 +835,7 @@ index f1b6a901..81c9cd71 100644
      io,
      path::PathBuf,
      sync::Arc,
-@@ -2683,6 +2683,75 @@ impl HlsProxyManager {
+@@ -2683,6 +2683,75 @@
          }
      }
  
@@ -733,23 +912,21 @@ index f1b6a901..81c9cd71 100644
          &self,
          lease_id: &HlsAccessLeaseId,
 diff --git a/backend/src/api/model/hls_cache/origin.rs b/backend/src/api/model/hls_cache/origin.rs
-index 90e31d64..655e7fc5 100644
 --- a/backend/src/api/model/hls_cache/origin.rs
 +++ b/backend/src/api/model/hls_cache/origin.rs
-@@ -136,6 +136,8 @@ impl HlsOriginAccountIoLease {
+@@ -135,6 +135,8 @@
+             notify: Arc::new(Notify::new()),
          }
      }
- 
-+    pub(crate) fn take_provider_handle(&mut self) -> Option<ProviderHandle> { self.provider_handle.take() }
 +
++    pub(crate) fn take_provider_handle(&mut self) -> Option<ProviderHandle> { self.provider_handle.take() }
+ 
      fn matches_binding(&self, binding: &HlsOriginAccountBinding) -> bool {
          self.account_name == binding.account_name && self.session_owner == binding.session_owner
-     }
 diff --git a/backend/src/api/model/hls_cache/playback.rs b/backend/src/api/model/hls_cache/playback.rs
-index cc8767d4..94cb1f4a 100644
 --- a/backend/src/api/model/hls_cache/playback.rs
 +++ b/backend/src/api/model/hls_cache/playback.rs
-@@ -105,6 +105,7 @@ async fn validate_hls_access_lease_admission(
+@@ -105,6 +105,7 @@
          &user,
          fingerprint,
          PlaylistItemType::LiveHls,
@@ -757,11 +934,27 @@ index cc8767d4..94cb1f4a 100644
          Some(&user_session),
          &lease.user_session_token,
          true,
+diff --git a/backend/src/auth/fingerprint.rs b/backend/src/auth/fingerprint.rs
+--- a/backend/src/auth/fingerprint.rs
++++ b/backend/src/auth/fingerprint.rs
+@@ -74,7 +74,12 @@
+ 
+         let client_ip = real_ip.as_ref()
+             .map(ToString::to_string)
+-            .or(forwarded_for.as_ref().map(ToString::to_string))
++            .or_else(|| {
++                forwarded_for.as_ref().map(|xff| {
++                    // X-Forwarded-For may be a chain: "client, proxy1, proxy2" - use the client.
++                    xff.split(',').next().unwrap_or(xff).trim().to_string()
++                })
++            })
+             .unwrap_or_else(|| addr.ip().to_string());
+ 
+         let ua = user_agent.unwrap_or_else(String::new);
 diff --git a/frontend/src/hooks/use_server_status.rs b/frontend/src/hooks/use_server_status.rs
-index 8444ab46..057a1edc 100644
 --- a/frontend/src/hooks/use_server_status.rs
 +++ b/frontend/src/hooks/use_server_status.rs
-@@ -285,40 +285,16 @@ fn apply_active_user_change(server_status: &mut StatusCheck, event: ActiveUserCo
+@@ -285,40 +285,16 @@
              prune_zapped_preserved_streams(&mut server_status.active_user_streams);
          }
          ActiveUserConnectionChange::Disconnected(addr) => {
@@ -782,7 +975,10 @@ index 8444ab46..057a1edc 100644
          }
          ActiveUserConnectionChange::DisconnectedStream { addr, uid } => {
 -            let already_preserved = server_status
--                .active_user_streams
++            // Backend DisconnectedStream is a hard remove (soft-preserve emits Updated instead).
++            // Soft-keeping here left zapped channels visible until hls_session_ttl.
++            server_status
+                 .active_user_streams
 -                .iter()
 -                .any(|stream_info| stream_info.addr == addr && stream_info.uid == uid && stream_info.preserved);
 -            if already_preserved {
@@ -793,10 +989,7 @@ index 8444ab46..057a1edc 100644
 -                return;
 -            }
 -            if let Some(stream) = server_status
-+            // Backend DisconnectedStream is a hard remove (soft-preserve emits Updated instead).
-+            // Soft-keeping here left zapped channels visible until hls_session_ttl.
-+            server_status
-                 .active_user_streams
+-                .active_user_streams
 -                .iter_mut()
 -                .find(|stream_info| stream_info.addr == addr && stream_info.uid == uid)
 -            {
@@ -809,7 +1002,7 @@ index 8444ab46..057a1edc 100644
          }
          ActiveUserConnectionChange::Connections(user_count, connections) => {
              server_status.active_users = user_count;
-@@ -879,7 +855,8 @@ mod tests {
+@@ -879,7 +855,8 @@
      }
  
      #[test]
@@ -819,7 +1012,7 @@ index 8444ab46..057a1edc 100644
          let active = test_stream(1, "127.0.0.1:1234", Some("tok-catchup"), PlaylistItemType::Catchup);
          let other = test_stream(2, "127.0.0.1:5678", Some("tok-live"), PlaylistItemType::LiveHls);
          let mut status = shared::model::StatusCheck {
-@@ -894,11 +871,7 @@ mod tests {
+@@ -894,11 +871,7 @@
              ActiveUserConnectionChange::DisconnectedStream { addr: active.addr, uid: active.uid },
          );
  
@@ -832,7 +1025,7 @@ index 8444ab46..057a1edc 100644
      }
  
      #[test]
-@@ -922,22 +895,21 @@ mod tests {
+@@ -922,22 +895,21 @@
      }
  
      #[test]
@@ -859,7 +1052,7 @@ index 8444ab46..057a1edc 100644
      }
  
      #[test]
-@@ -958,7 +930,7 @@ mod tests {
+@@ -958,7 +930,7 @@
      }
  
      #[test]
@@ -868,7 +1061,7 @@ index 8444ab46..057a1edc 100644
          let mut expired = test_stream(1, "127.0.0.1:1234", Some("tok-old"), PlaylistItemType::Catchup);
          expired.preserved = true;
          let active = test_stream(2, "127.0.0.1:1234", Some("tok-new"), PlaylistItemType::LiveHls);
-@@ -971,9 +943,7 @@ mod tests {
+@@ -971,9 +943,7 @@
  
          apply_active_user_change(&mut status, ActiveUserConnectionChange::Disconnected(active.addr));
  
