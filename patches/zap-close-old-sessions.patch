@@ -636,7 +636,7 @@ index fdb408ea..bb3ef6f8 100644
          let removed = self.by_lease_id.len();
          self.by_lease_id.clear();
 diff --git a/backend/src/api/model/hls_cache/manager.rs b/backend/src/api/model/hls_cache/manager.rs
-index f1b6a901..735ac305 100644
+index f1b6a901..81c9cd71 100644
 --- a/backend/src/api/model/hls_cache/manager.rs
 +++ b/backend/src/api/model/hls_cache/manager.rs
 @@ -58,14 +58,14 @@ use super::{
@@ -656,7 +656,7 @@ index f1b6a901..735ac305 100644
      io,
      path::PathBuf,
      sync::Arc,
-@@ -2683,6 +2683,68 @@ impl HlsProxyManager {
+@@ -2683,6 +2683,75 @@ impl HlsProxyManager {
          }
      }
  
@@ -685,7 +685,14 @@ index f1b6a901..735ac305 100644
 +
 +        let mut proxy_sessions = HashSet::new();
 +        for (lease_id, proxy_session_id) in &targets {
-+            let _ = self.deny_access_lease(lease_id, HlsAccessLeaseDenialMode::ImmediateEnd).await;
++            let _ = self
++                .deny_access_lease(
++                    lease_id,
++                    HlsAccessLeaseDenialMode::ImmediateRuntimePolicyEnd {
++                        reason: HlsRuntimeCustomTailReason::SessionOrLeaseExpired,
++                    },
++                )
++                .await;
 +            proxy_sessions.insert(proxy_session_id.clone());
 +        }
 +
