@@ -206,7 +206,7 @@ grep -q 'single_client_user' "${TREE}/backend/src/api/model/active_user_manager.
 grep -q 'Zap-closing connection' "${TREE}/backend/src/api/model/connection_manager.rs"
 grep -q 'Abort upstream TCP immediately on normal release' "${TREE}/backend/src/api/model/active_provider_manager.rs"
 grep -q 'Channel zap / dual-open' "${TREE}/backend/src/api/model/connection_manager.rs"
-grep -q 'X-Forwarded-For may be a chain' "${TREE}/backend/src/auth/fingerprint.rs"
+grep -q 'Take first hop if comma-separated' "${TREE}/backend/src/auth/fingerprint.rs"
 grep -q 'Backend DisconnectedStream is a hard remove' "${TREE}/frontend/src/hooks/use_server_status.rs"
 
 echo "MaxPain patches applied OK (zap-close-old-sessions + Hide Adult; Flussonic/Streams #807 is upstream)"
