@@ -1,11 +1,12 @@
-# MaxPain Hide Adult feature
-# Regenerated against upstream-synced develop tree.
+# MaxPain Hide Adult — per-user adult group/EPG filtering for playlists and XMLTV.
+# Regenerated against MaxPain develop after euzu/tuliprox#807 landed Flussonic/Streams upstream.
+# Apply with: scripts/apply-maxpain-flussonic.sh (Hide Adult only).
 
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
-index 4263a498..38b1420c 100644
+index d2d1ab90..c608769a 100644
 --- a/backend/src/api/api_utils.rs
 +++ b/backend/src/api/api_utils.rs
-@@ -4590,6 +4590,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
+@@ -4586,6 +4586,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
          status: None,
          output_clusters: shared::model::ClusterFlags::all(),
          ui_enabled: false,
@@ -13,7 +14,7 @@ index 4263a498..38b1420c 100644
          comment: None,
          priority: 0,
          soft_connections: 0,
-@@ -9780,6 +9781,7 @@ mod tests {
+@@ -9776,6 +9777,7 @@ mod tests {
              status: None,
              output_clusters: ClusterFlags::all(),
              ui_enabled: true,
@@ -36,10 +37,10 @@ index de5042f4..218ad75d 100644
                          })
                          .count()
 diff --git a/backend/src/api/endpoints/m3u_api.rs b/backend/src/api/endpoints/m3u_api.rs
-index 020c0ed3..653264f9 100644
+index 56a4286d..cb6698f7 100644
 --- a/backend/src/api/endpoints/m3u_api.rs
 +++ b/backend/src/api/endpoints/m3u_api.rs
-@@ -578,8 +578,8 @@ fn resolve_loaded_m3u_catchup(
+@@ -590,8 +590,8 @@ fn resolve_loaded_m3u_catchup(
      Ok((catchup_item, resolved.discriminator))
  }
  
@@ -50,7 +51,7 @@ index 020c0ed3..653264f9 100644
  }
  
  #[allow(clippy::too_many_lines)]
-@@ -816,7 +816,7 @@ async fn m3u_api_catchup(
+@@ -824,7 +824,7 @@ async fn m3u_api_catchup(
              return axum::http::StatusCode::BAD_REQUEST.into_response();
          }
      };
@@ -59,7 +60,7 @@ index 020c0ed3..653264f9 100644
          return axum::http::StatusCode::FORBIDDEN.into_response();
      }
  
-@@ -1095,10 +1095,74 @@ mod tests {
+@@ -1100,10 +1100,74 @@ mod tests {
  
      #[test]
      fn resolved_catchup_item_requires_rechecked_permissions() {
@@ -330,10 +331,10 @@ index e3107f8b..121e3cbc 100644
      async fn xmltv_output_uses_canonical_channel_ids_and_only_lowercases_display_names() {
          let dir = tempdir().expect("temp dir");
 diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints/xtream_api.rs
-index 9c93b8dd..e87a89d5 100644
+index f7666aa0..edc5ce39 100644
 --- a/backend/src/api/endpoints/xtream_api.rs
 +++ b/backend/src/api/endpoints/xtream_api.rs
-@@ -310,7 +310,7 @@ async fn xtream_player_api_stream(
+@@ -311,7 +311,7 @@ async fn xtream_player_api_stream(
      } else {
          user.allows_item_type(pli.item_type)
      };
@@ -342,7 +343,7 @@ index 9c93b8dd..e87a89d5 100644
          if is_hls_manifest_request {
              return hls_custom_video_manifest_response(
                  app_state,
-@@ -1003,7 +1003,9 @@ async fn xtream_player_api_resource(
+@@ -1013,7 +1013,9 @@ async fn xtream_player_api_resource(
          format!("Failed to read xtream item for stream id {req_virtual_id}")
      );
  
@@ -353,7 +354,7 @@ index 9c93b8dd..e87a89d5 100644
          return axum::http::StatusCode::NOT_FOUND.into_response();
      }
  
-@@ -1430,6 +1432,9 @@ async fn xtream_player_api_handle_content_action(
+@@ -1440,6 +1442,9 @@ async fn xtream_player_api_handle_content_action(
                          if let Some(fltr) = filter {
                              categories.retain(|c| fltr.contains(&c.category_id));
                          }
@@ -364,10 +365,10 @@ index 9c93b8dd..e87a89d5 100644
                      }
                      Err(err) => error!("Failed to parse json file {}: {err}", file_path.display()),
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
-index 9055e082..36f817dd 100644
+index 72bab640..5e5d4664 100644
 --- a/backend/src/api/model/active_user_manager.rs
 +++ b/backend/src/api/model/active_user_manager.rs
-@@ -4654,6 +4654,7 @@ mod tests {
+@@ -4613,6 +4613,7 @@ mod tests {
              status: None,
              output_clusters: shared::model::ClusterFlags::all(),
              ui_enabled: true,
@@ -497,507 +498,9 @@ index c9e89dfb..798a0d52 100644
 +        assert!(!user.allows_playlist_item("XXX", Some(&clean)));
 +    }
 +}
-diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/repository/bplustree/migration.rs
-index 7391f0a2..5d3d938f 100644
---- a/backend/src/repository/bplustree/migration.rs
-+++ b/backend/src/repository/bplustree/migration.rs
-@@ -474,16 +474,18 @@ pub fn migrate_bplustree_databases_with_marker(
- fn marker_file_name() -> String { format!("{MARKER_FILE_GUARD_PREFIX}{STORAGE_VERSION}") }
- 
- //
--// The user database has gone through six serialization schemas (MessagePack,
-+// The user database has gone through seven serialization schemas (MessagePack,
- // positional/sequence encoding via rmp_serde):
- //
- //   V1 (Deprecated) – original format, 13 fields, no epg_request_timeshift
- //   V2              – 14 fields, added epg_request_timeshift
- //   V3              – 15 fields, added priority
- //   V4              – 17 fields, added soft_connections and soft_priority
--//   V5 (current)    – 18 fields, added output_clusters
-+//   V5              – 18 fields, added output_clusters
-+//   V6              – 19 fields, added network_access
-+//   V7 (current)    – 20 fields, added hide_adult
- //
--// On first startup after an upgrade the file is still in V1 or V2 format.
-+// On first startup after an upgrade the file is still in an older format.
- // `migrate_user_db_schema` detects this, converts every record in-place, and
- // writes a merge-guard marker so that config-driven user merges cannot
- // overwrite the freshly migrated data.
-@@ -757,6 +759,69 @@ impl StoredApiUserV6 {
-     fn from_v1(v1: &StoredApiUserV1) -> Self { Self::from_v5(&StoredApiUserV5::from_v1(v1)) }
- }
- 
-+// V7 mirror — same layout as user_repository::StoredProxyUserCredentials.
-+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-+#[serde(deny_unknown_fields)]
-+struct StoredApiUserV7 {
-+    pub target: String,
-+    pub username: String,
-+    pub password: String,
-+    pub token: Option<String>,
-+    pub proxy: ProxyType,
-+    pub server: Option<String>,
-+    pub epg_timeshift: Option<String>,
-+    pub epg_request_timeshift: Option<String>,
-+    pub created_at: Option<i64>,
-+    pub exp_date: Option<i64>,
-+    pub max_connections: Option<u32>,
-+    pub status: Option<ProxyUserStatus>,
-+    pub output_clusters: ClusterFlags,
-+    pub ui_enabled: bool,
-+    pub hide_adult: bool,
-+    pub comment: Option<String>,
-+    pub priority: Option<i8>,
-+    pub soft_connections: Option<u16>,
-+    pub soft_priority: Option<i8>,
-+    pub network_access: Option<NetworkAccessDto>,
-+}
-+
-+impl StoredApiUserV7 {
-+    fn from_v6(v6: &StoredApiUserV6) -> Self {
-+        Self {
-+            target: v6.target.clone(),
-+            username: v6.username.clone(),
-+            password: v6.password.clone(),
-+            token: v6.token.clone(),
-+            proxy: v6.proxy,
-+            server: v6.server.clone(),
-+            epg_timeshift: v6.epg_timeshift.clone(),
-+            epg_request_timeshift: v6.epg_request_timeshift.clone(),
-+            created_at: v6.created_at,
-+            exp_date: v6.exp_date,
-+            max_connections: v6.max_connections,
-+            status: v6.status,
-+            output_clusters: v6.output_clusters,
-+            ui_enabled: v6.ui_enabled,
-+            hide_adult: false,
-+            comment: v6.comment.clone(),
-+            priority: v6.priority,
-+            soft_connections: v6.soft_connections,
-+            soft_priority: v6.soft_priority,
-+            network_access: v6.network_access.clone(),
-+        }
-+    }
-+
-+    fn from_v5(v5: &StoredApiUserV5) -> Self { Self::from_v6(&StoredApiUserV6::from_v5(v5)) }
-+
-+    fn from_v4(v4: &StoredApiUserV4) -> Self { Self::from_v6(&StoredApiUserV6::from_v4(v4)) }
-+
-+    fn from_v3(v3: &StoredApiUserV3) -> Self { Self::from_v6(&StoredApiUserV6::from_v3(v3)) }
-+
-+    fn from_v2(v2: &StoredApiUserV2) -> Self { Self::from_v6(&StoredApiUserV6::from_v2(v2)) }
-+
-+    fn from_v1(v1: &StoredApiUserV1) -> Self { Self::from_v6(&StoredApiUserV6::from_v1(v1)) }
-+}
-+
- fn create_user_db_merge_guard(merge_guard_path: &Path) -> io::Result<()> {
-     if !merge_guard_path.exists() {
-         std::fs::write(merge_guard_path, b"")?;
-@@ -773,9 +838,9 @@ fn migrate_legacy_user_schema<SourceV, Map>(
- ) -> io::Result<bool>
- where
-     SourceV: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone,
--    Map: FnMut(SourceV) -> StoredApiUserV6,
-+    Map: FnMut(SourceV) -> StoredApiUserV7,
- {
--    if super::v3::migration::migrate_v2_typed_map::<String, SourceV, StoredApiUserV6, _>(db_path, map).is_err()
-+    if super::v3::migration::migrate_v2_typed_map::<String, SourceV, StoredApiUserV7, _>(db_path, map).is_err()
-     {
-         return Ok(false);
-     }
-@@ -790,26 +855,26 @@ fn migrate_current_user_schema<SourceV, Map>(
- ) -> io::Result<bool>
- where
-     SourceV: for<'de> serde::Deserialize<'de>,
--    Map: Fn(&SourceV) -> StoredApiUserV6,
-+    Map: Fn(&SourceV) -> StoredApiUserV7,
- {
-     let Ok(tree) = BPlusTree::<String, SourceV>::load(db_path) else {
-         return Ok(false);
-     };
--    let mut v6_tree = BPlusTree::new();
-+    let mut v7_tree = BPlusTree::new();
-     for (key, user) in &tree {
--        v6_tree.insert(key.clone(), map(user));
-+        v7_tree.insert(key.clone(), map(user));
-     }
--    v6_tree.store(db_path)?;
-+    v7_tree.store(db_path)?;
-     create_user_db_merge_guard(merge_guard_path)?;
-     Ok(true)
- }
- 
--/// Migrates the user database file from V1-V5 schema to V6 (current) in
-+/// Migrates the user database file from V1-V6 schema to V7 (current) in
- /// place and creates a merge-guard file so config-driven merges are skipped
- /// until the operator explicitly removes it.
- ///
- /// Returns `true` when a migration was performed, `false` when the file was
--/// already in V6 format or did not exist.
-+/// already in V7 format or did not exist.
- fn migrate_user_db_schema(db_path: &Path, merge_guard_path: &Path) -> io::Result<bool> {
-     if !db_path.exists() {
-         return Ok(false);
-@@ -818,31 +883,36 @@ fn migrate_user_db_schema(db_path: &Path, merge_guard_path: &Path) -> io::Result
-     let storage_version = super::v3::migration::storage_version(db_path)?
-         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "user database is not a B+Tree"))?;
-     if storage_version <= 2 {
--        if super::v3::migration::migrate_v2_typed::<String, StoredApiUserV6>(db_path).is_ok() {
-+        if super::v3::migration::migrate_v2_typed::<String, StoredApiUserV7>(db_path).is_ok() {
-             return Ok(false);
-         }
-+        if migrate_legacy_user_schema::<StoredApiUserV6, _>(db_path, merge_guard_path, |user| {
-+            StoredApiUserV7::from_v6(&user)
-+        })? {
-+            return Ok(true);
-+        }
-         if migrate_legacy_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, |user| {
--            StoredApiUserV6::from_v5(&user)
-+            StoredApiUserV7::from_v5(&user)
-         })? {
-             return Ok(true);
-         }
-         if migrate_legacy_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, |user| {
--            StoredApiUserV6::from_v4(&user)
-+            StoredApiUserV7::from_v4(&user)
-         })? {
-             return Ok(true);
-         }
-         if migrate_legacy_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, |user| {
--            StoredApiUserV6::from_v3(&user)
-+            StoredApiUserV7::from_v3(&user)
-         })? {
-             return Ok(true);
-         }
-         if migrate_legacy_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, |user| {
--            StoredApiUserV6::from_v2(&user)
-+            StoredApiUserV7::from_v2(&user)
-         })? {
-             return Ok(true);
-         }
-         if migrate_legacy_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, |user| {
--            StoredApiUserV6::from_v1(&user)
-+            StoredApiUserV7::from_v1(&user)
-         })? {
-             return Ok(true);
-         }
-@@ -858,22 +928,25 @@ fn migrate_user_db_schema(db_path: &Path, merge_guard_path: &Path) -> io::Result
-         ));
-     }
- 
--    if BPlusTree::<String, StoredApiUserV6>::load(db_path).is_ok() {
-+    if BPlusTree::<String, StoredApiUserV7>::load(db_path).is_ok() {
-         return Ok(false);
-     }
--    if migrate_current_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, StoredApiUserV6::from_v5)? {
-+    if migrate_current_user_schema::<StoredApiUserV6, _>(db_path, merge_guard_path, StoredApiUserV7::from_v6)? {
-+        return Ok(true);
-+    }
-+    if migrate_current_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, StoredApiUserV7::from_v5)? {
-         return Ok(true);
-     }
--    if migrate_current_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, StoredApiUserV6::from_v4)? {
-+    if migrate_current_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, StoredApiUserV7::from_v4)? {
-         return Ok(true);
-     }
--    if migrate_current_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, StoredApiUserV6::from_v3)? {
-+    if migrate_current_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, StoredApiUserV7::from_v3)? {
-         return Ok(true);
-     }
--    if migrate_current_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, StoredApiUserV6::from_v2)? {
-+    if migrate_current_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, StoredApiUserV7::from_v2)? {
-         return Ok(true);
-     }
--    if migrate_current_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, StoredApiUserV6::from_v1)? {
-+    if migrate_current_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, StoredApiUserV7::from_v1)? {
-         return Ok(true);
-     }
- 
-diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
-index 6a5d7eb5..89cef580 100644
---- a/backend/src/repository/m3u_playlist_iterator.rs
-+++ b/backend/src/repository/m3u_playlist_iterator.rs
-@@ -267,6 +267,7 @@ impl M3uPlaylistIterator {
-         let target_id = target.id;
-         let proxy_type = user.proxy;
-         let output_clusters = user.output_clusters;
-+        let hide_adult = user.hide_adult;
-         let target_options = target.options.clone();
-         let input_by_name: HashMap<Arc<str>, Arc<crate::model::ConfigInput>> = cfg
-             .sources
-@@ -312,6 +313,15 @@ impl M3uPlaylistIterator {
-                     continue;
-                 }
- 
-+                if hide_adult
-+                    && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
-+                        || crate::model::ProxyUserCredentials::stream_props_marked_adult(
-+                            item.additional_properties.as_ref(),
-+                        ))
-+                {
-+                    continue;
-+                }
-+
-                 if let Some(set) = &filter {
-                     if !set.contains(item.group.as_ref()) {
-                         continue;
-diff --git a/backend/src/repository/mod.rs b/backend/src/repository/mod.rs
-index c903b1dc..c1e68f48 100644
---- a/backend/src/repository/mod.rs
-+++ b/backend/src/repository/mod.rs
-@@ -1,5 +1,6 @@
- mod storage;
- mod target_id_mapping;
-+mod adult_epg_ids;
- mod bplustree;
- mod playlist_repository;
- mod m3u_repository;
-@@ -23,6 +24,7 @@ pub mod stalker_generation_repository;
- 
- pub use storage::*;
- pub use target_id_mapping::*;
-+pub use adult_epg_ids::*;
- pub use bplustree::*;
- pub use playlist_repository::*;
- pub use m3u_repository::*;
-diff --git a/backend/src/repository/user_repository.rs b/backend/src/repository/user_repository.rs
-index 9ecf3b59..85409bb3 100644
---- a/backend/src/repository/user_repository.rs
-+++ b/backend/src/repository/user_repository.rs
-@@ -34,6 +34,7 @@ struct StoredProxyUserCredentials {
-     pub status: Option<ProxyUserStatus>,
-     pub output_clusters: ClusterFlags,
-     pub ui_enabled: bool,
-+    pub hide_adult: bool,
-     pub comment: Option<String>,
-     pub priority: Option<i8>,
-     pub soft_connections: Option<u16>,
-@@ -59,6 +60,7 @@ impl StoredProxyUserCredentials {
-             status: proxy.status,
-             output_clusters: proxy.output_clusters,
-             ui_enabled: proxy.ui_enabled,
-+            hide_adult: proxy.hide_adult,
-             comment: proxy.comment.clone(),
-             priority: if proxy.priority != 0 { Some(proxy.priority) } else { None },
-             soft_connections: if proxy.soft_connections > 0 { Some(proxy.soft_connections) } else { None },
-@@ -82,6 +84,7 @@ impl StoredProxyUserCredentials {
-             status: stored.status,
-             output_clusters: stored.output_clusters,
-             ui_enabled: stored.ui_enabled,
-+            hide_adult: stored.hide_adult,
-             comment: stored.comment.clone(),
-             priority: stored.priority.unwrap_or(0),
-             soft_connections: stored.soft_connections.unwrap_or(0),
-@@ -518,6 +521,7 @@ mod tests {
-             status: Some(status),
-             output_clusters: ClusterFlags::all(),
-             ui_enabled: true,
-+            hide_adult: false,
-             comment: None,
-             priority: 0,
-             soft_connections: 0,
-diff --git a/backend/src/repository/xtream_playlist_iterator.rs b/backend/src/repository/xtream_playlist_iterator.rs
-index 7e68b6e6..c5f61f13 100644
---- a/backend/src/repository/xtream_playlist_iterator.rs
-+++ b/backend/src/repository/xtream_playlist_iterator.rs
-@@ -70,6 +70,7 @@ impl XtreamPlaylistIterator {
-                     })
-                     .collect()
-             });
-+            let hide_adult = user.hide_adult;
- 
-             let xtream_path = xtream_path.clone();
-             let index_path = get_file_path_for_db_index(&xtream_path);
-@@ -105,7 +106,7 @@ impl XtreamPlaylistIterator {
-                         }
-                     };
- 
--                    if !Self::matches_filters(cluster, filter_ids.as_ref(), &item) {
-+                    if !Self::matches_filters(cluster, filter_ids.as_ref(), hide_adult, &item) {
-                         continue;
-                     }
- 
-@@ -141,7 +142,12 @@ impl XtreamPlaylistIterator {
-         }
-     }
- 
--    fn matches_filters(cluster: XtreamCluster, filter_ids: Option<&HashSet<u32>>, item: &XtreamPlaylistItem) -> bool {
-+    fn matches_filters(
-+        cluster: XtreamCluster,
-+        filter_ids: Option<&HashSet<u32>>,
-+        hide_adult: bool,
-+        item: &XtreamPlaylistItem,
-+    ) -> bool {
-         // We can't serve episodes within series
-         if cluster == XtreamCluster::Series
-             && !matches!(item.item_type, PlaylistItemType::SeriesInfo | PlaylistItemType::LocalSeriesInfo)
-@@ -156,6 +162,13 @@ impl XtreamPlaylistIterator {
-             }
-         }
- 
-+        if hide_adult
-+            && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
-+                || crate::model::ProxyUserCredentials::stream_props_marked_adult(item.additional_properties.as_ref()))
-+        {
-+            return false;
-+        }
-+
-         true
-     }
- }
-diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
-index 015aef61..62e8251b 100644
---- a/frontend/public/assets/i18n/ar.json
-+++ b/frontend/public/assets/i18n/ar.json
-@@ -672,6 +672,7 @@
-       "STATUS": "الحالة النشطة أو المعطلة لبيانات اعتماد وكيل المستخدم.",
-       "TOKEN": "رمز API فريد يمكن استخدامه بدلاً من اسم المستخدم/كلمة المرور.",
-       "UI_ENABLED": "إذا كان صحيحًا، يمكن لهذا المستخدم تسجيل الدخول إلى محرر باقة WebUI المبسط (الافتراضي صحيح).",
-+      "HIDE_ADULT": "عند التفعيل، تُخفى فئات وقنوات Adult / 18+ / XXX من قوائم وبث هذا المستخدم.",
-       "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
-     },
-     "RATE_LIMIT_CONFIG": {
-@@ -1549,6 +1550,7 @@
-     "USER_STATUS_TRIAL": "تجريبي",
-     "USER_UI": "واجهة المستخدم",
-     "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
-+    "HIDE_ADULT": "إخفاء Adult",
-     "COMBINE_VIEWS_STATS_STREAMS": "دمج الإحصائيات والبث",
-     "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
-     "USE_OUTPUT": "استخدام المخرج",
-diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
-index 78abbefe..b8adc317 100644
---- a/frontend/public/assets/i18n/en.json
-+++ b/frontend/public/assets/i18n/en.json
-@@ -676,6 +676,7 @@
-       "STATUS": "The active or disabled state of the user proxy credential.",
-       "TOKEN": "Unique API token that can be used instead of username/password.",
-       "UI_ENABLED": "If true, this user can log into the simplified WebUI bouquet editor (default true).",
-+      "HIDE_ADULT": "When enabled, Adult / 18+ / XXX categories and channels are hidden from this user's playlists and streams.",
-       "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
-     },
-     "RATE_LIMIT_CONFIG": {
-@@ -1556,6 +1557,7 @@
-     "USER_STATUS_TRIAL": "Trial",
-     "USER_UI": "User UI",
-     "USER_UI_ENABLED": "User-UI Enabled",
-+    "HIDE_ADULT": "Hide Adult",
-     "COMBINE_VIEWS_STATS_STREAMS": "Combine Stats & Streams",
-     "USE_MEMORY_CACHE": "Mem-Cache",
-     "USE_OUTPUT": "Use output",
-diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
-index 26e3b72a..2e95fb76 100644
---- a/frontend/public/assets/i18n/ru.json
-+++ b/frontend/public/assets/i18n/ru.json
-@@ -633,6 +633,7 @@
-       "STATUS": "Активное или отключенное состояние учетных данных прокси пользователя.",
-       "TOKEN": "Уникальный токен API, который можно использовать вместо имени пользователя/пароля.",
-       "UI_ENABLED": "Если true, этот пользователь может войти в упрощенный редактор букетов WebUI (по умолчанию true).",
-+      "HIDE_ADULT": "Если включено, категории и каналы Adult / 18+ / XXX скрываются из плейлистов и потоков этого пользователя.",
-       "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
-     },
-     "RATE_LIMIT_CONFIG": {
-@@ -1444,6 +1445,7 @@
-     "USER_STATUS_TRIAL": "Пробный",
-     "USER_UI": "Пользовательский UI",
-     "USER_UI_ENABLED": "User-UI включен",
-+    "HIDE_ADULT": "Скрыть Adult",
-     "COMBINE_VIEWS_STATS_STREAMS": "Объединить статистику и потоки",
-     "USE_MEMORY_CACHE": "Mem-кэш",
-     "USE_OUTPUT": "Использовать вывод",
-diff --git a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-index da335508..d2034efa 100644
---- a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-+++ b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-@@ -112,6 +112,7 @@ generate_form_reducer!(
-         SoftPriority => soft_priority: i8,
-         ExpDate => exp_date: Option<i64>,
-         UiEnabled => ui_enabled: bool,
-+        HideAdult => hide_adult: bool,
-         EpgTimeshift => epg_timeshift: Option<String>,
-         EpgRequestTimeshift => epg_request_timeshift: Option<String>,
-         Comment => comment: Option<String>,
-@@ -208,6 +209,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
-                 user.status = Some(ProxyUserStatus::Active);
-                 user.output_clusters = None;
-                 user.ui_enabled = true;
-+                user.hide_adult = false;
-                 let now = Utc::now();
-                 user.created_at = Some(now.timestamp());
-                 let in_one_year = now + Duration::days(DEFAULT_EXPIRATION_DAYS);
-@@ -394,6 +396,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
-             { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_TIMESHIFT"), epg_timeshift, UserFormAction::EpgTimeshift) }
-             { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_REQUEST_TIMESHIFT"), epg_request_timeshift, UserFormAction::EpgRequestTimeshift) }
-             { edit_field_bool!(form_state,  translate.t("LABEL.USER_UI_ENABLED"), ui_enabled, UserFormAction::UiEnabled) }
-+            { edit_field_bool!(form_state,  translate.t("LABEL.HIDE_ADULT"), hide_adult, UserFormAction::HideAdult) }
-             { edit_field_text_option!(form_state,  translate.t("LABEL.COMMENT"), comment, UserFormAction::Comment) }
-             {edit_field_list_option!(allowed_countries, translate.t("LABEL.ALLOWED_COUNTRIES"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_COUNTRIES", translate.t("LABEL.ADD_COUNTRY"), create_country_tag)}
-             {edit_field_list_option!(allowed_networks, translate.t("LABEL.ALLOWED_NETWORKS"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_NETWORKS", translate.t("LABEL.ADD_NETWORK"), create_network_tag)}
-diff --git a/shared/src/model/config/api_user.rs b/shared/src/model/config/api_user.rs
-index ec50b019..613e96a0 100644
---- a/shared/src/model/config/api_user.rs
-+++ b/shared/src/model/config/api_user.rs
-@@ -1,5 +1,7 @@
- use crate::{
--    defaults::{default_as_true, default_user_priority, is_cluster_optional, is_default_user_priority, is_true},
-+    defaults::{
-+        default_as_true, default_user_priority, is_cluster_optional, is_default_user_priority, is_false, is_true,
-+    },
-     error::TuliproxError,
-     model::{ClusterFlags, NetworkAccessDto, ProxyType, ProxyUserStatus, XtreamCluster},
-     utils::{deserialize_timestamp, is_blank_optional_string},
-@@ -39,6 +41,9 @@ pub struct ProxyUserCredentialsDto {
-     pub output_clusters: Option<ClusterFlags>,
-     #[serde(default = "default_as_true", skip_serializing_if = "is_true")]
-     pub ui_enabled: bool,
-+    /// When true, Adult / 18+ / XXX categories and channels are omitted from playlists.
-+    #[serde(default, skip_serializing_if = "is_false")]
-+    pub hide_adult: bool,
-     #[serde(default, skip_serializing_if = "is_blank_optional_string")]
-     pub comment: Option<String>,
-     #[serde(default = "default_user_priority", skip_serializing_if = "is_default_user_priority")]
-@@ -130,6 +135,7 @@ impl Default for ProxyUserCredentialsDto {
-             status: None,
-             output_clusters: None,
-             ui_enabled: default_as_true(),
-+            hide_adult: false,
-             comment: None,
-             priority: default_user_priority(),
-             soft_connections: 0,
-@@ -269,4 +275,31 @@ mod tests {
-                 .is_some_and(|networks| networks.iter().any(|n| n == "192.168.1.0/24")));
-         }
-     }
-+
-+    #[test]
-+    fn proxy_user_credentials_roundtrip_preserves_hide_adult() {
-+        let user = ProxyUserCredentialsDto {
-+            username: "alice".to_string(),
-+            password: "secret".to_string(),
-+            hide_adult: true,
-+            ..ProxyUserCredentialsDto::default()
-+        };
-+
-+        let serialized = serde_json::to_value(&user).expect("user should serialize");
-+        let deserialized: ProxyUserCredentialsDto =
-+            serde_json::from_value(serialized).expect("user should deserialize");
-+
-+        assert!(deserialized.hide_adult);
-+    }
-+
-+    #[test]
-+    fn proxy_user_credentials_default_hides_adult_false() {
-+        let value = serde_json::json!({
-+            "username": "alice",
-+            "password": "secret"
-+        });
-+
-+        let user: ProxyUserCredentialsDto = serde_json::from_value(value).expect("user should deserialize");
-+        assert!(!user.hide_adult);
-+    }
- }
 diff --git a/backend/src/repository/adult_epg_ids.rs b/backend/src/repository/adult_epg_ids.rs
 new file mode 100644
+index 00000000..eb07e5f1
 --- /dev/null
 +++ b/backend/src/repository/adult_epg_ids.rs
 @@ -0,0 +1,361 @@
@@ -1362,3 +865,502 @@ new file mode 100644
 +        assert!(!epg_channel_hidden_by_adult_blocklist(&HashSet::new(), &"mix.case".intern()));
 +    }
 +}
+diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/repository/bplustree/migration.rs
+index 7391f0a2..5d3d938f 100644
+--- a/backend/src/repository/bplustree/migration.rs
++++ b/backend/src/repository/bplustree/migration.rs
+@@ -474,16 +474,18 @@ pub fn migrate_bplustree_databases_with_marker(
+ fn marker_file_name() -> String { format!("{MARKER_FILE_GUARD_PREFIX}{STORAGE_VERSION}") }
+ 
+ //
+-// The user database has gone through six serialization schemas (MessagePack,
++// The user database has gone through seven serialization schemas (MessagePack,
+ // positional/sequence encoding via rmp_serde):
+ //
+ //   V1 (Deprecated) – original format, 13 fields, no epg_request_timeshift
+ //   V2              – 14 fields, added epg_request_timeshift
+ //   V3              – 15 fields, added priority
+ //   V4              – 17 fields, added soft_connections and soft_priority
+-//   V5 (current)    – 18 fields, added output_clusters
++//   V5              – 18 fields, added output_clusters
++//   V6              – 19 fields, added network_access
++//   V7 (current)    – 20 fields, added hide_adult
+ //
+-// On first startup after an upgrade the file is still in V1 or V2 format.
++// On first startup after an upgrade the file is still in an older format.
+ // `migrate_user_db_schema` detects this, converts every record in-place, and
+ // writes a merge-guard marker so that config-driven user merges cannot
+ // overwrite the freshly migrated data.
+@@ -757,6 +759,69 @@ impl StoredApiUserV6 {
+     fn from_v1(v1: &StoredApiUserV1) -> Self { Self::from_v5(&StoredApiUserV5::from_v1(v1)) }
+ }
+ 
++// V7 mirror — same layout as user_repository::StoredProxyUserCredentials.
++#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct StoredApiUserV7 {
++    pub target: String,
++    pub username: String,
++    pub password: String,
++    pub token: Option<String>,
++    pub proxy: ProxyType,
++    pub server: Option<String>,
++    pub epg_timeshift: Option<String>,
++    pub epg_request_timeshift: Option<String>,
++    pub created_at: Option<i64>,
++    pub exp_date: Option<i64>,
++    pub max_connections: Option<u32>,
++    pub status: Option<ProxyUserStatus>,
++    pub output_clusters: ClusterFlags,
++    pub ui_enabled: bool,
++    pub hide_adult: bool,
++    pub comment: Option<String>,
++    pub priority: Option<i8>,
++    pub soft_connections: Option<u16>,
++    pub soft_priority: Option<i8>,
++    pub network_access: Option<NetworkAccessDto>,
++}
++
++impl StoredApiUserV7 {
++    fn from_v6(v6: &StoredApiUserV6) -> Self {
++        Self {
++            target: v6.target.clone(),
++            username: v6.username.clone(),
++            password: v6.password.clone(),
++            token: v6.token.clone(),
++            proxy: v6.proxy,
++            server: v6.server.clone(),
++            epg_timeshift: v6.epg_timeshift.clone(),
++            epg_request_timeshift: v6.epg_request_timeshift.clone(),
++            created_at: v6.created_at,
++            exp_date: v6.exp_date,
++            max_connections: v6.max_connections,
++            status: v6.status,
++            output_clusters: v6.output_clusters,
++            ui_enabled: v6.ui_enabled,
++            hide_adult: false,
++            comment: v6.comment.clone(),
++            priority: v6.priority,
++            soft_connections: v6.soft_connections,
++            soft_priority: v6.soft_priority,
++            network_access: v6.network_access.clone(),
++        }
++    }
++
++    fn from_v5(v5: &StoredApiUserV5) -> Self { Self::from_v6(&StoredApiUserV6::from_v5(v5)) }
++
++    fn from_v4(v4: &StoredApiUserV4) -> Self { Self::from_v6(&StoredApiUserV6::from_v4(v4)) }
++
++    fn from_v3(v3: &StoredApiUserV3) -> Self { Self::from_v6(&StoredApiUserV6::from_v3(v3)) }
++
++    fn from_v2(v2: &StoredApiUserV2) -> Self { Self::from_v6(&StoredApiUserV6::from_v2(v2)) }
++
++    fn from_v1(v1: &StoredApiUserV1) -> Self { Self::from_v6(&StoredApiUserV6::from_v1(v1)) }
++}
++
+ fn create_user_db_merge_guard(merge_guard_path: &Path) -> io::Result<()> {
+     if !merge_guard_path.exists() {
+         std::fs::write(merge_guard_path, b"")?;
+@@ -773,9 +838,9 @@ fn migrate_legacy_user_schema<SourceV, Map>(
+ ) -> io::Result<bool>
+ where
+     SourceV: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone,
+-    Map: FnMut(SourceV) -> StoredApiUserV6,
++    Map: FnMut(SourceV) -> StoredApiUserV7,
+ {
+-    if super::v3::migration::migrate_v2_typed_map::<String, SourceV, StoredApiUserV6, _>(db_path, map).is_err()
++    if super::v3::migration::migrate_v2_typed_map::<String, SourceV, StoredApiUserV7, _>(db_path, map).is_err()
+     {
+         return Ok(false);
+     }
+@@ -790,26 +855,26 @@ fn migrate_current_user_schema<SourceV, Map>(
+ ) -> io::Result<bool>
+ where
+     SourceV: for<'de> serde::Deserialize<'de>,
+-    Map: Fn(&SourceV) -> StoredApiUserV6,
++    Map: Fn(&SourceV) -> StoredApiUserV7,
+ {
+     let Ok(tree) = BPlusTree::<String, SourceV>::load(db_path) else {
+         return Ok(false);
+     };
+-    let mut v6_tree = BPlusTree::new();
++    let mut v7_tree = BPlusTree::new();
+     for (key, user) in &tree {
+-        v6_tree.insert(key.clone(), map(user));
++        v7_tree.insert(key.clone(), map(user));
+     }
+-    v6_tree.store(db_path)?;
++    v7_tree.store(db_path)?;
+     create_user_db_merge_guard(merge_guard_path)?;
+     Ok(true)
+ }
+ 
+-/// Migrates the user database file from V1-V5 schema to V6 (current) in
++/// Migrates the user database file from V1-V6 schema to V7 (current) in
+ /// place and creates a merge-guard file so config-driven merges are skipped
+ /// until the operator explicitly removes it.
+ ///
+ /// Returns `true` when a migration was performed, `false` when the file was
+-/// already in V6 format or did not exist.
++/// already in V7 format or did not exist.
+ fn migrate_user_db_schema(db_path: &Path, merge_guard_path: &Path) -> io::Result<bool> {
+     if !db_path.exists() {
+         return Ok(false);
+@@ -818,31 +883,36 @@ fn migrate_user_db_schema(db_path: &Path, merge_guard_path: &Path) -> io::Result
+     let storage_version = super::v3::migration::storage_version(db_path)?
+         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "user database is not a B+Tree"))?;
+     if storage_version <= 2 {
+-        if super::v3::migration::migrate_v2_typed::<String, StoredApiUserV6>(db_path).is_ok() {
++        if super::v3::migration::migrate_v2_typed::<String, StoredApiUserV7>(db_path).is_ok() {
+             return Ok(false);
+         }
++        if migrate_legacy_user_schema::<StoredApiUserV6, _>(db_path, merge_guard_path, |user| {
++            StoredApiUserV7::from_v6(&user)
++        })? {
++            return Ok(true);
++        }
+         if migrate_legacy_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, |user| {
+-            StoredApiUserV6::from_v5(&user)
++            StoredApiUserV7::from_v5(&user)
+         })? {
+             return Ok(true);
+         }
+         if migrate_legacy_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, |user| {
+-            StoredApiUserV6::from_v4(&user)
++            StoredApiUserV7::from_v4(&user)
+         })? {
+             return Ok(true);
+         }
+         if migrate_legacy_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, |user| {
+-            StoredApiUserV6::from_v3(&user)
++            StoredApiUserV7::from_v3(&user)
+         })? {
+             return Ok(true);
+         }
+         if migrate_legacy_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, |user| {
+-            StoredApiUserV6::from_v2(&user)
++            StoredApiUserV7::from_v2(&user)
+         })? {
+             return Ok(true);
+         }
+         if migrate_legacy_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, |user| {
+-            StoredApiUserV6::from_v1(&user)
++            StoredApiUserV7::from_v1(&user)
+         })? {
+             return Ok(true);
+         }
+@@ -858,22 +928,25 @@ fn migrate_user_db_schema(db_path: &Path, merge_guard_path: &Path) -> io::Result
+         ));
+     }
+ 
+-    if BPlusTree::<String, StoredApiUserV6>::load(db_path).is_ok() {
++    if BPlusTree::<String, StoredApiUserV7>::load(db_path).is_ok() {
+         return Ok(false);
+     }
+-    if migrate_current_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, StoredApiUserV6::from_v5)? {
++    if migrate_current_user_schema::<StoredApiUserV6, _>(db_path, merge_guard_path, StoredApiUserV7::from_v6)? {
++        return Ok(true);
++    }
++    if migrate_current_user_schema::<StoredApiUserV5, _>(db_path, merge_guard_path, StoredApiUserV7::from_v5)? {
+         return Ok(true);
+     }
+-    if migrate_current_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, StoredApiUserV6::from_v4)? {
++    if migrate_current_user_schema::<StoredApiUserV4, _>(db_path, merge_guard_path, StoredApiUserV7::from_v4)? {
+         return Ok(true);
+     }
+-    if migrate_current_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, StoredApiUserV6::from_v3)? {
++    if migrate_current_user_schema::<StoredApiUserV3, _>(db_path, merge_guard_path, StoredApiUserV7::from_v3)? {
+         return Ok(true);
+     }
+-    if migrate_current_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, StoredApiUserV6::from_v2)? {
++    if migrate_current_user_schema::<StoredApiUserV2, _>(db_path, merge_guard_path, StoredApiUserV7::from_v2)? {
+         return Ok(true);
+     }
+-    if migrate_current_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, StoredApiUserV6::from_v1)? {
++    if migrate_current_user_schema::<StoredApiUserV1, _>(db_path, merge_guard_path, StoredApiUserV7::from_v1)? {
+         return Ok(true);
+     }
+ 
+diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
+index 91bea550..04b6bdb3 100644
+--- a/backend/src/repository/m3u_playlist_iterator.rs
++++ b/backend/src/repository/m3u_playlist_iterator.rs
+@@ -277,6 +277,7 @@ impl M3uPlaylistIterator {
+         let target_id = target.id;
+         let proxy_type = user.proxy;
+         let output_clusters = user.output_clusters;
++        let hide_adult = user.hide_adult;
+         let target_options = target.options.clone();
+         let input_by_name: HashMap<Arc<str>, Arc<crate::model::ConfigInput>> =
+             cfg.sources.load().inputs.iter().map(|input| (Arc::clone(&input.name), Arc::clone(input))).collect();
+@@ -317,6 +318,15 @@ impl M3uPlaylistIterator {
+                     continue;
+                 }
+ 
++                if hide_adult
++                    && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
++                        || crate::model::ProxyUserCredentials::stream_props_marked_adult(
++                            item.additional_properties.as_ref(),
++                        ))
++                {
++                    continue;
++                }
++
+                 if let Some(set) = &filter {
+                     if !set.contains(item.group.as_ref()) {
+                         continue;
+diff --git a/backend/src/repository/mod.rs b/backend/src/repository/mod.rs
+index c903b1dc..c1e68f48 100644
+--- a/backend/src/repository/mod.rs
++++ b/backend/src/repository/mod.rs
+@@ -1,5 +1,6 @@
+ mod storage;
+ mod target_id_mapping;
++mod adult_epg_ids;
+ mod bplustree;
+ mod playlist_repository;
+ mod m3u_repository;
+@@ -23,6 +24,7 @@ pub mod stalker_generation_repository;
+ 
+ pub use storage::*;
+ pub use target_id_mapping::*;
++pub use adult_epg_ids::*;
+ pub use bplustree::*;
+ pub use playlist_repository::*;
+ pub use m3u_repository::*;
+diff --git a/backend/src/repository/user_repository.rs b/backend/src/repository/user_repository.rs
+index 9ecf3b59..85409bb3 100644
+--- a/backend/src/repository/user_repository.rs
++++ b/backend/src/repository/user_repository.rs
+@@ -34,6 +34,7 @@ struct StoredProxyUserCredentials {
+     pub status: Option<ProxyUserStatus>,
+     pub output_clusters: ClusterFlags,
+     pub ui_enabled: bool,
++    pub hide_adult: bool,
+     pub comment: Option<String>,
+     pub priority: Option<i8>,
+     pub soft_connections: Option<u16>,
+@@ -59,6 +60,7 @@ impl StoredProxyUserCredentials {
+             status: proxy.status,
+             output_clusters: proxy.output_clusters,
+             ui_enabled: proxy.ui_enabled,
++            hide_adult: proxy.hide_adult,
+             comment: proxy.comment.clone(),
+             priority: if proxy.priority != 0 { Some(proxy.priority) } else { None },
+             soft_connections: if proxy.soft_connections > 0 { Some(proxy.soft_connections) } else { None },
+@@ -82,6 +84,7 @@ impl StoredProxyUserCredentials {
+             status: stored.status,
+             output_clusters: stored.output_clusters,
+             ui_enabled: stored.ui_enabled,
++            hide_adult: stored.hide_adult,
+             comment: stored.comment.clone(),
+             priority: stored.priority.unwrap_or(0),
+             soft_connections: stored.soft_connections.unwrap_or(0),
+@@ -518,6 +521,7 @@ mod tests {
+             status: Some(status),
+             output_clusters: ClusterFlags::all(),
+             ui_enabled: true,
++            hide_adult: false,
+             comment: None,
+             priority: 0,
+             soft_connections: 0,
+diff --git a/backend/src/repository/xtream_playlist_iterator.rs b/backend/src/repository/xtream_playlist_iterator.rs
+index 7e68b6e6..c5f61f13 100644
+--- a/backend/src/repository/xtream_playlist_iterator.rs
++++ b/backend/src/repository/xtream_playlist_iterator.rs
+@@ -70,6 +70,7 @@ impl XtreamPlaylistIterator {
+                     })
+                     .collect()
+             });
++            let hide_adult = user.hide_adult;
+ 
+             let xtream_path = xtream_path.clone();
+             let index_path = get_file_path_for_db_index(&xtream_path);
+@@ -105,7 +106,7 @@ impl XtreamPlaylistIterator {
+                         }
+                     };
+ 
+-                    if !Self::matches_filters(cluster, filter_ids.as_ref(), &item) {
++                    if !Self::matches_filters(cluster, filter_ids.as_ref(), hide_adult, &item) {
+                         continue;
+                     }
+ 
+@@ -141,7 +142,12 @@ impl XtreamPlaylistIterator {
+         }
+     }
+ 
+-    fn matches_filters(cluster: XtreamCluster, filter_ids: Option<&HashSet<u32>>, item: &XtreamPlaylistItem) -> bool {
++    fn matches_filters(
++        cluster: XtreamCluster,
++        filter_ids: Option<&HashSet<u32>>,
++        hide_adult: bool,
++        item: &XtreamPlaylistItem,
++    ) -> bool {
+         // We can't serve episodes within series
+         if cluster == XtreamCluster::Series
+             && !matches!(item.item_type, PlaylistItemType::SeriesInfo | PlaylistItemType::LocalSeriesInfo)
+@@ -156,6 +162,13 @@ impl XtreamPlaylistIterator {
+             }
+         }
+ 
++        if hide_adult
++            && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
++                || crate::model::ProxyUserCredentials::stream_props_marked_adult(item.additional_properties.as_ref()))
++        {
++            return false;
++        }
++
+         true
+     }
+ }
+diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
+index 015aef61..62e8251b 100644
+--- a/frontend/public/assets/i18n/ar.json
++++ b/frontend/public/assets/i18n/ar.json
+@@ -672,6 +672,7 @@
+       "STATUS": "الحالة النشطة أو المعطلة لبيانات اعتماد وكيل المستخدم.",
+       "TOKEN": "رمز API فريد يمكن استخدامه بدلاً من اسم المستخدم/كلمة المرور.",
+       "UI_ENABLED": "إذا كان صحيحًا، يمكن لهذا المستخدم تسجيل الدخول إلى محرر باقة WebUI المبسط (الافتراضي صحيح).",
++      "HIDE_ADULT": "عند التفعيل، تُخفى فئات وقنوات Adult / 18+ / XXX من قوائم وبث هذا المستخدم.",
+       "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
+     },
+     "RATE_LIMIT_CONFIG": {
+@@ -1549,6 +1550,7 @@
+     "USER_STATUS_TRIAL": "تجريبي",
+     "USER_UI": "واجهة المستخدم",
+     "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
++    "HIDE_ADULT": "إخفاء Adult",
+     "COMBINE_VIEWS_STATS_STREAMS": "دمج الإحصائيات والبث",
+     "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
+     "USE_OUTPUT": "استخدام المخرج",
+diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
+index 78abbefe..b8adc317 100644
+--- a/frontend/public/assets/i18n/en.json
++++ b/frontend/public/assets/i18n/en.json
+@@ -676,6 +676,7 @@
+       "STATUS": "The active or disabled state of the user proxy credential.",
+       "TOKEN": "Unique API token that can be used instead of username/password.",
+       "UI_ENABLED": "If true, this user can log into the simplified WebUI bouquet editor (default true).",
++      "HIDE_ADULT": "When enabled, Adult / 18+ / XXX categories and channels are hidden from this user's playlists and streams.",
+       "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
+     },
+     "RATE_LIMIT_CONFIG": {
+@@ -1556,6 +1557,7 @@
+     "USER_STATUS_TRIAL": "Trial",
+     "USER_UI": "User UI",
+     "USER_UI_ENABLED": "User-UI Enabled",
++    "HIDE_ADULT": "Hide Adult",
+     "COMBINE_VIEWS_STATS_STREAMS": "Combine Stats & Streams",
+     "USE_MEMORY_CACHE": "Mem-Cache",
+     "USE_OUTPUT": "Use output",
+diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
+index 26e3b72a..2e95fb76 100644
+--- a/frontend/public/assets/i18n/ru.json
++++ b/frontend/public/assets/i18n/ru.json
+@@ -633,6 +633,7 @@
+       "STATUS": "Активное или отключенное состояние учетных данных прокси пользователя.",
+       "TOKEN": "Уникальный токен API, который можно использовать вместо имени пользователя/пароля.",
+       "UI_ENABLED": "Если true, этот пользователь может войти в упрощенный редактор букетов WebUI (по умолчанию true).",
++      "HIDE_ADULT": "Если включено, категории и каналы Adult / 18+ / XXX скрываются из плейлистов и потоков этого пользователя.",
+       "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
+     },
+     "RATE_LIMIT_CONFIG": {
+@@ -1444,6 +1445,7 @@
+     "USER_STATUS_TRIAL": "Пробный",
+     "USER_UI": "Пользовательский UI",
+     "USER_UI_ENABLED": "User-UI включен",
++    "HIDE_ADULT": "Скрыть Adult",
+     "COMBINE_VIEWS_STATS_STREAMS": "Объединить статистику и потоки",
+     "USE_MEMORY_CACHE": "Mem-кэш",
+     "USE_OUTPUT": "Использовать вывод",
+diff --git a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
+index da335508..d2034efa 100644
+--- a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
++++ b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
+@@ -112,6 +112,7 @@ generate_form_reducer!(
+         SoftPriority => soft_priority: i8,
+         ExpDate => exp_date: Option<i64>,
+         UiEnabled => ui_enabled: bool,
++        HideAdult => hide_adult: bool,
+         EpgTimeshift => epg_timeshift: Option<String>,
+         EpgRequestTimeshift => epg_request_timeshift: Option<String>,
+         Comment => comment: Option<String>,
+@@ -208,6 +209,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
+                 user.status = Some(ProxyUserStatus::Active);
+                 user.output_clusters = None;
+                 user.ui_enabled = true;
++                user.hide_adult = false;
+                 let now = Utc::now();
+                 user.created_at = Some(now.timestamp());
+                 let in_one_year = now + Duration::days(DEFAULT_EXPIRATION_DAYS);
+@@ -394,6 +396,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
+             { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_TIMESHIFT"), epg_timeshift, UserFormAction::EpgTimeshift) }
+             { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_REQUEST_TIMESHIFT"), epg_request_timeshift, UserFormAction::EpgRequestTimeshift) }
+             { edit_field_bool!(form_state,  translate.t("LABEL.USER_UI_ENABLED"), ui_enabled, UserFormAction::UiEnabled) }
++            { edit_field_bool!(form_state,  translate.t("LABEL.HIDE_ADULT"), hide_adult, UserFormAction::HideAdult) }
+             { edit_field_text_option!(form_state,  translate.t("LABEL.COMMENT"), comment, UserFormAction::Comment) }
+             {edit_field_list_option!(allowed_countries, translate.t("LABEL.ALLOWED_COUNTRIES"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_COUNTRIES", translate.t("LABEL.ADD_COUNTRY"), create_country_tag)}
+             {edit_field_list_option!(allowed_networks, translate.t("LABEL.ALLOWED_NETWORKS"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_NETWORKS", translate.t("LABEL.ADD_NETWORK"), create_network_tag)}
+diff --git a/shared/src/model/config/api_user.rs b/shared/src/model/config/api_user.rs
+index ec50b019..613e96a0 100644
+--- a/shared/src/model/config/api_user.rs
++++ b/shared/src/model/config/api_user.rs
+@@ -1,5 +1,7 @@
+ use crate::{
+-    defaults::{default_as_true, default_user_priority, is_cluster_optional, is_default_user_priority, is_true},
++    defaults::{
++        default_as_true, default_user_priority, is_cluster_optional, is_default_user_priority, is_false, is_true,
++    },
+     error::TuliproxError,
+     model::{ClusterFlags, NetworkAccessDto, ProxyType, ProxyUserStatus, XtreamCluster},
+     utils::{deserialize_timestamp, is_blank_optional_string},
+@@ -39,6 +41,9 @@ pub struct ProxyUserCredentialsDto {
+     pub output_clusters: Option<ClusterFlags>,
+     #[serde(default = "default_as_true", skip_serializing_if = "is_true")]
+     pub ui_enabled: bool,
++    /// When true, Adult / 18+ / XXX categories and channels are omitted from playlists.
++    #[serde(default, skip_serializing_if = "is_false")]
++    pub hide_adult: bool,
+     #[serde(default, skip_serializing_if = "is_blank_optional_string")]
+     pub comment: Option<String>,
+     #[serde(default = "default_user_priority", skip_serializing_if = "is_default_user_priority")]
+@@ -130,6 +135,7 @@ impl Default for ProxyUserCredentialsDto {
+             status: None,
+             output_clusters: None,
+             ui_enabled: default_as_true(),
++            hide_adult: false,
+             comment: None,
+             priority: default_user_priority(),
+             soft_connections: 0,
+@@ -269,4 +275,31 @@ mod tests {
+                 .is_some_and(|networks| networks.iter().any(|n| n == "192.168.1.0/24")));
+         }
+     }
++
++    #[test]
++    fn proxy_user_credentials_roundtrip_preserves_hide_adult() {
++        let user = ProxyUserCredentialsDto {
++            username: "alice".to_string(),
++            password: "secret".to_string(),
++            hide_adult: true,
++            ..ProxyUserCredentialsDto::default()
++        };
++
++        let serialized = serde_json::to_value(&user).expect("user should serialize");
++        let deserialized: ProxyUserCredentialsDto =
++            serde_json::from_value(serialized).expect("user should deserialize");
++
++        assert!(deserialized.hide_adult);
++    }
++
++    #[test]
++    fn proxy_user_credentials_default_hides_adult_false() {
++        let value = serde_json::json!({
++            "username": "alice",
++            "password": "secret"
++        });
++
++        let user: ProxyUserCredentialsDto = serde_json::from_value(value).expect("user should deserialize");
++        assert!(!user.hide_adult);
++    }
+ }

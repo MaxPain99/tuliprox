@@ -1,14 +1,14 @@
 #!/bin/bash
-# Apply MaxPain tuliprox patches (Flussonic catchup enhancements + Hide Adult).
-# Regenerated against upstream euzu/develop (synced tip). Used by build.yml + docker-build.yml.
+# Apply MaxPain tuliprox patches for Release/Docker builds.
+#
+# Upstream euzu/tuliprox#807 landed Flussonic/BitTV archive catchup + Streams sticky panel.
+# This script now applies only Hide Adult. The flussonic patch file is kept as a stub.
 #
 # Usage:
 #   ./scripts/apply-maxpain-flussonic.sh [TREE]
 #   TULIPROX_ROOT=/path/to/tuliprox ./scripts/apply-maxpain-flussonic.sh
 #
-# Note: EPG url-tvg and EXTVLCOPT user-agent are now upstream in v3.3.74+.
-# Windows build compat landed upstream in v3.3.87 (#806) — no longer patched here.
-# Patches: Flussonic catchup deltas, Hide Adult.
+# Note: EPG url-tvg, EXTVLCOPT, Windows #806, and Flussonic/Streams sticky (#807) are upstream.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +16,6 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TREE="$(cd "${1:-${TULIPROX_ROOT:-${ROOT_DIR}}}" && pwd)"
 
 PATCHES=(
-  "m3u-flussonic-tivimate.patch"
   "user-hide-adult.patch"
 )
 
@@ -44,7 +43,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from pathlib import Path
 
 body_path = Path(os.environ["PATCH_BODY"])
@@ -160,7 +158,7 @@ apply_one_patch() {
   elif command -v patch >/dev/null 2>&1; then
     apply_with_patch
   elif command -v python3 >/dev/null 2>&1; then
-    echo "git/patch missing — using embedded Python applicator"
+    echo "git/patch missing - using embedded Python applicator"
     apply_with_python
   else
     echo "ERROR: need git, patch, or python3 to apply the patch" >&2
@@ -172,42 +170,26 @@ for name in "${PATCHES[@]}"; do
   apply_one_patch "${ROOT_DIR}/patches/${name}"
 done
 
-# Sanity checks (upstream Windows #806 + MaxPain patches)
+# Sanity: #807 Flussonic/Streams sticky is upstream (do not re-apply).
 grep -q 'ProcessHandle' "${TREE}/backend/src/api/sys_usage.rs"
 grep -q 'M3U_APPEND_MODE_DEFAULT_TEMPLATE' "${TREE}/backend/src/iptv/m3u/catchup.rs"
 grep -q 'append_unified_catchup_type_attributes' "${TREE}/shared/src/model/playlist.rs"
-grep -q 'append_player_type' "${TREE}/shared/src/model/stream_properties.rs"
+grep -q 'Prefer `catchup-type` when both are set' "${TREE}/shared/src/model/stream_properties.rs"
 grep -q 'resolve_leaked_hls_relative_origin' "${TREE}/backend/src/api/endpoints/hls_api.rs"
-grep -q 'hls_api_stream_leaked_relative' "${TREE}/backend/src/api/endpoints/hls_api.rs"
-grep -q '{*token}' "${TREE}/backend/src/api/endpoints/hls_api.rs"
-grep -q 'm3u_catchup_epg_reference_from_session_token' "${TREE}/backend/src/api/endpoints/hls_api.rs"
-grep -q 'is_archive_playback' "${TREE}/backend/src/api/endpoints/hls_api.rs"
-grep -q 'epg_reference_ts_from_date_tree_path' "${TREE}/backend/src/api/endpoints/hls_api.rs"
-grep -q 'looks_like_archive_media_path' "${TREE}/backend/src/api/endpoints/hls_api.rs"
-grep -q 'session_token_hint' "${TREE}/backend/src/api/endpoints/hls_api.rs"
-grep -q 'Some(session_key.as_str())' "${TREE}/backend/src/api/endpoints/m3u_api.rs"
-grep -q 'Some(session_key.as_str())' "${TREE}/backend/src/api/endpoints/xtream_api.rs"
-grep -q 'find_latest_session_for_virtual_id' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'is_sticky_session_stream' "${TREE}/frontend/src/hooks/use_server_status.rs"
-grep -q 'Connections(0) often arrives before Disconnected' "${TREE}/frontend/src/hooks/use_server_status.rs"
-grep -q 'Backend session TTL expiry' "${TREE}/frontend/src/hooks/use_server_status.rs"
-grep -q 'prune_zapped_preserved_streams' "${TREE}/frontend/src/hooks/use_server_status.rs"
-grep -q 'stream_display_key' "${TREE}/frontend/src/app/components/dashboard/stream_display/mod.rs"
 grep -q 'panel_streams' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'panel_streams' "${TREE}/backend/src/api/endpoints/v1_api.rs"
-grep -q 'Catchup-token Live/.ts segment sockets must preserve' "${TREE}/backend/src/api/model/active_user_manager.rs"
+grep -q 'is_sticky_session_stream' "${TREE}/frontend/src/hooks/use_server_status.rs"
+grep -q 'prune_zapped_preserved_streams' "${TREE}/frontend/src/hooks/use_server_status.rs"
 grep -q 'overflow-y: auto' "${TREE}/frontend/scss/app/components/dashboard/_streams_view.scss"
-grep -q 'Soft-preserve is for segment gaps only' "${TREE}/frontend/src/app/components/dashboard/stream_display/helpers.rs"
-grep -q 'Trust backend `panel_streams` as authoritative' "${TREE}/frontend/src/hooks/use_server_status.rs"
-grep -q 'Prefer `catchup-type` when both are set' "${TREE}/shared/src/model/stream_properties.rs"
-grep -q 'playlist_item_allows_flussonic_archive' "${TREE}/backend/src/api/endpoints/m3u_api.rs"
-grep -q 'BitTV rows often have timeshift' "${TREE}/backend/src/repository/m3u_playlist_iterator.rs"
+
+# Sanity: Hide Adult patch applied.
 grep -q 'hide_adult' "${TREE}/shared/src/model/config/api_user.rs"
 grep -q 'is_adult_group' "${TREE}/backend/src/model/config/api_user.rs"
 grep -q 'StoredApiUserV7' "${TREE}/backend/src/repository/bplustree/migration.rs"
 grep -q 'adult_epg_id_blocklist' "${TREE}/backend/src/repository/adult_epg_ids.rs"
 grep -q 'HIDE_ADULT' "${TREE}/frontend/src/app/components/userlist/proxy_user_credentials_form.rs"
 grep -q 'adult_epg_id_blocklist' "${TREE}/backend/src/api/endpoints/xmltv_api.rs"
+grep -q 'let hide_adult = user.hide_adult' "${TREE}/backend/src/repository/m3u_playlist_iterator.rs"
 
-echo "MaxPain patches applied OK (Flussonic catchup deltas + Hide Adult)"
-echo "Rebuild tuliprox and refresh playlists. Note: EPG url-tvg, EXTVLCOPT, Windows compat are upstream."
+echo "MaxPain patches applied OK (Hide Adult only; Flussonic/Streams #807 is upstream)"
+echo "Rebuild tuliprox and refresh playlists."

@@ -166,13 +166,13 @@ jobs:
           fi
 
       # Apply after the version commit so patched sources never land on develop.
-      # Without this step Docker images are stock upstream and archive Streams sticky fixes never ship.
+      # Hide Adult stays patch-based; Flussonic/Streams sticky landed upstream in #807.
       - name: Apply MaxPain patches
         run: |
           set -euo pipefail
           chmod +x scripts/apply-maxpain-flussonic.sh
           ./scripts/apply-maxpain-flussonic.sh .
-          echo "Applied: m3u-flussonic-tivimate.patch, user-hide-adult.patch"
+          echo "Applied: user-hide-adult.patch (Flussonic/Streams #807 is upstream)"
 
       - name: Build and push Docker images
         env:
