@@ -204,6 +204,8 @@ grep -q 'other_active_by_client' "${TREE}/backend/src/api/model/active_user_mana
 grep -q 'normalize_client_ip' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'single_client_user' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'release_streamless_counted_leases_for_zap' "${TREE}/backend/src/api/model/active_user_manager.rs"
+grep -q 'client_has_panel_stream' "${TREE}/backend/src/api/model/active_user_manager.rs"
+grep -q 'zap_keep_channel_does_not_sweep_soft_preserved_hls_gap_as_ghost' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'Double-increment left ghost' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'Zap-closing connection' "${TREE}/backend/src/api/model/connection_manager.rs"
 grep -q 'Abort upstream TCP immediately on normal release' "${TREE}/backend/src/api/model/active_provider_manager.rs"
