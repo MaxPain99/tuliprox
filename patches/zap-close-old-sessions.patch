@@ -1,11 +1,11 @@
 # Close soft-preserved / HLS-origin sessions for other channels on Activate (zap).
 # After #807 soft-preserve, flipping channels left adaptive/HLS/Catchup sessions and
-# provider TCP until TTL. Nuclear close (3.3.105):
+# provider TCP until TTL. Nuclear close + ghost lease fix (3.3.107):
 # - terminate other virtual_ids for same user (single-client or matching IP)
-# - auto-close on update_connection
-# - cancel_token on provider release_connection (abort upstream TCP)
-# - refuse soft-preserve when another channel is already active
-# - tear down HLS origin leases; hard-remove Streams Disconnected*
+# - release streamless counted leases (empty Streams + nonzero connections)
+# - auto-close on update_connection; cancel_token on provider release
+# - no double-increment on preserved HLS reactivate
+# - hard-remove Streams Disconnected*
 # Apply BEFORE user-hide-adult.patch.
 
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
@@ -224,7 +224,21 @@ diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/mode
                                  if let Some(entry) = self.build_preserved_stream_expiry(
                                      username,
                                      &stream_info,
-@@ -2534,6 +2550,276 @@
+@@ -1916,10 +1932,9 @@
+         if admission.permission == UserConnectionPermission::Allowed {
+             let session = &mut connection_data.sessions[session_index];
+             Self::update_session_admission(session, admission.permission, Some(kind));
+-            if has_preserved {
+-                connection_data.increment_kind(kind);
+-            }
+-        }
++        }
++        // Do not increment for preserved streams here: `update_connection` already increments
++        // on `was_preserved` reactivate. Double-increment left ghost `active_user_connections`.
+         if has_preserved {
+             return ConnectionAdmission { permission: UserConnectionPermission::Exhausted, kind: admission.kind };
+         }
+@@ -2534,6 +2549,385 @@
          debug!("GraceActive expired for session {token} in {username}, released {removed_count} streams");
      }
  
@@ -374,7 +388,49 @@ diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/mode
 +                }
 +            }
 +
-+            if terminated.is_empty() {
++            // Counted UserSession leases without an active StreamInfo row (ghost connections).
++            // Must run even when tokens_to_remove / orphans were empty — zap can drop preserved
++            // rows without emitting Connections, leaving streamless Active leases behind.
++            let (streamless_changed, streamless_terminated) = Self::release_streamless_counted_leases_for_zap(
++                connection_data,
++                client_ip,
++                client_ip_addr,
++                &normalized_client_ip,
++                client_fingerprint,
++                keep_virtual_id,
++                single_client_user,
++            );
++            connection_changed |= streamless_changed;
++            terminated.extend(streamless_terminated);
++
++            // Belt-and-suspenders: if this client has no live (non-preserved) streams left but the
++            // connection counter is still elevated, force-release any remaining streamless counted
++            // leases for the matched client / single-client user.
++            let client_has_live_stream = connection_data.streams.iter().any(|stream| {
++                !stream.preserved
++                    && (single_client_user
++                        || Self::stream_matches_client_ip(
++                            stream,
++                            client_ip,
++                            client_ip_addr,
++                            &normalized_client_ip,
++                        ))
++            });
++            if !client_has_live_stream && connection_data.connections > 0 {
++                let (extra_changed, extra_terminated) = Self::release_streamless_counted_leases_for_zap(
++                    connection_data,
++                    client_ip,
++                    client_ip_addr,
++                    &normalized_client_ip,
++                    client_fingerprint,
++                    keep_virtual_id,
++                    single_client_user,
++                );
++                connection_changed |= extra_changed;
++                terminated.extend(extra_terminated);
++            }
++
++            if terminated.is_empty() && !connection_changed {
 +                return Vec::new();
 +            }
 +
@@ -404,6 +460,73 @@ diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/mode
 +            );
 +        }
 +        terminated
++    }
++
++    /// Release counted leases that have no active (non-preserved) StreamInfo row.
++    ///
++    /// Zap can remove preserved stream rows without clearing the corresponding Active /
++    /// GraceActive session lease, leaving ghost `active_user_connections`. Includes
++    /// `keep_virtual_id` sessions when they are streamless ghosts (unlike the other-channel
++    /// session sweep, which skips keep_virtual_id).
++    fn release_streamless_counted_leases_for_zap(
++        connection_data: &mut UserConnectionData,
++        client_ip: &str,
++        client_ip_addr: Option<IpAddr>,
++        normalized_client_ip: &str,
++        client_fingerprint: Option<&str>,
++        keep_virtual_id: u32,
++        single_client_user: bool,
++    ) -> (bool, Vec<(String, Vec<SocketAddr>, Vec<(SocketAddr, u32)>)>) {
++        let _ = keep_virtual_id; // intentionally not excluded — ghost keep-channel leases too
++        let tokens: Vec<String> = connection_data
++            .sessions
++            .iter()
++            .filter(|session| {
++                session.lifecycle.is_counted()
++                    && !Self::session_has_active_stream(connection_data, session.token.as_str())
++                    && (single_client_user
++                        || Self::session_matches_client(
++                            session,
++                            &connection_data.streams,
++                            client_ip,
++                            client_ip_addr,
++                            normalized_client_ip,
++                            client_fingerprint,
++                        ))
++            })
++            .map(|session| session.token.clone())
++            .collect();
++
++        let mut connection_changed = false;
++        let mut terminated = Vec::with_capacity(tokens.len());
++
++        for token in tokens {
++            let Some(session_index) = connection_data.sessions.iter().position(|s| s.token == token) else {
++                continue;
++            };
++
++            let kind = connection_data.sessions[session_index]
++                .connection_kind
++                .unwrap_or(ConnectionKind::Normal);
++            let mut addrs = Vec::new();
++            let session_addr = connection_data.sessions[session_index].addr;
++            if !session_addr.ip().is_unspecified() {
++                addrs.push(session_addr);
++            }
++            for addr in &connection_data.sessions[session_index].active_addrs {
++                if !addrs.contains(addr) {
++                    addrs.push(*addr);
++                }
++            }
++
++            connection_data.decrement_kind(kind);
++            connection_changed = true;
++            Self::clear_session_counted_without_stream(connection_data, &token);
++            connection_data.sessions.swap_remove(session_index);
++            terminated.push((token, addrs, Vec::new()));
++        }
++
++        (connection_changed, terminated)
 +    }
 +
 +    fn parse_client_ip(client_ip: &str) -> Option<IpAddr> {
@@ -501,7 +624,7 @@ diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/mode
      /// Terminates the session and all associated streams for a playback.
      ///
      /// This is the explicit `Terminate` path from the playback state machine:
-@@ -3960,6 +4246,346 @@
+@@ -3960,6 +4354,540 @@
          assert!(connection_data.sessions.iter().all(|session| session.token != token));
      }
  
@@ -842,6 +965,200 @@ diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/mode
 +                .iter()
 +                .all(|stream| stream.channel.virtual_id == 9302),
 +            "only keep virtual_id streams should remain"
++        );
++    }
++
++    /// Ghost Active counted leases with no StreamInfo must be swept on zap even when
++    /// `tokens_to_remove` finds no other-channel session with streams.
++    #[tokio::test]
++    async fn zap_activate_releases_streamless_counted_ghost_leases() {
++        let config = Config::default();
++        let geoip = Arc::new(ArcSwapOption::<GeoIp>::default());
++        let event_manager = Arc::new(EventManager::new());
++        let manager = ActiveUserManager::new(&config, &geoip, &event_manager);
++
++        let addr_a: SocketAddr = "127.0.0.1:55440".parse().unwrap();
++        let addr_b: SocketAddr = "127.0.0.1:55441".parse().unwrap();
++        let addr_keep: SocketAddr = "127.0.0.1:55442".parse().unwrap();
++        let mut user = ProxyUserCredentials::default();
++        user.username = "user-zap-streamless-ghost".to_string();
++        user.max_connections = 4;
++
++        let token_a = manager
++            .create_user_session(CreateUserSessionParams {
++                user: &user,
++                session_token: "tok-ghost-a",
++                virtual_id: 9401,
++                provider: "provider-a",
++                stream_url: "http://localhost/a.ts",
++                addr: &addr_a,
++                connection_permission: UserConnectionPermission::Allowed,
++                connection_kind: Some(ConnectionKind::Normal),
++                socket_bound: false,
++            })
++            .await;
++        let token_b = manager
++            .create_user_session(CreateUserSessionParams {
++                user: &user,
++                session_token: "tok-ghost-b",
++                virtual_id: 9402,
++                provider: "provider-b",
++                stream_url: "http://localhost/b.ts",
++                addr: &addr_b,
++                connection_permission: UserConnectionPermission::Allowed,
++                connection_kind: Some(ConnectionKind::Normal),
++                socket_bound: false,
++            })
++            .await;
++        let token_keep = manager
++            .create_user_session(CreateUserSessionParams {
++                user: &user,
++                session_token: "tok-ghost-keep",
++                virtual_id: 9403,
++                provider: "provider-c",
++                stream_url: "http://localhost/c.ts",
++                addr: &addr_keep,
++                connection_permission: UserConnectionPermission::Allowed,
++                connection_kind: Some(ConnectionKind::Normal),
++                socket_bound: false,
++            })
++            .await;
++
++        // Artificially leave Active counted leases with NO streams (ghost connections).
++        {
++            let mut connections = manager.connections.write().await;
++            let data = connections.by_key.get_mut(&user.username).unwrap();
++            for token in [&token_a, &token_b, &token_keep] {
++                let session = data.sessions.iter_mut().find(|s| s.token == *token).unwrap();
++                session.lifecycle = PlaybackLifecycle::Active;
++                data.increment_kind(ConnectionKind::Normal);
++            }
++        }
++        assert_eq!(manager.user_connections(&user.username).await, 3);
++        {
++            let connections = manager.connections.read().await;
++            let data = connections.by_key.get(&user.username).unwrap();
++            assert!(data.streams.is_empty(), "ghost fixture must have empty Streams list");
++        }
++
++        let terminated = manager
++            .terminate_other_channel_sessions_for_client_ip(&user.username, "127.0.0.1", None, 9403)
++            .await;
++        assert!(
++            !terminated.is_empty(),
++            "streamless ghost leases must be zap-terminated"
++        );
++        assert_eq!(
++            manager.user_connections(&user.username).await,
++            0,
++            "ghost active_user_connections must return to 0"
++        );
++        assert!(manager.get_and_update_user_session(&user.username, &token_a).await.is_none());
++        assert!(manager.get_and_update_user_session(&user.username, &token_b).await.is_none());
++        assert!(
++            manager.get_and_update_user_session(&user.username, &token_keep).await.is_none(),
++            "keep_virtual_id streamless ghost lease must also be released"
++        );
++        {
++            let connections = manager.connections.read().await;
++            if let Some(data) = connections.by_key.get(&user.username) {
++                assert!(
++                    data.sessions.iter().all(|session| !session.lifecycle.is_counted()),
++                    "no streamless counted sessions should remain"
++                );
++                assert_eq!(data.connections, 0);
++                assert!(data.streams.is_empty());
++            }
++        }
++    }
++
++    /// Preserved-reactivate admission must not pre-increment; `update_connection` owns the count.
++    #[tokio::test]
++    async fn session_activation_with_preserved_stream_does_not_double_increment() {
++        let config = Config::default();
++        let geoip = Arc::new(ArcSwapOption::<GeoIp>::default());
++        let event_manager = Arc::new(EventManager::new());
++        let manager = ActiveUserManager::new(&config, &geoip, &event_manager);
++
++        let addr: SocketAddr = "127.0.0.1:55443".parse().unwrap();
++        let fingerprint = Fingerprint::new("fp-no-double-inc".to_string(), "127.0.0.1".to_string(), addr);
++        let mut user = ProxyUserCredentials::default();
++        user.username = "user-no-double-inc".to_string();
++        user.max_connections = 1;
++
++        let token = manager
++            .create_user_session(CreateUserSessionParams {
++                user: &user,
++                session_token: "tok-no-double-inc",
++                virtual_id: 9501,
++                provider: "provider-a",
++                stream_url: "http://localhost/a.m3u8",
++                addr: &addr,
++                connection_permission: UserConnectionPermission::Allowed,
++                connection_kind: Some(ConnectionKind::Normal),
++                socket_bound: false,
++            })
++            .await;
++        manager.add_connection(&addr).await;
++        manager
++            .update_connection(ActiveUserConnectionParams {
++                uid: 9501,
++                meter_uid: 0,
++                username: &user.username,
++                max_connections: user.max_connections,
++                soft_connections: 0,
++                connection_kind: ConnectionKind::Normal,
++                priority: 0,
++                soft_priority: 0,
++                fingerprint: &fingerprint,
++                provider: "provider-a".intern(),
++                stream_channel: &test_adaptive_channel(9501),
++                user_agent: Cow::Borrowed("ua"),
++                session_token: Some(&token),
++            })
++            .await
++            .expect("stream should register");
++        assert!(manager.release_connection(&addr).await.removed_streams.is_empty());
++        assert_eq!(manager.user_connections(&user.username).await, 0);
++
++        let admission = manager
++            .connection_admission_for_session_activation(
++                &user.username,
++                user.max_connections,
++                0,
++                &token,
++            )
++            .await;
++        assert_eq!(admission.permission, UserConnectionPermission::Exhausted);
++        assert_eq!(
++            manager.user_connections(&user.username).await,
++            0,
++            "admission must not increment for preserved reactivate"
++        );
++
++        manager.add_connection(&addr).await;
++        manager
++            .update_connection(ActiveUserConnectionParams {
++                uid: 9501,
++                meter_uid: 0,
++                username: &user.username,
++                max_connections: user.max_connections,
++                soft_connections: 0,
++                connection_kind: ConnectionKind::Normal,
++                priority: 0,
++                soft_priority: 0,
++                fingerprint: &fingerprint,
++                provider: "provider-a".intern(),
++                stream_channel: &test_adaptive_channel(9501),
++                user_agent: Cow::Borrowed("ua"),
++                session_token: Some(&token),
++            })
++            .await
++            .expect("preserved stream should reactivate");
++        assert_eq!(
++            manager.user_connections(&user.username).await,
++            1,
++            "only update_connection should restore the counted slot"
 +        );
 +    }
 +
