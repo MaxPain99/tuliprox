@@ -1,18 +1,16 @@
-# Close soft-preserved / HLS-origin sessions for other channels on Activate (zap).
-# After #807 soft-preserve, flipping channels left adaptive/HLS/Catchup sessions and
-# provider TCP until TTL. Backend nuclear close + ghost lease fix (3.3.109):
-# - terminate other virtual_ids for same user (single-client or matching IP)
-# - release TRUE streamless counted leases (empty Streams + nonzero connections)
-# - do NOT sweep soft-preserved HLS-gap rows (preserved StreamInfo) as ghosts — that
-#   blanked live Streams between segments (blink on 3.3.107/108)
-# - refuse soft-preserve only when another sticky session channel is active
-# - auto-close on update_connection; cancel_token on provider release
-# - no double-increment on preserved HLS reactivate
-# FE: keep upstream #807 soft-preserve between HLS segments; zap UI uses prune_zapped.
+# Close other-channel soft-preserved sessions on Activate only (zap).
+# Aligned with working MaxPain 3.3.78 behavior:
+# - 3.3.78 closed plain Live on disconnect and used FE prune_zapped for sticky UI
+# - After upstream #807, soft-preserve left old channels until TTL — terminate on Activate
+# MUST NOT (these cut live mid-watch on 3.3.103-109):
+# - cancel_token on normal provider release
+# - zap_close on FollowUp / every HLS segment entry / every update_connection
+# Keep: Activate-only terminate, sticky refuse soft-preserve, true streamless ghost sweep
+# FE soft-preserve between segments stays upstream #807 (no FE hard-remove in this patch).
 # Apply BEFORE user-hide-adult.patch.
 
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
-index d2d1ab90..7fb60d9b 100644
+index d2d1ab90..c45386be 100644
 --- a/backend/src/api/api_utils.rs
 +++ b/backend/src/api/api_utils.rs
 @@ -125,12 +125,42 @@ pub(crate) fn classify_playback_request(facts: PlaybackRequestFacts<'_>) -> Play
@@ -58,24 +56,20 @@ index d2d1ab90..7fb60d9b 100644
      user_session: Option<&UserSession>,
      session_token: &str,
      activate_unbound_session: bool,
-@@ -180,6 +210,16 @@ pub(crate) async fn resolve_playback_request_admission(
+@@ -180,6 +210,12 @@ pub(crate) async fn resolve_playback_request_admission(
          );
      }
  
-+    // Channel zap: drop soft-preserved (and still-open) sessions for other virtual_ids on
-+    // this user+IP before admission, so capacity is freed immediately instead of waiting
-+    // for hls_session_ttl. Same-channel FollowUp / same virtual_id Activate is a no-op.
-+    if !matches!(
-+        request_class,
-+        PlaybackRequestClass::Prepare | PlaybackRequestClass::Terminate
-+    ) {
++    // Channel zap only on Activate (new channel). Never on FollowUp / HLS segment re-entry —
++    // 3.3.78 did not tear down playback mid-watch; soft-preserve + FE prune handled the panel.
++    if request_class == PlaybackRequestClass::Activate {
 +        zap_close_other_channel_playback(app_state, &user.username, fingerprint, virtual_id).await;
 +    }
 +
      if request_class == PlaybackRequestClass::FollowUp || !limits_enabled {
          return (
              crate::api::model::ConnectionAdmission {
-@@ -1164,6 +1204,9 @@ async fn activate_session_before_stream_open(
+@@ -1164,6 +1200,9 @@ async fn activate_session_before_stream_open(
              terminate: false,
          })
      };
@@ -85,7 +79,7 @@ index d2d1ab90..7fb60d9b 100644
      let limits_enabled = app_state.app_config.config.load().user_access_control
          && (user.max_connections > 0 || user.soft_connections > 0);
      // Prepare: session setup without admission cost. The caller handles the actual activation.
-@@ -6617,6 +6660,7 @@ mod tests {
+@@ -6617,6 +6656,7 @@ mod tests {
              &user,
              &fingerprint,
              PlaylistItemType::LiveHls,
@@ -93,7 +87,7 @@ index d2d1ab90..7fb60d9b 100644
              None,
              "tok-prepare-only",
              false,
-@@ -6682,6 +6726,7 @@ mod tests {
+@@ -6682,6 +6722,7 @@ mod tests {
              &user,
              &fingerprint,
              PlaylistItemType::LiveHls,
@@ -101,7 +95,7 @@ index d2d1ab90..7fb60d9b 100644
              before.as_ref(),
              session_token,
              false,
-@@ -9473,6 +9518,7 @@ mod tests {
+@@ -9473,6 +9514,7 @@ mod tests {
              &user,
              &ts_fingerprint,
              PlaylistItemType::Live,
@@ -110,16 +104,16 @@ index d2d1ab90..7fb60d9b 100644
              &ts_token,
              false,
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
-index 233919a5..0bad49df 100644
+index 233919a5..4624358a 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
 @@ -4396,6 +4396,9 @@ async fn prepare_hls_cache_user_session(
      connection_permission: UserConnectionPermission,
      connection_kind: Option<crate::api::model::ConnectionKind>,
  ) -> String {
-+    // HLS entry for a channel is an Activate-equivalent: drop soft-preserved sessions for
-+    // other virtual_ids on this user+IP so zap does not wait for hls_session_ttl.
-+    crate::api::api_utils::zap_close_other_channel_playback(app_state, &user.username, fingerprint, virtual_id).await;
++    // Do not zap-close here: create_user_session runs on every HLS (re)entry including segment
++    // gaps. Closing other channels belongs on Activate admission only (see api_utils), matching
++    // 3.3.78 where mid-watch segment churn never aborted the current provider stream.
      app_state
          .active_users
          .create_user_session(crate::api::model::CreateUserSessionParams {
@@ -187,41 +181,6 @@ index 04103c3b..9a009e9a 100644
          user_session.as_ref(),
          &session_key,
          false,
-diff --git a/backend/src/api/model/active_provider_manager.rs b/backend/src/api/model/active_provider_manager.rs
-index 8bf6c441..4529f425 100644
---- a/backend/src/api/model/active_provider_manager.rs
-+++ b/backend/src/api/model/active_provider_manager.rs
-@@ -1046,6 +1046,8 @@ impl ActiveProviderManager {
-                     info.allocation.get_provider_name().unwrap_or_default(),
-                     sanitize_sensitive_info(&addr.to_string())
-                 );
-+                // Abort upstream TCP immediately on normal release (same as preemption).
-+                info.cancel_token.cancel();
-                 info.allocation.release().await;
-             }
-             return;
-@@ -1090,7 +1092,7 @@ impl ActiveProviderManager {
-                         );
-                     }
-                 }
--                Some(shared.allocation)
-+                Some((shared.allocation, shared.cancel_token))
-             } else {
-                 // Recompute shared priority from remaining subscribers so preemption decisions
-                 // reflect who is actually still watching the shared stream. Unlimited
-@@ -1127,7 +1129,11 @@ impl ActiveProviderManager {
-         };
- 
-         // release allocation
--        if let Some(allocation) = shared_allocation {
-+        if let Some((allocation, cancel_token)) = shared_allocation {
-+            // Abort upstream TCP immediately when last shared client leaves (same as preemption).
-+            if let Some(token) = cancel_token {
-+                token.cancel();
-+            }
-             allocation.release().await;
-             debug_if_enabled!(
-                 "Released last shared connection for provider {}, releasing allocation {}",
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
 index 72bab640..3f864818 100644
 --- a/backend/src/api/model/active_user_manager.rs
@@ -1294,7 +1253,7 @@ index 72bab640..3f864818 100644
      #[tokio::test]
      async fn terminate_session_promotes_soft_stream_after_releasing_capacity() {
 diff --git a/backend/src/api/model/connection_manager.rs b/backend/src/api/model/connection_manager.rs
-index c5c127b8..e80cfa64 100644
+index c5c127b8..8c15ed70 100644
 --- a/backend/src/api/model/connection_manager.rs
 +++ b/backend/src/api/model/connection_manager.rs
 @@ -8,7 +8,7 @@ use crate::{
@@ -1315,7 +1274,7 @@ index c5c127b8..e80cfa64 100644
      net::SocketAddr,
      str::FromStr,
      sync::{
-@@ -1008,6 +1008,69 @@ impl ConnectionManager {
+@@ -1008,6 +1008,71 @@ impl ConnectionManager {
          }
      }
  
@@ -1352,7 +1311,9 @@ index c5c127b8..e80cfa64 100644
 +                    continue;
 +                }
 +                info!("Zap-closing connection {addr} for user {username}");
-+                // Close socket first, then cancel_token via provider release, then shared teardown.
++                // Close client socket + clear provider reservation; do not cancel_token here —
++                // aborting upstream on zap of another channel is fine via close_connection, but
++                // provider cancel_token on normal segment release cut live (removed from patch).
 +                let _ = self.close_connection_with_reason(&addr, DisconnectReason::ClientKicked);
 +                self.provider_manager.release_connection(&addr).await;
 +                self.shared_stream_manager.release_connection(&addr, true).await;
@@ -1385,21 +1346,12 @@ index c5c127b8..e80cfa64 100644
      pub fn next_stream_uid(&self) -> u32 {
          self.stream_uid_counter
              .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-@@ -1123,6 +1186,17 @@ impl ConnectionManager {
+@@ -1123,6 +1188,8 @@ impl ConnectionManager {
              }
              self.event_manager
                  .send_event(EventMessage::ActiveUser(ActiveUserConnectionChange::Updated(stream_info.clone())));
-+            // Channel zap / dual-open: when a new stream registers, close other virtual_ids for
-+            // this user+client immediately (provider slots + soft-preserved rows), not after TTL.
-+            if stream_info.channel.virtual_id != 0 {
-+                self.terminate_other_channel_sessions_for_client(
-+                    username,
-+                    &fingerprint.client_ip,
-+                    Some(fingerprint.key.as_str()),
-+                    stream_info.channel.virtual_id,
-+                )
-+                .await;
-+            }
++            // Do not terminate other channels on every update_connection — that runs on each
++            // HLS segment register and cut live mid-watch. Zap close stays on Activate only.
              Some(stream_info)
          } else {
              warn!("Failed to register connection for user {username} at {}; disconnecting client", fingerprint.addr);

@@ -208,9 +208,13 @@ grep -q 'client_has_panel_stream' "${TREE}/backend/src/api/model/active_user_man
 grep -q 'zap_keep_channel_does_not_sweep_soft_preserved_hls_gap_as_ghost' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'Double-increment left ghost' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'Zap-closing connection' "${TREE}/backend/src/api/model/connection_manager.rs"
-grep -q 'Abort upstream TCP immediately on normal release' "${TREE}/backend/src/api/model/active_provider_manager.rs"
-grep -q 'Channel zap / dual-open' "${TREE}/backend/src/api/model/connection_manager.rs"
 grep -q 'Take first hop if comma-separated' "${TREE}/backend/src/auth/fingerprint.rs"
+
+# Must NOT cancel provider TCP on normal release (that cut live mid-watch).
+if grep -q 'Abort upstream TCP immediately on normal release' "${TREE}/backend/src/api/model/active_provider_manager.rs"; then
+  echo "ERROR: cancel_token on normal provider release must not be patched" >&2
+  exit 1
+fi
 
 echo "MaxPain patches applied OK (zap-close-old-sessions + Hide Adult; Flussonic/Streams #807 is upstream)"
 echo "Rebuild tuliprox and refresh playlists."
