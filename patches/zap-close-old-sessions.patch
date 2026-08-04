@@ -1,12 +1,10 @@
-# Close other-channel soft-preserved sessions on Activate only (zap).
-# Aligned with working MaxPain 3.3.78 behavior:
-# - 3.3.78 closed plain Live on disconnect and used FE prune_zapped for sticky UI
-# - After upstream #807, soft-preserve left old channels until TTL — terminate on Activate
-# MUST NOT (these cut live mid-watch on 3.3.103-109):
-# - cancel_token on normal provider release
-# - zap_close on FollowUp / every HLS segment entry / every update_connection
-# Keep: Activate-only terminate, sticky refuse soft-preserve, true streamless ghost sweep
-# FE soft-preserve between segments stays upstream #807 (no FE hard-remove in this patch).
+# Close other-channel soft-preserved sessions on channel zap (3.3.111).
+# Aligned with working MaxPain 3.3.78 Streams + connection behavior:
+# - Soft-preserve Live+session (.ts media under HLS/session) so Streams shows live like Catchup
+# - FE prune_zapped is virtual_id-aware (keep same-channel preserved during HLS gaps)
+# - Terminate other virtual_ids on Activate, HLS entry, and update_connection (same-channel no-op)
+# MUST NOT: cancel_token on normal provider release (cut live mid-watch on 103-109)
+# Keep: sticky refuse soft-preserve, true streamless ghost sweep (session_has_stream)
 # Apply BEFORE user-hide-adult.patch.
 
 diff --git a/backend/src/api/api_utils.rs b/backend/src/api/api_utils.rs
@@ -104,16 +102,16 @@ index d2d1ab90..c45386be 100644
              &ts_token,
              false,
 diff --git a/backend/src/api/endpoints/hls_api.rs b/backend/src/api/endpoints/hls_api.rs
-index 233919a5..4624358a 100644
+index 233919a5..ff40814c 100644
 --- a/backend/src/api/endpoints/hls_api.rs
 +++ b/backend/src/api/endpoints/hls_api.rs
 @@ -4396,6 +4396,9 @@ async fn prepare_hls_cache_user_session(
      connection_permission: UserConnectionPermission,
      connection_kind: Option<crate::api::model::ConnectionKind>,
  ) -> String {
-+    // Do not zap-close here: create_user_session runs on every HLS (re)entry including segment
-+    // gaps. Closing other channels belongs on Activate admission only (see api_utils), matching
-+    // 3.3.78 where mid-watch segment churn never aborted the current provider stream.
++    // Other-channel terminate only (keep_virtual_id). Same-channel HLS re-entry is a no-op;
++    // required because many players never hit Activate admission when flipping HLS channels.
++    crate::api::api_utils::zap_close_other_channel_playback(app_state, &user.username, fingerprint, virtual_id).await;
      app_state
          .active_users
          .create_user_session(crate::api::model::CreateUserSessionParams {
@@ -182,7 +180,7 @@ index 04103c3b..9a009e9a 100644
          &session_key,
          false,
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
-index 72bab640..3f864818 100644
+index 72bab640..47385962 100644
 --- a/backend/src/api/model/active_user_manager.rs
 +++ b/backend/src/api/model/active_user_manager.rs
 @@ -28,7 +28,7 @@ use std::{
@@ -194,7 +192,19 @@ index 72bab640..3f864818 100644
      num::NonZeroUsize,
      sync::{
          atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-@@ -959,6 +959,21 @@ impl ActiveUserManager {
+@@ -381,8 +381,11 @@ fn create_socket_reentry_guard_key(username: &str, client_ip: &str, virtual_id:
+ fn is_stable_session_stream(stream: &StreamInfo) -> bool {
+     // Catchup-token Live/.ts segment sockets must preserve too; otherwise archive panel rows
+     // hard-remove every HLS chunk and Streams blinks even when frontend soft-preserve is present.
++    // Plain Live + session_token: HLS/Xtream live often registers media as Live/.ts while the
++    // playlist is adaptive — without this, Streams shows Catchup but not the live channel.
+     stream.channel.item_type == PlaylistItemType::Catchup
+         || stream.channel.item_type.is_live_adaptive()
++        || (stream.channel.item_type == PlaylistItemType::Live && stream.session_token.is_some())
+         || stream.session_token.as_deref().is_some_and(is_catchup_session_token)
+         || matches!(
+             extract_extension_from_url(stream.channel.url.as_ref()),
+@@ -959,6 +962,21 @@ impl ActiveUserManager {
                      let mut removed_session_tokens = HashSet::new();
                      let mut preserved_session_tokens = Vec::new();
                      let now = current_time_secs();
@@ -216,7 +226,7 @@ index 72bab640..3f864818 100644
                      for mut stream_info in connection_data.streams.drain(..) {
                          if stream_info.addr == *addr {
                              let migrated_addr = stream_info
-@@ -971,7 +986,13 @@ impl ActiveUserManager {
+@@ -971,7 +989,13 @@ impl ActiveUserManager {
                                  stream_info.addr = next_addr;
                                  stream_info.ts = now;
                                  remaining_streams.push(stream_info);
@@ -231,7 +241,7 @@ index 72bab640..3f864818 100644
                                  if let Some(entry) = self.build_preserved_stream_expiry(
                                      username,
                                      &stream_info,
-@@ -1916,10 +1937,9 @@ impl ActiveUserManager {
+@@ -1916,10 +1940,9 @@ impl ActiveUserManager {
          if admission.permission == UserConnectionPermission::Allowed {
              let session = &mut connection_data.sessions[session_index];
              Self::update_session_admission(session, admission.permission, Some(kind));
@@ -244,7 +254,7 @@ index 72bab640..3f864818 100644
          if has_preserved {
              return ConnectionAdmission { permission: UserConnectionPermission::Exhausted, kind: admission.kind };
          }
-@@ -2534,6 +2554,385 @@ impl ActiveUserManager {
+@@ -2534,6 +2557,385 @@ impl ActiveUserManager {
          debug!("GraceActive expired for session {token} in {username}, released {removed_count} streams");
      }
  
@@ -630,7 +640,7 @@ index 72bab640..3f864818 100644
      /// Terminates the session and all associated streams for a playback.
      ///
      /// This is the explicit `Terminate` path from the playback state machine:
-@@ -3960,6 +4359,621 @@ mod tests {
+@@ -3960,6 +4362,621 @@ mod tests {
          assert!(connection_data.sessions.iter().all(|session| session.token != token));
      }
  
@@ -1253,7 +1263,7 @@ index 72bab640..3f864818 100644
      #[tokio::test]
      async fn terminate_session_promotes_soft_stream_after_releasing_capacity() {
 diff --git a/backend/src/api/model/connection_manager.rs b/backend/src/api/model/connection_manager.rs
-index c5c127b8..8c15ed70 100644
+index c5c127b8..f8b3070e 100644
 --- a/backend/src/api/model/connection_manager.rs
 +++ b/backend/src/api/model/connection_manager.rs
 @@ -8,7 +8,7 @@ use crate::{
@@ -1346,12 +1356,22 @@ index c5c127b8..8c15ed70 100644
      pub fn next_stream_uid(&self) -> u32 {
          self.stream_uid_counter
              .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-@@ -1123,6 +1188,8 @@ impl ConnectionManager {
+@@ -1123,6 +1188,18 @@ impl ConnectionManager {
              }
              self.event_manager
                  .send_event(EventMessage::ActiveUser(ActiveUserConnectionChange::Updated(stream_info.clone())));
-+            // Do not terminate other channels on every update_connection — that runs on each
-+            // HLS segment register and cut live mid-watch. Zap close stays on Activate only.
++            // Zap: new virtual_id registered → drop other channels for this user+client.
++            // Same-channel HLS segment churn keeps the same virtual_id (no-op). Do not cancel
++            // provider TCP on normal release — that cut live mid-watch (removed from patch).
++            if stream_info.channel.virtual_id != 0 {
++                self.terminate_other_channel_sessions_for_client(
++                    username,
++                    &fingerprint.client_ip,
++                    Some(fingerprint.key.as_str()),
++                    stream_info.channel.virtual_id,
++                )
++                .await;
++            }
              Some(stream_info)
          } else {
              warn!("Failed to register connection for user {username} at {}; disconnecting client", fingerprint.addr);
@@ -1569,3 +1589,71 @@ index 18c5f617..b1965fd0 100644
              .unwrap_or_else(|| addr.ip().to_string());
  
          let ua = user_agent.unwrap_or_else(String::new);
+diff --git a/frontend/src/hooks/use_server_status.rs b/frontend/src/hooks/use_server_status.rs
+index 8444ab46..93bf8daf 100644
+--- a/frontend/src/hooks/use_server_status.rs
++++ b/frontend/src/hooks/use_server_status.rs
+@@ -38,6 +38,10 @@ fn is_sticky_session_stream(stream: &StreamInfo) -> bool {
+     if stream.channel.item_type.is_live_adaptive() || is_shared_hls_stream(stream) {
+         return true;
+     }
++    // Live/.ts media under a session (common for HLS rewrite) must stay visible like Catchup.
++    if stream.channel.item_type == PlaylistItemType::Live && stream.session_token.is_some() {
++        return true;
++    }
+     if stream_url_looks_adaptive(stream.channel.url.as_ref()) {
+         return true;
+     }
+@@ -60,11 +64,13 @@ fn find_stream_update_index(streams: &[StreamInfo], updated_stream: &StreamInfo)
+         }
+     }
+ 
+-    // Catchup without a stable token still remaps by channel identity so Streams does not accumulate
+-    // one row per HLS segment addr/uid churn.
+-    if updated_stream.channel.item_type == PlaylistItemType::Catchup {
++    // Catchup / session-backed Live without a stable token still remaps by channel identity so
++    // Streams does not accumulate one row per HLS segment addr/uid churn.
++    if updated_stream.channel.item_type == PlaylistItemType::Catchup
++        || (updated_stream.channel.item_type == PlaylistItemType::Live && updated_stream.session_token.is_some())
++    {
+         if let Some(index) = streams.iter().position(|stream| {
+-            stream.channel.item_type == PlaylistItemType::Catchup
++            stream.channel.item_type == updated_stream.channel.item_type
+                 && stream.username == updated_stream.username
+                 && stream.channel.virtual_id == updated_stream.channel.virtual_id
+         }) {
+@@ -84,18 +90,19 @@ fn dedupe_streams_by_identity(streams: &mut Vec<StreamInfo>) {
+     streams.retain(|stream| seen.insert(stream_identity_key(stream)));
+ }
+ 
+-/// Drop preserved sticky rows once the same user+IP has an active replacement row.
+-/// Keeps soft-preserve during HLS segment gaps (no active row yet); clears zapped channels immediately
+-/// instead of waiting for hls_session_ttl (~15s).
++/// Drop preserved sticky rows for other virtual_ids once the same user+IP has an active row.
++/// Keeps same-channel soft-preserve during HLS gaps (3.3.78); clears zapped channels immediately.
+ fn prune_zapped_preserved_streams(streams: &mut Vec<StreamInfo>) {
+-    let users_with_active: HashSet<(String, String)> = streams
++    let active_channels: HashSet<(String, String, u32)> = streams
+         .iter()
+         .filter(|stream| !stream.preserved && stream.client_ip != BACKGROUND_TRANSFER_CLIENT_IP)
+-        .map(|stream| (stream.username.clone(), stream.client_ip.clone()))
++        .map(|stream| (stream.username.clone(), stream.client_ip.clone(), stream.channel.virtual_id))
+         .collect();
+-    if users_with_active.is_empty() {
++    if active_channels.is_empty() {
+         return;
+     }
++    let users_with_active: HashSet<(String, String)> =
++        active_channels.iter().map(|(username, client_ip, _)| (username.clone(), client_ip.clone())).collect();
+ 
+     streams.retain(|stream| {
+         if stream.client_ip == BACKGROUND_TRANSFER_CLIENT_IP {
+@@ -108,7 +115,7 @@ fn prune_zapped_preserved_streams(streams: &mut Vec<StreamInfo>) {
+         if !users_with_active.contains(&user_ip) {
+             return true;
+         }
+-        false
++        active_channels.contains(&(stream.username.clone(), stream.client_ip.clone(), stream.channel.virtual_id))
+     });
+ }
+ 
