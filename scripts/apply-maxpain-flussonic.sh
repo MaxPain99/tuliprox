@@ -3,7 +3,7 @@
 #
 # Upstream euzu/tuliprox#807 landed Flussonic/BitTV archive catchup + Streams sticky panel.
 # This script applies:
-#   1) zap-close-old-sessions — terminate other-channel soft-preserved sessions on Activate
+#   1) streams-panel-zap — 3.3.78-style Streams panel + channel zap (no nuclear socket terminate)
 #   2) user-hide-adult — per-user adult filtering
 # The flussonic patch file is kept as a stub (do not apply).
 #
@@ -19,7 +19,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TREE="$(cd "${1:-${TULIPROX_ROOT:-${ROOT_DIR}}}" && pwd)"
 
 PATCHES=(
-  "zap-close-old-sessions.patch"
+  "streams-panel-zap.patch"
   "user-hide-adult.patch"
 )
 
@@ -195,33 +195,26 @@ grep -q 'HIDE_ADULT' "${TREE}/frontend/src/app/components/userlist/proxy_user_cr
 grep -q 'adult_epg_id_blocklist' "${TREE}/backend/src/api/endpoints/xmltv_api.rs"
 grep -q 'let hide_adult = user.hide_adult' "${TREE}/backend/src/repository/m3u_playlist_iterator.rs"
 
-# Sanity: zap-close-old-sessions applied.
-grep -q 'terminate_other_channel_sessions_for_client_ip' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'terminate_other_channel_sessions_for_client' "${TREE}/backend/src/api/model/connection_manager.rs"
-grep -q 'zap_close_other_channel_playback' "${TREE}/backend/src/api/api_utils.rs"
-grep -q 'terminate_other_channel_hls_for_client' "${TREE}/backend/src/api/model/hls_cache/manager.rs"
+# Sanity: streams-panel-zap applied.
 grep -q 'other_active_by_client' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'normalize_client_ip' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'single_client_user' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'release_streamless_counted_leases_for_zap' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'client_has_panel_stream' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'zap_keep_channel_does_not_sweep_soft_preserved_hls_gap_as_ghost' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'Double-increment left ghost' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'Zap-closing connection' "${TREE}/backend/src/api/model/connection_manager.rs"
-grep -q 'Take first hop if comma-separated' "${TREE}/backend/src/auth/fingerprint.rs"
-grep -q 'has_other_channel_for_zap_client' "${TREE}/backend/src/api/model/active_user_manager.rs"
+grep -q 'PlaylistItemType::Live && stream.session_token.is_some()' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'active_channels.contains' "${TREE}/frontend/src/hooks/use_server_status.rs"
-grep -q 'Live/.ts media under a session' "${TREE}/frontend/src/hooks/use_server_status.rs"
-if grep -q 'PlaylistItemType::Live && stream.session_token.is_some()' "${TREE}/backend/src/api/model/active_user_manager.rs"; then
-  echo "ERROR: backend must not soft-preserve plain Live+session (TTL cuts live)" >&2
+grep -q 'PlaylistItemType::Live && stream.session_token.is_some()' "${TREE}/frontend/src/hooks/use_server_status.rs"
+
+# Nuclear zap must stay out (cut live mid-watch in v3.3.108–112).
+if grep -q 'terminate_other_channel_sessions_for_client_ip' "${TREE}/backend/src/api/model/active_user_manager.rs"; then
+  echo "ERROR: nuclear zap terminate_other_channel_sessions must not be patched" >&2
   exit 1
 fi
-
-# Must NOT cancel provider TCP on normal release (that cut live mid-watch).
+if grep -q 'zap_close_other_channel_playback' "${TREE}/backend/src/api/api_utils.rs"; then
+  echo "ERROR: zap_close_other_channel_playback must not be patched" >&2
+  exit 1
+fi
 if grep -q 'Abort upstream TCP immediately on normal release' "${TREE}/backend/src/api/model/active_provider_manager.rs"; then
   echo "ERROR: cancel_token on normal provider release must not be patched" >&2
   exit 1
 fi
 
-echo "MaxPain patches applied OK (zap-close-old-sessions + Hide Adult; Flussonic/Streams #807 is upstream)"
+echo "MaxPain patches applied OK (streams-panel-zap + Hide Adult; Flussonic/Streams #807 is upstream)"
 echo "Rebuild tuliprox and refresh playlists."

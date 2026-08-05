@@ -1,0 +1,138 @@
+# MaxPain streams-panel-zap.patch — minimal 3.3.78-style Streams + channel zap.
+#
+# Backend:
+#   - Live+session in `panel_streams` (soft-preserve between segment gaps)
+#   - Refuse soft-preserve when same client already watches another channel (zap)
+#   - Fix double-increment ghost connection counter
+#
+# Frontend:
+#   - Live+session sticky rows; virtual_id-aware `prune_zapped_preserved_streams`
+#
+# Deliberately omits nuclear zap (terminate_other_channel_*, zap_close on HLS/update_connection)
+# which cut live playback mid-watch in v3.3.108–112.
+diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
+index 72bab640..d18b899d 100644
+--- a/backend/src/api/model/active_user_manager.rs
++++ b/backend/src/api/model/active_user_manager.rs
+@@ -383,6 +383,7 @@ fn is_stable_session_stream(stream: &StreamInfo) -> bool {
+     // hard-remove every HLS chunk and Streams blinks even when frontend soft-preserve is present.
+     stream.channel.item_type == PlaylistItemType::Catchup
+         || stream.channel.item_type.is_live_adaptive()
++        || (stream.channel.item_type == PlaylistItemType::Live && stream.session_token.is_some())
+         || stream.session_token.as_deref().is_some_and(is_catchup_session_token)
+         || matches!(
+             extract_extension_from_url(stream.channel.url.as_ref()),
+@@ -959,6 +960,14 @@ impl ActiveUserManager {
+                     let mut removed_session_tokens = HashSet::new();
+                     let mut preserved_session_tokens = Vec::new();
+                     let now = current_time_secs();
++                    let other_active_by_client: HashSet<(String, u32)> = connection_data
++                        .streams
++                        .iter()
++                        .filter(|stream| {
++                            stream.addr != *addr && !stream.preserved && Self::should_preserve_session_stream(stream)
++                        })
++                        .map(|stream| (stream.client_ip.clone(), stream.channel.virtual_id))
++                        .collect();
+                     for mut stream_info in connection_data.streams.drain(..) {
+                         if stream_info.addr == *addr {
+                             let migrated_addr = stream_info
+@@ -971,7 +980,12 @@ impl ActiveUserManager {
+                                 stream_info.addr = next_addr;
+                                 stream_info.ts = now;
+                                 remaining_streams.push(stream_info);
+-                            } else if preserve_session_streams && Self::should_preserve_session_stream(&stream_info) {
++                            } else if preserve_session_streams
++                                && Self::should_preserve_session_stream(&stream_info)
++                                && !other_active_by_client.iter().any(|(ip, vid)| {
++                                    *vid != stream_info.channel.virtual_id && ip == &stream_info.client_ip
++                                })
++                            {
+                                 if let Some(entry) = self.build_preserved_stream_expiry(
+                                     username,
+                                     &stream_info,
+@@ -1645,7 +1659,10 @@ impl ActiveUserManager {
+         // row using the stream timestamp so Streams does not blink between archive chunks.
+         let session_ts = if let Some(session) = sessions.iter().find(|session| session.token == session_token) {
+             session.ts
+-        } else if stream.channel.item_type == PlaylistItemType::Catchup || is_catchup_session_token(session_token) {
++        } else if stream.channel.item_type == PlaylistItemType::Catchup
++            || is_catchup_session_token(session_token)
++            || (stream.channel.item_type == PlaylistItemType::Live && stream.session_token.is_some())
++        {
+             stream.ts
+         } else {
+             return None;
+@@ -1916,10 +1933,9 @@ impl ActiveUserManager {
+         if admission.permission == UserConnectionPermission::Allowed {
+             let session = &mut connection_data.sessions[session_index];
+             Self::update_session_admission(session, admission.permission, Some(kind));
+-            if has_preserved {
+-                connection_data.increment_kind(kind);
+-            }
+         }
++        // Do not increment for preserved streams here: `update_connection` already increments
++        // on `was_preserved` reactivate. Double-increment left ghost `active_user_connections`.
+         if has_preserved {
+             return ConnectionAdmission { permission: UserConnectionPermission::Exhausted, kind: admission.kind };
+         }
+diff --git a/frontend/src/hooks/use_server_status.rs b/frontend/src/hooks/use_server_status.rs
+index 8444ab46..b19f3b18 100644
+--- a/frontend/src/hooks/use_server_status.rs
++++ b/frontend/src/hooks/use_server_status.rs
+@@ -41,6 +41,9 @@ fn is_sticky_session_stream(stream: &StreamInfo) -> bool {
+     if stream_url_looks_adaptive(stream.channel.url.as_ref()) {
+         return true;
+     }
++    if stream.channel.item_type == PlaylistItemType::Live && stream.session_token.is_some() {
++        return true;
++    }
+     stream.session_token.as_deref().is_some_and(is_catchup_session_token)
+ }
+ 
+@@ -60,11 +63,13 @@ fn find_stream_update_index(streams: &[StreamInfo], updated_stream: &StreamInfo)
+         }
+     }
+ 
+-    // Catchup without a stable token still remaps by channel identity so Streams does not accumulate
++    // Catchup/Live without a stable token still remaps by channel identity so Streams does not accumulate
+     // one row per HLS segment addr/uid churn.
+-    if updated_stream.channel.item_type == PlaylistItemType::Catchup {
++    if updated_stream.channel.item_type == PlaylistItemType::Catchup
++        || (updated_stream.channel.item_type == PlaylistItemType::Live && updated_stream.session_token.is_some())
++    {
+         if let Some(index) = streams.iter().position(|stream| {
+-            stream.channel.item_type == PlaylistItemType::Catchup
++            stream.channel.item_type == updated_stream.channel.item_type
+                 && stream.username == updated_stream.username
+                 && stream.channel.virtual_id == updated_stream.channel.virtual_id
+         }) {
+@@ -88,14 +93,16 @@ fn dedupe_streams_by_identity(streams: &mut Vec<StreamInfo>) {
+ /// Keeps soft-preserve during HLS segment gaps (no active row yet); clears zapped channels immediately
+ /// instead of waiting for hls_session_ttl (~15s).
+ fn prune_zapped_preserved_streams(streams: &mut Vec<StreamInfo>) {
+-    let users_with_active: HashSet<(String, String)> = streams
++    let active_channels: HashSet<(String, String, u32)> = streams
+         .iter()
+         .filter(|stream| !stream.preserved && stream.client_ip != BACKGROUND_TRANSFER_CLIENT_IP)
+-        .map(|stream| (stream.username.clone(), stream.client_ip.clone()))
++        .map(|stream| (stream.username.clone(), stream.client_ip.clone(), stream.channel.virtual_id))
+         .collect();
+-    if users_with_active.is_empty() {
++    if active_channels.is_empty() {
+         return;
+     }
++    let users_with_active: HashSet<(String, String)> =
++        active_channels.iter().map(|(username, client_ip, _)| (username.clone(), client_ip.clone())).collect();
+ 
+     streams.retain(|stream| {
+         if stream.client_ip == BACKGROUND_TRANSFER_CLIENT_IP {
+@@ -108,7 +115,7 @@ fn prune_zapped_preserved_streams(streams: &mut Vec<StreamInfo>) {
+         if !users_with_active.contains(&user_ip) {
+             return true;
+         }
+-        false
++        active_channels.contains(&(stream.username.clone(), stream.client_ip.clone(), stream.channel.virtual_id))
+     });
+ }
+ 
