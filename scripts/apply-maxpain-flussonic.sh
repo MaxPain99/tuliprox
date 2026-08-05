@@ -197,7 +197,6 @@ grep -q 'let hide_adult = user.hide_adult' "${TREE}/backend/src/repository/m3u_p
 
 # Sanity: streams-panel-zap applied.
 grep -q 'other_active_by_client' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'Double-increment left ghost' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'PlaylistItemType::Live && stream.session_token.is_some()' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'active_channels.contains' "${TREE}/frontend/src/hooks/use_server_status.rs"
 grep -q 'PlaylistItemType::Live && stream.session_token.is_some()' "${TREE}/frontend/src/hooks/use_server_status.rs"

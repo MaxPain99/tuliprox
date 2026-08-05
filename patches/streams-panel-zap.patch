@@ -1,17 +1,16 @@
-# MaxPain streams-panel-zap.patch — minimal 3.3.78-style Streams + channel zap.
+# MaxPain streams-panel-zap.patch — minimal Streams panel + channel zap (on euzu v3.3.82).
 #
 # Backend:
-#   - Live+session in `panel_streams` (soft-preserve between segment gaps)
+#   - Live+session in panel_streams (soft-preserve between segment gaps)
 #   - Refuse soft-preserve when same client already watches another channel (zap)
-#   - Fix double-increment ghost connection counter
 #
 # Frontend:
-#   - Live+session sticky rows; virtual_id-aware `prune_zapped_preserved_streams`
+#   - Live+session sticky rows; virtual_id-aware prune_zapped_preserved_streams
 #
-# Deliberately omits nuclear zap (terminate_other_channel_*, zap_close on HLS/update_connection)
-# which cut live playback mid-watch in v3.3.108–112.
+# Ghost double-increment is fixed upstream in #815 — not re-patched here.
+# Deliberately omits nuclear zap (terminate_other_channel_*, zap_close on HLS).
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
-index 72bab640..d18b899d 100644
+index 07e5f678..98cdbf5d 100644
 --- a/backend/src/api/model/active_user_manager.rs
 +++ b/backend/src/api/model/active_user_manager.rs
 @@ -383,6 +383,7 @@ fn is_stable_session_stream(stream: &StreamInfo) -> bool {
@@ -63,19 +62,6 @@ index 72bab640..d18b899d 100644
              stream.ts
          } else {
              return None;
-@@ -1916,10 +1933,9 @@ impl ActiveUserManager {
-         if admission.permission == UserConnectionPermission::Allowed {
-             let session = &mut connection_data.sessions[session_index];
-             Self::update_session_admission(session, admission.permission, Some(kind));
--            if has_preserved {
--                connection_data.increment_kind(kind);
--            }
-         }
-+        // Do not increment for preserved streams here: `update_connection` already increments
-+        // on `was_preserved` reactivate. Double-increment left ghost `active_user_connections`.
-         if has_preserved {
-             return ConnectionAdmission { permission: UserConnectionPermission::Exhausted, kind: admission.kind };
-         }
 diff --git a/frontend/src/hooks/use_server_status.rs b/frontend/src/hooks/use_server_status.rs
 index 8444ab46..b19f3b18 100644
 --- a/frontend/src/hooks/use_server_status.rs
