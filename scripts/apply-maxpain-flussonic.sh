@@ -3,9 +3,8 @@
 #
 # Upstream euzu/tuliprox#807 landed Flussonic/BitTV archive catchup + Streams sticky panel.
 # This script applies:
-#   1) streams-panel-zap — 3.3.78-style Streams panel + channel zap (no nuclear socket terminate)
+#   1) streams-panel-zap — Streams panel Live sticky + channel zap (no nuclear socket terminate)
 #   2) user-hide-adult — per-user adult filtering
-# The flussonic patch file is kept as a stub (do not apply).
 #
 # Usage:
 #   ./scripts/apply-maxpain-flussonic.sh [TREE]

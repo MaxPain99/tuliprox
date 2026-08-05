@@ -1,3 +1,0 @@
-# OBSOLETE — Windows build compat landed upstream in euzu/tuliprox #806 (v3.3.87+).
-# Kept as a placeholder so old docs/scripts that mention this filename do not break.
-# scripts/apply-maxpain-flussonic.sh no longer applies this file.
