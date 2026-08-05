@@ -209,9 +209,13 @@ grep -q 'zap_keep_channel_does_not_sweep_soft_preserved_hls_gap_as_ghost' "${TRE
 grep -q 'Double-increment left ghost' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'Zap-closing connection' "${TREE}/backend/src/api/model/connection_manager.rs"
 grep -q 'Take first hop if comma-separated' "${TREE}/backend/src/auth/fingerprint.rs"
-grep -q 'PlaylistItemType::Live && stream.session_token.is_some()' "${TREE}/backend/src/api/model/active_user_manager.rs"
+grep -q 'has_other_channel_for_zap_client' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'active_channels.contains' "${TREE}/frontend/src/hooks/use_server_status.rs"
 grep -q 'Live/.ts media under a session' "${TREE}/frontend/src/hooks/use_server_status.rs"
+if grep -q 'PlaylistItemType::Live && stream.session_token.is_some()' "${TREE}/backend/src/api/model/active_user_manager.rs"; then
+  echo "ERROR: backend must not soft-preserve plain Live+session (TTL cuts live)" >&2
+  exit 1
+fi
 
 # Must NOT cancel provider TCP on normal release (that cut live mid-watch).
 if grep -q 'Abort upstream TCP immediately on normal release' "${TREE}/backend/src/api/model/active_provider_manager.rs"; then
