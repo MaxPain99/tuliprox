@@ -1,16 +1,13 @@
 #!/bin/bash
 # Apply MaxPain tuliprox patches for Release/Docker builds.
 #
-# Upstream euzu/tuliprox#807 landed Flussonic/BitTV archive catchup + Streams sticky panel.
-# This script applies:
-#   1) streams-panel-zap — Streams panel Live sticky + channel zap (no nuclear socket terminate)
-#   2) user-hide-adult — per-user adult filtering
+# Upstream euzu/tuliprox already includes Flussonic/Streams sticky (#807), Windows (#806),
+# ghost connection slots (#815), and later develop fixes. This script applies only:
+#   1) user-hide-adult — per-user adult filtering
 #
 # Usage:
 #   ./scripts/apply-maxpain-flussonic.sh [TREE]
 #   TULIPROX_ROOT=/path/to/tuliprox ./scripts/apply-maxpain-flussonic.sh
-#
-# Note: EPG url-tvg, EXTVLCOPT, Windows #806, and Flussonic/Streams sticky (#807) are upstream.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,7 +15,6 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TREE="$(cd "${1:-${TULIPROX_ROOT:-${ROOT_DIR}}}" && pwd)"
 
 PATCHES=(
-  "streams-panel-zap.patch"
   "user-hide-adult.patch"
 )
 
@@ -173,17 +169,9 @@ for name in "${PATCHES[@]}"; do
   apply_one_patch "${ROOT_DIR}/patches/${name}"
 done
 
-# Sanity: #807 Flussonic/Streams sticky is upstream (do not re-apply).
-grep -q 'ProcessHandle' "${TREE}/backend/src/api/sys_usage.rs"
-grep -q 'M3U_APPEND_MODE_DEFAULT_TEMPLATE' "${TREE}/backend/src/iptv/m3u/catchup.rs"
-grep -q 'append_unified_catchup_type_attributes' "${TREE}/shared/src/model/playlist.rs"
-grep -q 'Prefer `catchup-type` when both are set' "${TREE}/shared/src/model/stream_properties.rs"
-grep -q 'resolve_leaked_hls_relative_origin' "${TREE}/backend/src/api/endpoints/hls_api.rs"
+# Sanity: upstream Streams sticky still present (do not re-patch).
 grep -q 'panel_streams' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'panel_streams' "${TREE}/backend/src/api/endpoints/v1_api.rs"
 grep -q 'is_sticky_session_stream' "${TREE}/frontend/src/hooks/use_server_status.rs"
-grep -q 'prune_zapped_preserved_streams' "${TREE}/frontend/src/hooks/use_server_status.rs"
-grep -q 'overflow-y: auto' "${TREE}/frontend/scss/app/components/dashboard/_streams_view.scss"
 
 # Sanity: Hide Adult patch applied.
 grep -q 'hide_adult' "${TREE}/shared/src/model/config/api_user.rs"
@@ -194,25 +182,15 @@ grep -q 'HIDE_ADULT' "${TREE}/frontend/src/app/components/userlist/proxy_user_cr
 grep -q 'adult_epg_id_blocklist' "${TREE}/backend/src/api/endpoints/xmltv_api.rs"
 grep -q 'let hide_adult = user.hide_adult' "${TREE}/backend/src/repository/m3u_playlist_iterator.rs"
 
-# Sanity: streams-panel-zap applied.
-grep -q 'other_active_by_client' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'PlaylistItemType::Live && stream.session_token.is_some()' "${TREE}/backend/src/api/model/active_user_manager.rs"
-grep -q 'active_channels.contains' "${TREE}/frontend/src/hooks/use_server_status.rs"
-grep -q 'PlaylistItemType::Live && stream.session_token.is_some()' "${TREE}/frontend/src/hooks/use_server_status.rs"
-
-# Nuclear zap must stay out (cut live mid-watch in v3.3.108–112).
-if grep -q 'terminate_other_channel_sessions_for_client_ip' "${TREE}/backend/src/api/model/active_user_manager.rs"; then
-  echo "ERROR: nuclear zap terminate_other_channel_sessions must not be patched" >&2
+# streams-panel-zap must stay out.
+if grep -q 'other_active_by_client' "${TREE}/backend/src/api/model/active_user_manager.rs"; then
+  echo "ERROR: streams-panel-zap other_active_by_client must not be patched" >&2
   exit 1
 fi
-if grep -q 'zap_close_other_channel_playback' "${TREE}/backend/src/api/api_utils.rs"; then
-  echo "ERROR: zap_close_other_channel_playback must not be patched" >&2
-  exit 1
-fi
-if grep -q 'Abort upstream TCP immediately on normal release' "${TREE}/backend/src/api/model/active_provider_manager.rs"; then
-  echo "ERROR: cancel_token on normal provider release must not be patched" >&2
+if [[ -f "${ROOT_DIR}/patches/streams-panel-zap.patch" ]]; then
+  echo "ERROR: streams-panel-zap.patch must be removed" >&2
   exit 1
 fi
 
-echo "MaxPain patches applied OK (streams-panel-zap + Hide Adult; Flussonic/Streams #807 is upstream)"
+echo "MaxPain patches applied OK (Hide Adult only; Streams/Flussonic are upstream)"
 echo "Rebuild tuliprox and refresh playlists."
