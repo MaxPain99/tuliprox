@@ -4,20 +4,34 @@
 # LiveHls segment gaps soft-preserve the stream, then next segment Activate returned
 # Exhausted and kick-evicted the SAME session (retry storm / disconnect).
 # Restore 3.3.78 entitlement via session_has_stream (includes preserved).
+# Remove unused session_has_active_stream helper (dead_code with -D warnings).
 # Keep #815 ghost-slot fix (no increment_kind on preserved reactivation).
 #
 diff --git a/backend/src/api/model/active_user_manager.rs b/backend/src/api/model/active_user_manager.rs
-index 07e5f678..47164c74 100644
+index 07e5f678..914314d7 100644
 --- a/backend/src/api/model/active_user_manager.rs
 +++ b/backend/src/api/model/active_user_manager.rs
-@@ -1889,9 +1889,12 @@ impl ActiveUserManager {
+@@ -1798,12 +1798,6 @@ impl ActiveUserManager {
+         connection_data.streams.iter().any(|stream| stream.session_token.as_deref() == Some(session_token))
+     }
+ 
+-    fn session_has_active_stream(connection_data: &UserConnectionData, session_token: &str) -> bool {
+-        connection_data
+-            .streams
+-            .iter()
+-            .any(|stream| !stream.preserved && stream.session_token.as_deref() == Some(session_token))
+-    }
+ 
+     fn clear_session_counted_without_stream(connection_data: &mut UserConnectionData, session_token: &str) {
+         if Self::session_has_stream(connection_data, session_token) {
+@@ -1889,9 +1883,12 @@ impl ActiveUserManager {
              return self.check_connection_admission(username, connection_data);
          };
  
 -        // Existing counted session or session with an active stream: entitled to its slot.
 +        // Existing counted session or any stream row for this token (including soft-preserved
 +        // HLS/Catchup between segments): entitled to its slot. #807 switched this to
-+        // `session_has_active_stream` only, so every LiveHls segment gap returned Exhausted
++        // active-only stream checks, so every LiveHls segment gap returned Exhausted
 +        // and kick-evicted/terminated the same session (retry storm since v3.3.79).
          if connection_data.sessions[session_index].lifecycle.is_counted()
 -            || Self::session_has_active_stream(connection_data, session_token)
@@ -25,7 +39,7 @@ index 07e5f678..47164c74 100644
          {
              return ConnectionAdmission {
                  permission: UserConnectionPermission::Allowed,
-@@ -1899,22 +1902,14 @@ impl ActiveUserManager {
+@@ -1899,22 +1896,14 @@ impl ActiveUserManager {
              };
          }
  
@@ -51,7 +65,7 @@ index 07e5f678..47164c74 100644
          if admission.permission == UserConnectionPermission::Allowed {
              let session = &mut connection_data.sessions[session_index];
              Self::update_session_admission(session, admission.permission, admission.kind);
-@@ -8252,7 +8247,7 @@ mod tests {
+@@ -8252,7 +8241,7 @@ mod tests {
              )
              .await;
  
@@ -60,7 +74,7 @@ index 07e5f678..47164c74 100644
          assert_eq!(admission.kind, Some(ConnectionKind::Normal));
          let connections = manager.connections.read().await;
          let connection_data = connections.by_key.get(&user.username).expect("user connection data");
-@@ -8289,7 +8284,7 @@ mod tests {
+@@ -8289,7 +8278,7 @@ mod tests {
                  session_token,
              )
              .await;
@@ -69,7 +83,7 @@ index 07e5f678..47164c74 100644
          {
              let connections = manager.connections.read().await;
              let connection_data = connections.by_key.get(&user.username).expect("user connection data");
-@@ -8344,7 +8339,7 @@ mod tests {
+@@ -8344,7 +8333,7 @@ mod tests {
                  session_token,
              )
              .await;
@@ -78,7 +92,7 @@ index 07e5f678..47164c74 100644
          {
              let connections = manager.connections.read().await;
              let connection_data = connections.by_key.get(&user.username).expect("user connection data");
-@@ -8403,7 +8398,7 @@ mod tests {
+@@ -8403,7 +8392,7 @@ mod tests {
                      session_token,
                  )
                  .await;
@@ -87,7 +101,7 @@ index 07e5f678..47164c74 100644
  
              let counter_changed = manager
                  .release_session_streams_and_counted_reservation(&user.username, session_token)
-@@ -8449,7 +8444,7 @@ mod tests {
+@@ -8449,7 +8438,7 @@ mod tests {
                  session_token,
              )
              .await;

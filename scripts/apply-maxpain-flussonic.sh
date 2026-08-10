@@ -178,13 +178,9 @@ grep -q 'is_sticky_session_stream' "${TREE}/frontend/src/hooks/use_server_status
 # Sanity: HLS soft-preserve reactivation fix applied.
 grep -q 'session_has_stream(connection_data, session_token)' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'kick-evicted/terminated the same session' "${TREE}/backend/src/api/model/active_user_manager.rs"
-if grep -q 'session_has_active_stream(connection_data, session_token)' "${TREE}/backend/src/api/model/active_user_manager.rs"; then
-  # Helper may still exist; entitlement path must not use it for activation.
-  if grep -n 'connection_admission_for_session_activation' -A40 "${TREE}/backend/src/api/model/active_user_manager.rs" \
-    | grep -q 'session_has_active_stream(connection_data, session_token)'; then
-    echo "ERROR: session activation must use session_has_stream (includes preserved)" >&2
-    exit 1
-  fi
+if grep -q 'fn session_has_active_stream' "${TREE}/backend/src/api/model/active_user_manager.rs"; then
+  echo "ERROR: unused session_has_active_stream helper must be removed (dead_code)" >&2
+  exit 1
 fi
 
 # Sanity: Hide Adult patch applied.
