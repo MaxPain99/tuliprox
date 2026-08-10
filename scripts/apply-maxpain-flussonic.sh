@@ -2,8 +2,9 @@
 # Apply MaxPain tuliprox patches for Release/Docker builds.
 #
 # Upstream euzu/tuliprox already includes Flussonic/Streams sticky (#807), Windows (#806),
-# ghost connection slots (#815), and later develop fixes. This script applies only:
-#   1) user-hide-adult — per-user adult filtering
+# ghost connection slots (#815), and later develop fixes. This script applies:
+#   1) fix-hls-soft-preserve-reactivation — restore 3.3.78 same-session HLS reopen (#807 regression)
+#   2) user-hide-adult — per-user adult filtering
 #
 # Usage:
 #   ./scripts/apply-maxpain-flussonic.sh [TREE]
@@ -15,6 +16,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TREE="$(cd "${1:-${TULIPROX_ROOT:-${ROOT_DIR}}}" && pwd)"
 
 PATCHES=(
+  "fix-hls-soft-preserve-reactivation.patch"
   "user-hide-adult.patch"
 )
 
@@ -173,6 +175,18 @@ done
 grep -q 'panel_streams' "${TREE}/backend/src/api/model/active_user_manager.rs"
 grep -q 'is_sticky_session_stream' "${TREE}/frontend/src/hooks/use_server_status.rs"
 
+# Sanity: HLS soft-preserve reactivation fix applied.
+grep -q 'session_has_stream(connection_data, session_token)' "${TREE}/backend/src/api/model/active_user_manager.rs"
+grep -q 'kick-evicted/terminated the same session' "${TREE}/backend/src/api/model/active_user_manager.rs"
+if grep -q 'session_has_active_stream(connection_data, session_token)' "${TREE}/backend/src/api/model/active_user_manager.rs"; then
+  # Helper may still exist; entitlement path must not use it for activation.
+  if grep -n 'connection_admission_for_session_activation' -A40 "${TREE}/backend/src/api/model/active_user_manager.rs" \
+    | grep -q 'session_has_active_stream(connection_data, session_token)'; then
+    echo "ERROR: session activation must use session_has_stream (includes preserved)" >&2
+    exit 1
+  fi
+fi
+
 # Sanity: Hide Adult patch applied.
 grep -q 'hide_adult' "${TREE}/shared/src/model/config/api_user.rs"
 grep -q 'is_adult_group' "${TREE}/backend/src/model/config/api_user.rs"
@@ -192,5 +206,5 @@ if [[ -f "${ROOT_DIR}/patches/streams-panel-zap.patch" ]]; then
   exit 1
 fi
 
-echo "MaxPain patches applied OK (Hide Adult only; Streams/Flussonic are upstream)"
+echo "MaxPain patches applied OK (HLS soft-preserve fix + Hide Adult)"
 echo "Rebuild tuliprox and refresh playlists."
