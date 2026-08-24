@@ -66,7 +66,8 @@ jobs:
           chmod +x ./bin/inc_version.sh
           if [[ "${{ github.event_name }}" == "push" ]]; then
             case "${{ github.ref_name }}" in
-              develop) ./bin/inc_version.sh ;;
+              # Keep fork version identical to upstream; bump only when syncing from euzu.
+              develop) echo "Develop builds keep the committed upstream version; skipping version bump." ;;
               master) echo "Master builds use the version already committed in the merged PR; skipping version bump." ;;
               *) echo "Unsupported push branch: ${{ github.ref_name }}" >&2; exit 1 ;;
             esac
@@ -96,11 +97,11 @@ jobs:
           VERSION="${{ steps.version.outputs.value }}"
           IFS='.' read -r major minor patch <<< "${VERSION}"
           if [[ -z "${major}" || -z "${minor}" || -z "${patch}" ]]; then
-            echo "🧨 Invalid semantic version: ${VERSION}" >&2
+            echo "ЁЯзи Invalid semantic version: ${VERSION}" >&2
             exit 1
           fi
           if [[ "${patch}" != "0" ]]; then
-            echo "🧨 Refusing master release for non-release version ${VERSION}. Patch component must be 0." >&2
+            echo "ЁЯзи Refusing master release for non-release version ${VERSION}. Patch component must be 0." >&2
             exit 1
           fi
 
@@ -140,19 +141,19 @@ jobs:
           )
           for resource in "${required_resources[@]}"; do
             if [[ ! -f "resources/${resource}.ts" ]]; then
-              echo "🧨 Missing resource: resources/${resource}.ts"
+              echo "ЁЯзи Missing resource: resources/${resource}.ts"
               exit 1
             fi
           done
       - name: Commit version bump
         if: >-
-          (github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.branch != 'master')
+          github.event_name == 'workflow_dispatch' && github.event.inputs.branch != 'master'
         id: version_commit
         run: |
           git config user.name "euzu"
           git config user.email "euzu@proton.me"
-          git add .
+          # Only stage version files тАФ never commit the applied MaxPain patch tree into develop.
+          git add Cargo.toml Cargo.lock frontend/Cargo.toml
           if git diff --cached --quiet; then
             echo "did_commit=false" >> "$GITHUB_OUTPUT"
           else
@@ -163,6 +164,15 @@ jobs:
             git tag -a "v$VERSION" -m "v$VERSION"
             echo "did_commit=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # Apply after the version commit so patched sources never land on develop.
+      # Zap + Hide Adult stay patch-based; Flussonic/Streams sticky landed upstream in #807.
+      - name: Apply MaxPain patches
+        run: |
+          set -euo pipefail
+          chmod +x scripts/apply-maxpain-flussonic.sh
+          ./scripts/apply-maxpain-flussonic.sh .
+          echo "Applied: user-hide-adult.patch"
 
       - name: Build and push Docker images
         env:
@@ -218,10 +228,8 @@ jobs:
       - name: Push version bump
         if: >-
           success() &&
-          (
-            (github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
-            (github.event_name == 'workflow_dispatch' && github.event.inputs.branch != 'master')
-          ) &&
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.branch != 'master' &&
           steps.version_commit.outputs.did_commit == 'true'
         run: |
           # Use origin HEAD to push to the correct remote branch, and push tags
