@@ -69,13 +69,10 @@ jobs:
 
       - name: Test MaxPain deltas
         run: |
-          cargo test -p tuliprox parses_flat_tivimate_hls_archive --locked
-          cargo test -p tuliprox resolve_default_mode_query_template_keeps_base_stream_url --locked
-          cargo test -p tuliprox leaked_dvr_relative_joins_against_media_playlist --locked
-          cargo test -p tuliprox date_tree_path_recovers_bittv_archive_epg_reference --locked
-          cargo test -p tuliprox append_catchup_session_hint_keeps_m3u_catchup_token_without_shared_hls_cache --locked
-          cargo test -p tuliprox append_discriminator_embeds_archive_start_for_panel_epg --locked
           cargo test -p tuliprox adult_group_matcher_covers_bittv_style_names --locked
+          cargo test -p tuliprox allows_group_respects_hide_adult_flag --locked
+          cargo test -p tuliprox allows_playlist_item_honors_xtream_is_adult_flag --locked
+          cargo test -p tuliprox proxy_user_credentials_roundtrip_preserves_hide_adult --locked
 
       - name: Build frontend
         run: |

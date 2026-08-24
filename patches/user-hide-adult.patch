@@ -327,7 +327,7 @@ index 8f38a39c..da20d0fb 100644
      async fn xmltv_output_uses_canonical_channel_ids_and_only_lowercases_display_names() {
          let dir = tempdir().expect("temp dir");
 diff --git a/backend/src/api/endpoints/xtream_api.rs b/backend/src/api/endpoints/xtream_api.rs
-index 811f85ff..86459798 100644
+index 811f85ff..b7ed6372 100644
 --- a/backend/src/api/endpoints/xtream_api.rs
 +++ b/backend/src/api/endpoints/xtream_api.rs
 @@ -319,7 +319,8 @@ async fn xtream_player_api_stream(
@@ -348,15 +348,7 @@ index 811f85ff..86459798 100644
      {
          return axum::http::StatusCode::NOT_FOUND.into_response();
      }
-@@ -1490,7 +1492,6 @@ async fn xtream_player_api_handle_content_action(
-                         if let Some(fltr) = filter {
-                             categories.retain(|c| fltr.contains(&c.category_id));
-                         }
--                        // Hide categories fully filtered out by the user's content filter.
-                         if let Some(visible) = crate::api::endpoints::user_visibility::collect_visible_category_ids(
-                             &app_state.app_config,
-                             target,
-@@ -1503,6 +1504,9 @@ async fn xtream_player_api_handle_content_action(
+@@ -1503,6 +1505,9 @@ async fn xtream_player_api_handle_content_action(
                                  c.category_id.parse::<u32>().is_ok_and(|id| visible.contains(&id))
                              });
                          }
@@ -867,7 +859,7 @@ index 00000000..7302c176
 +    }
 +}
 diff --git a/backend/src/repository/bplustree/migration.rs b/backend/src/repository/bplustree/migration.rs
-index c66b5188..0f1f50ac 100644
+index c66b5188..e181283f 100644
 --- a/backend/src/repository/bplustree/migration.rs
 +++ b/backend/src/repository/bplustree/migration.rs
 @@ -483,7 +483,7 @@ fn marker_file_name() -> String { format!("{MARKER_FILE_GUARD_PREFIX}{STORAGE_VE
@@ -895,47 +887,64 @@ index c66b5188..0f1f50ac 100644
              comment: v6.comment.clone(),
              priority: v6.priority,
              soft_connections: v6.soft_connections,
-@@ -1430,6 +1432,7 @@ mod tests {
+@@ -1424,6 +1426,7 @@ mod tests {
+         assert_eq!(user.username, "alice");
+         assert_eq!(user.epg_request_timeshift.as_deref(), Some("2"));
+         assert_eq!(user.output_clusters, ClusterFlags::all());
++        assert!(!user.hide_adult);
+         assert_eq!(user.priority, None);
+         assert_eq!(user.soft_connections, None);
+         assert_eq!(user.soft_priority, None);
+@@ -1473,6 +1476,7 @@ mod tests {
+             .query(&"bob".to_string())
+             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bob missing after migration"))?;
+         assert_eq!(user.output_clusters, ClusterFlags::all());
++        assert!(!user.hide_adult);
+         assert_eq!(user.priority, Some(5));
+         assert_eq!(user.soft_connections, None);
+         assert_eq!(user.soft_priority, None);
+@@ -1523,6 +1527,7 @@ mod tests {
+             .query(&"carol".to_string())
+             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "carol missing after migration"))?;
+         assert_eq!(user.output_clusters, ClusterFlags::all());
++        assert!(!user.hide_adult);
+         assert_eq!(user.soft_connections, Some(2));
+         assert_eq!(user.soft_priority, Some(-4));
          assert_eq!(user.network_access, None);
-         assert_eq!(user.plan, None);
-         assert_eq!(user.filter, None);
+@@ -1573,6 +1578,7 @@ mod tests {
+             .query(&"dave".to_string())
+             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "dave missing after v7 migration"))?;
+         assert_eq!(user.output_clusters, ClusterFlags::Live | ClusterFlags::Vod);
 +        assert!(!user.hide_adult);
+         assert_eq!(user.priority, Some(5));
+         assert_eq!(user.soft_connections, Some(2));
+         assert_eq!(user.soft_priority, Some(-4));
+@@ -1589,8 +1595,7 @@ mod tests {
+         let db_path = temp.path().join(storage_const::API_USER_DB_FILE);
+         let merge_guard_path = user_db_merge_guard_path(temp.path());
  
-         Ok(())
-     }
-@@ -1479,6 +1482,8 @@ mod tests {
-         assert_eq!(user.network_access, None);
-         assert_eq!(user.plan, None);
- 
+-        let mut v6_tree: super::super::v2::BPlusTree<String, StoredApiUserV6> =
+-            super::super::v2::BPlusTree::new();
++        let mut v6_tree: BPlusTree<String, StoredApiUserV6> = BPlusTree::new();
+         v6_tree.insert(
+             "erin".to_string(),
+             StoredApiUserV6 {
+@@ -1630,6 +1635,7 @@ mod tests {
+             .query(&"erin".to_string())
+             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "erin missing after v7 migration"))?;
+         assert_eq!(user.output_clusters, ClusterFlags::Live | ClusterFlags::Vod);
 +        assert!(!user.hide_adult);
-+
-         Ok(())
-     }
- 
-@@ -1579,6 +1584,7 @@ mod tests {
-         assert_eq!(user.network_access, None);
-         assert_eq!(user.plan, None);
-         assert_eq!(user.filter, None);
-+        assert!(!user.hide_adult);
- 
-         Ok(())
-     }
-@@ -1639,6 +1645,7 @@ mod tests {
-         );
-         assert_eq!(user.plan, None);
-         assert_eq!(user.filter, None);
-+        assert!(!user.hide_adult);
- 
-         Ok(())
-     }
-@@ -1689,6 +1696,7 @@ mod tests {
-             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "frank missing after v7 detection"))?;
-         assert_eq!(user.plan.as_deref(), Some("basic"));
-         assert_eq!(user.filter.as_deref(), Some(r#"Group ~ "^DE.*""#));
-+        assert!(user.hide_adult);
- 
-         Ok(())
-     }
+         assert_eq!(user.priority, Some(5));
+         assert_eq!(user.soft_connections, Some(2));
+         assert_eq!(user.soft_priority, Some(-4));
+@@ -1667,6 +1673,7 @@ mod tests {
+                 status: Some(ProxyUserStatus::Active),
+                 output_clusters: ClusterFlags::all(),
+                 ui_enabled: true,
++                hide_adult: true,
+                 comment: None,
+                 priority: None,
+                 soft_connections: None,
 diff --git a/backend/src/repository/m3u_playlist_iterator.rs b/backend/src/repository/m3u_playlist_iterator.rs
 index 4b692796..7c389a81 100644
 --- a/backend/src/repository/m3u_playlist_iterator.rs
@@ -1020,7 +1029,7 @@ index 131054e7..a74774c3 100644
              priority: 0,
              soft_connections: 0,
 diff --git a/backend/src/repository/xtream_playlist_iterator.rs b/backend/src/repository/xtream_playlist_iterator.rs
-index 0cfafdfb..5095021d 100644
+index 0cfafdfb..2357ef1b 100644
 --- a/backend/src/repository/xtream_playlist_iterator.rs
 +++ b/backend/src/repository/xtream_playlist_iterator.rs
 @@ -70,6 +70,7 @@ impl XtreamPlaylistIterator {
@@ -1062,6 +1071,33 @@ index 0cfafdfb..5095021d 100644
          // per-user content filter (plan AND user), applied post-cache
          if let Some(filter) = user_filter {
              let pli = shared::model::PlaylistItem::from(item);
+@@ -291,17 +300,25 @@ mod tests {
+         );
+ 
+         // no filter: everything passes
+-        assert!(XtreamPlaylistIterator::matches_filters(XtreamCluster::Live, None, None, &make_item("VIP Sports")));
++        assert!(XtreamPlaylistIterator::matches_filters(
++            XtreamCluster::Live,
++            None,
++            false,
++            None,
++            &make_item("VIP Sports")
++        ));
+         // filter hides matching groups, keeps the rest
+         assert!(!XtreamPlaylistIterator::matches_filters(
+             XtreamCluster::Live,
+             None,
++            false,
+             Some(&filter),
+             &make_item("VIP Sports")
+         ));
+         assert!(XtreamPlaylistIterator::matches_filters(
+             XtreamCluster::Live,
+             None,
++            false,
+             Some(&filter),
+             &make_item("News")
+         ));
 diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
 index 8ef3fb53..ecc5e963 100644
 --- a/frontend/public/assets/i18n/ar.json
