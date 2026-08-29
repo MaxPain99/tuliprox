@@ -1,3 +1,15 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index f741f07b..62859f1f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4781,6 +4781,7 @@ dependencies = [
+  "bytes",
+  "chrono",
+  "crc32fast",
++ "dashmap",
+  "env_logger",
+  "filetime",
+  "futures",
 diff --git a/backend/app/src/api/api_utils.rs b/backend/app/src/api/api_utils.rs
 index 235681a4..c83dd08a 100644
 --- a/backend/app/src/api/api_utils.rs
@@ -355,37 +367,769 @@ index 81036a84..d15bf3ca 100644
                      }
                      Err(err) => error!("Failed to parse json file {}: {err}", file_path.display()),
 diff --git a/backend/core/src/model/config/api_user.rs b/backend/core/src/model/config/api_user.rs
-index 60f59fcf..b0402c07 100644
+index 60f59fcf..d3295b0a 100644
 --- a/backend/core/src/model/config/api_user.rs
 +++ b/backend/core/src/model/config/api_user.rs
-@@ -106,6 +106,7 @@ pub struct ProxyUserCredentials {
-     pub status: Option<ProxyUserStatus>,
-     pub output_clusters: ClusterFlags,
-     pub ui_enabled: bool,
+@@ -1,424 +1,505 @@
+-use crate::model::{macros, AppConfig, Config, UserPlan};
+-use arc_swap::{access::Access, ArcSwap};
+-use chrono::Local;
+-use log::{debug, error, warn};
+-use shared::{
+-    foundation::{get_filter, BinaryOperator, Filter},
+-    model::{
+-        ClusterFlags, NetworkAccessDto, ProxyType, ProxyUserCredentialsDto, ProxyUserStatus, TargetUserDto,
+-        XtreamCluster,
+-    },
+-};
+-use std::{collections::HashMap, sync::Arc};
+-use zeroize::Zeroize;
+-
+-#[derive(Debug, Clone, PartialEq, Eq)]
+-pub enum ProxyUserPermissionDenyReason {
+-    Expired,
+-    Disabled,
+-    Banned,
+-    ExpiredStatus,
+-    Inactive,
+-    UnresolvedPlan,
+-    InvalidFilter,
+-}
+-
+-#[derive(Debug, Clone, Default)]
+-pub struct NetworkAccess {
+-    pub allowed_countries: Vec<String>,
+-    pub allowed_networks: Vec<ipnet::IpNet>,
+-}
+-
+-impl NetworkAccess {
+-    pub fn is_empty(&self) -> bool { self.allowed_countries.is_empty() && self.allowed_networks.is_empty() }
+-}
+-
+-impl From<&NetworkAccessDto> for NetworkAccess {
+-    fn from(dto: &NetworkAccessDto) -> Self {
+-        let mut seen_countries = std::collections::HashSet::new();
+-        let allowed_countries: Vec<String> = dto
+-            .allowed_countries
+-            .as_ref()
+-            .map(|countries| {
+-                countries
+-                    .iter()
+-                    .filter_map(|c| {
+-                        let upper = c.trim().to_uppercase();
+-                        if upper.is_empty() {
+-                            None
+-                        } else if seen_countries.insert(upper.clone()) {
+-                            Some(upper)
+-                        } else {
+-                            None
+-                        }
+-                    })
+-                    .collect()
+-            })
+-            .unwrap_or_default();
+-
+-        let allowed_networks: Vec<ipnet::IpNet> = dto
+-            .allowed_networks
+-            .as_ref()
+-            .map(|networks| {
+-                networks
+-                    .iter()
+-                    .filter_map(|n| match n.trim().parse::<ipnet::IpNet>() {
+-                        Ok(net) => Some(net),
+-                        Err(err) => {
+-                            warn!("Skipping invalid CIDR '{n}': {err}");
+-                            None
+-                        }
+-                    })
+-                    .collect()
+-            })
+-            .unwrap_or_default();
+-
+-        Self { allowed_countries, allowed_networks }
+-    }
+-}
+-
+-impl From<&NetworkAccess> for NetworkAccessDto {
+-    fn from(instance: &NetworkAccess) -> Self {
+-        let allowed_countries =
+-            if instance.allowed_countries.is_empty() { None } else { Some(instance.allowed_countries.clone()) };
+-        let allowed_networks = if instance.allowed_networks.is_empty() {
+-            None
+-        } else {
+-            Some(instance.allowed_networks.iter().map(std::string::ToString::to_string).collect())
+-        };
+-        Self { allowed_countries, allowed_networks }
+-    }
+-}
+-
+-#[derive(Debug, Clone, Default)]
+-#[allow(clippy::struct_excessive_bools)]
+-pub struct ProxyUserCredentials {
+-    pub username: String,
+-    pub password: String,
+-    pub token: Option<String>,
+-    pub proxy: ProxyType,
+-    pub server: Option<String>,
+-    pub epg_timeshift: Option<String>,
+-    pub epg_request_timeshift: Option<String>,
+-    pub created_at: Option<i64>,
+-    pub exp_date: Option<i64>,
+-    pub max_connections: u32,
+-    pub status: Option<ProxyUserStatus>,
+-    pub output_clusters: ClusterFlags,
+-    pub ui_enabled: bool,
+-    pub comment: Option<String>,
+-    pub priority: i8,
+-    pub soft_connections: u16,
+-    pub soft_priority: i8,
+-    pub t_is_api_user: bool,
+-    pub network_access: Option<NetworkAccess>,
+-    /// Capability tier name; resolved via `resolve_plan`.
+-    pub plan: Option<String>,
+-    /// Raw user-level content filter (DSL); AND-combined with the plan filter.
+-    pub filter: Option<String>,
+-    // Raw configured values (None/0 = inherit from plan). The sibling
+-    // non-raw fields hold the resolved serving values after resolve_plan();
+-    // persistence (YAML/DB) always writes the raw values so plan edits
+-    // keep propagating to members.
+-    pub raw_output_clusters: Option<ClusterFlags>,
+-    pub raw_max_connections: u32,
+-    pub raw_soft_connections: u16,
+-    pub raw_proxy: Option<ProxyType>,
+-    /// Compiled content filter (plan AND user), applied at serve time.
+-    pub t_filter: Option<Arc<Filter>>,
+-    /// True when `plan` references a plan that no longer exists; the user is denied.
+-    pub t_has_unresolved_plan: bool,
+-    /// True when the configured user filter failed to compile; the user is denied.
+-    pub t_has_invalid_filter: bool,
+-}
+-
+-macros::from_impl!(ProxyUserCredentials);
+-impl From<&ProxyUserCredentialsDto> for ProxyUserCredentials {
+-    fn from(dto: &ProxyUserCredentialsDto) -> Self {
+-        Self {
+-            username: dto.username.clone(),
+-            password: dto.password.clone(),
+-            token: dto.token.clone(),
+-            proxy: dto.proxy,
+-            server: dto.server.clone(),
+-            epg_timeshift: dto.epg_timeshift.clone(),
+-            epg_request_timeshift: dto.epg_request_timeshift.clone(),
+-            created_at: dto.created_at,
+-            exp_date: dto.exp_date,
+-            max_connections: dto.max_connections,
+-            status: dto.status,
+-            output_clusters: dto.output_clusters.unwrap_or_else(ClusterFlags::all),
+-            ui_enabled: dto.ui_enabled,
+-            comment: dto.comment.clone(),
+-            priority: dto.priority,
+-            soft_connections: dto.soft_connections,
+-            soft_priority: dto.soft_priority,
+-            t_is_api_user: false,
+-            network_access: dto
+-                .network_access
+-                .as_ref()
+-                .map(NetworkAccess::from)
+-                .filter(|network_access| !network_access.is_empty()),
+-            plan: dto.plan.clone(),
+-            filter: dto.filter.clone(),
+-            raw_output_clusters: dto.output_clusters,
+-            raw_max_connections: dto.max_connections,
+-            raw_soft_connections: dto.soft_connections,
+-            raw_proxy: if dto.proxy == ProxyType::default() && dto.plan.is_some() { None } else { Some(dto.proxy) },
+-            t_filter: None,
+-            t_has_unresolved_plan: false,
+-            t_has_invalid_filter: false,
+-        }
+-    }
+-}
+-
+-impl From<&ProxyUserCredentials> for ProxyUserCredentialsDto {
+-    fn from(instance: &ProxyUserCredentials) -> Self {
+-        Self {
+-            username: instance.username.clone(),
+-            password: instance.password.clone(),
+-            token: instance.token.clone(),
+-            proxy: instance.raw_proxy.unwrap_or(instance.proxy),
+-            server: instance.server.clone(),
+-            epg_timeshift: instance.epg_timeshift.clone(),
+-            epg_request_timeshift: instance.epg_request_timeshift.clone(),
+-            created_at: instance.created_at,
+-            exp_date: instance.exp_date,
+-            // Persist raw (pre-plan-resolution) values so plan edits keep propagating.
+-            max_connections: instance.raw_max_connections,
+-            status: instance.status,
+-            output_clusters: instance.raw_output_clusters.filter(|flags| !flags.is_all()),
+-            ui_enabled: instance.ui_enabled,
+-            comment: instance.comment.clone(),
+-            priority: instance.priority,
+-            soft_connections: instance.raw_soft_connections,
+-            soft_priority: instance.soft_priority,
+-            network_access: instance.network_access.as_ref().map(NetworkAccessDto::from),
+-            plan: instance.plan.clone(),
+-            filter: instance.filter.clone(),
+-        }
+-    }
+-}
+-
+-impl ProxyUserCredentials {
+-    /// Fill unset capability values from the referenced plan and compile the
+-    /// combined content filter. Idempotent; call after any load/conversion.
+-    pub fn resolve_plan(&mut self, plans: &HashMap<String, Arc<UserPlan>>) {
+-        let plan = self.plan.as_ref().and_then(|name| plans.get(name));
+-        self.t_has_unresolved_plan = self.plan.is_some() && plan.is_none();
+-        if self.t_has_unresolved_plan {
+-            error!(
+-                "Unknown user plan {:?} for user {}; access is denied until the plan exists or the reference is removed",
+-                self.plan, self.username
+-            );
+-        }
+-        self.output_clusters =
+-            self.raw_output_clusters.or_else(|| plan.and_then(|p| p.output_clusters)).unwrap_or_else(ClusterFlags::all);
+-        if let Some(plan_proxy) = plan.and_then(|p| p.proxy) {
+-            self.proxy = self.raw_proxy.unwrap_or(plan_proxy);
+-        }
+-        self.max_connections =
+-            if self.raw_max_connections > 0 { self.raw_max_connections } else { plan.map_or(0, |p| p.max_connections) };
+-        self.soft_connections = if self.raw_soft_connections > 0 {
+-            self.raw_soft_connections
+-        } else {
+-            plan.map_or(0, |p| p.soft_connections)
+-        };
+-
+-        let plan_filter = plan.and_then(|p| p.t_filter.as_ref().map(Arc::clone));
+-        self.t_has_invalid_filter = false;
+-        let user_filter = self.filter.as_ref().and_then(|raw| match get_filter(raw, None) {
+-            Ok(filter) => Some(Arc::new(filter)),
+-            Err(err) => {
+-                error!(
+-                    "Invalid filter for user {}; access is denied until the filter is fixed or removed: {err}",
+-                    self.username
+-                );
+-                self.t_has_invalid_filter = true;
+-                None
+-            }
+-        });
+-        self.t_filter = match (plan_filter, user_filter) {
+-            // Group both sides so OR expressions keep their intended precedence.
+-            (Some(plan), Some(user)) => Some(Arc::new(Filter::BinaryExpression(
+-                Box::new(Filter::Group(Box::new((*plan).clone()))),
+-                BinaryOperator::And,
+-                Box::new(Filter::Group(Box::new((*user).clone()))),
+-            ))),
+-            (Some(filter), None) | (None, Some(filter)) => Some(filter),
+-            (None, None) => None,
+-        };
+-    }
+-
+-    /// True when the compiled content filter (plan AND user) permits this item.
+-    /// Users without a filter see everything.
+-    pub fn allows_content(&self, pli: &shared::model::PlaylistItem) -> bool {
+-        self.t_filter.as_ref().is_none_or(|filter| {
+-            let provider = shared::foundation::ValueProvider { pli, match_as_ascii: false };
+-            filter.filter(&provider)
+-        })
+-    }
+-
+-    pub fn matches_token(&self, token: &str) -> bool {
+-        if let Some(tkn) = &self.token {
+-            return crate::utils::constant_time_eq(tkn.as_bytes(), token.as_bytes());
+-        }
+-        false
+-    }
+-
+-    pub fn matches(&self, username: &str, password: &str) -> bool {
+-        self.username.eq(username) && crate::utils::constant_time_eq(self.password.as_bytes(), password.as_bytes())
+-    }
+-
+-    #[inline]
+-    pub fn has_permissions(&self, app_config: &AppConfig) -> bool {
+-        self.permission_denied_reason(app_config).is_none()
+-    }
+-
+-    #[inline]
+-    pub fn permission_denied(&self, app_config: &AppConfig) -> bool { !self.has_permissions(app_config) }
+-
+-    pub fn permission_denied_reason(&self, app_config: &AppConfig) -> Option<ProxyUserPermissionDenyReason> {
+-        // A plan reference that cannot be resolved must never fall back to
+-        // default clusters, unlimited connections and no filter.
+-        if self.t_has_unresolved_plan {
+-            debug!("User access denied, unresolved plan {:?}: {}", self.plan, self.username);
+-            return Some(ProxyUserPermissionDenyReason::UnresolvedPlan);
+-        }
+-        // A filter that fails to compile must deny instead of serving unfiltered content.
+-        if self.t_has_invalid_filter {
+-            debug!("User access denied, invalid filter: {}", self.username);
+-            return Some(ProxyUserPermissionDenyReason::InvalidFilter);
+-        }
+-        let config = <Arc<ArcSwap<Config>> as Access<Config>>::load(&app_config.config);
+-        if config.user_access_control {
+-            if let Some(exp_date) = self.exp_date.as_ref() {
+-                let now = Local::now();
+-                if (exp_date - now.timestamp()) < 0 {
+-                    debug!("User access denied, expired: {}", self.username);
+-                    return Some(ProxyUserPermissionDenyReason::Expired);
+-                }
+-            }
+-
+-            if let Some(status) = &self.status {
+-                match status {
+-                    ProxyUserStatus::Disabled => {
+-                        debug!("User access denied, status disabled: {}", self.username);
+-                        return Some(ProxyUserPermissionDenyReason::Disabled);
+-                    }
+-                    ProxyUserStatus::Banned => {
+-                        debug!("User access denied, status banned: {}", self.username);
+-                        return Some(ProxyUserPermissionDenyReason::Banned);
+-                    }
+-                    ProxyUserStatus::Expired => {
+-                        debug!("User access denied, status expired: {}", self.username);
+-                        return Some(ProxyUserPermissionDenyReason::ExpiredStatus);
+-                    }
+-                    ProxyUserStatus::Active | ProxyUserStatus::Trial => {}
+-                    ProxyUserStatus::Pending => {
+-                        debug!("User access denied, status pending: {}", self.username);
+-                        return Some(ProxyUserPermissionDenyReason::Inactive);
+-                    }
+-                }
+-            }
+-        }
+-        None
+-    }
+-
+-    pub fn allows_cluster(&self, cluster: XtreamCluster) -> bool { self.output_clusters.has_cluster(cluster.into()) }
+-
+-    pub fn allows_item_type(&self, item_type: shared::model::PlaylistItemType) -> bool {
+-        self.output_clusters.has_cluster(item_type)
+-    }
+-}
+-
+-impl Drop for ProxyUserCredentials {
+-    fn drop(&mut self) {
+-        self.password.zeroize();
+-        if let Some(mut token) = self.token.take() {
+-            token.zeroize();
+-        }
+-    }
+-}
+-
+-#[derive(Debug, Clone)]
+-pub struct TargetUser {
+-    pub target: String,
+-    pub credentials: Vec<Arc<ProxyUserCredentials>>,
+-}
+-
+-macros::from_impl!(TargetUser);
+-impl From<&TargetUserDto> for TargetUser {
+-    fn from(dto: &TargetUserDto) -> Self {
+-        Self { target: dto.target.clone(), credentials: dto.credentials.iter().map(|c| Arc::new(c.into())).collect() }
+-    }
+-}
+-
+-impl From<&TargetUser> for TargetUserDto {
+-    fn from(instance: &TargetUser) -> Self {
+-        Self {
+-            target: instance.target.clone(),
+-            credentials: instance.credentials.iter().map(|c| c.as_ref().into()).collect(),
+-        }
+-    }
+-}
+-
+-impl TargetUser {
+-    pub fn get_target_name(&self, username: &str, password: &str) -> Option<(Arc<ProxyUserCredentials>, &str)> {
+-        self.credentials
+-            .iter()
+-            .find(|c| c.matches(username, password))
+-            .map(|credentials| (Arc::clone(credentials), self.target.as_str()))
+-    }
+-    pub fn get_target_name_by_token(&self, token: &str) -> Option<(Arc<ProxyUserCredentials>, &str)> {
+-        self.credentials
+-            .iter()
+-            .find(|c| c.matches_token(token))
+-            .map(|credentials| (Arc::clone(credentials), self.target.as_str()))
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-    use shared::model::UserPlanDto;
+-
+-    #[test]
+-    fn test_resolve_plan_inherits_proxy() {
+-        let plan_dto = UserPlanDto {
+-            name: "reverse_plan".to_string(),
+-            proxy: Some(ProxyType::Reverse(Some(ClusterFlags::Live))),
+-            max_connections: 3,
+-            ..Default::default()
+-        };
+-        let plan = Arc::new(UserPlan::from(&plan_dto));
+-        let mut plans = HashMap::new();
+-        plans.insert("reverse_plan".to_string(), plan);
+-
+-        // User with plan, default redirect proxy (inherited from plan)
+-        let user_dto = ProxyUserCredentialsDto {
+-            username: "alice".to_string(),
+-            password: "123".to_string(),
+-            plan: Some("reverse_plan".to_string()),
+-            proxy: ProxyType::Redirect,
+-            ..Default::default()
+-        };
+-        let mut user = ProxyUserCredentials::from(&user_dto);
+-        assert_eq!(user.proxy, ProxyType::Redirect);
+-        user.resolve_plan(&plans);
+-        assert_eq!(user.proxy, ProxyType::Reverse(Some(ClusterFlags::Live)));
+-        assert_eq!(user.max_connections, 3);
+-
+-        // User with explicit reverse proxy override
+-        let user_dto2 = ProxyUserCredentialsDto {
+-            username: "bob".to_string(),
+-            password: "456".to_string(),
+-            plan: Some("reverse_plan".to_string()),
+-            proxy: ProxyType::Reverse(Some(ClusterFlags::Vod)),
+-            ..Default::default()
+-        };
+-        let mut user2 = ProxyUserCredentials::from(&user_dto2);
+-        user2.resolve_plan(&plans);
+-        assert_eq!(user2.proxy, ProxyType::Reverse(Some(ClusterFlags::Vod)));
+-    }
+-}
++use crate::model::{macros, AppConfig, Config, UserPlan};
++use arc_swap::{access::Access, ArcSwap};
++use chrono::Local;
++use log::{debug, error, warn};
++use shared::{
++    foundation::{get_filter, BinaryOperator, Filter},
++    model::{
++        ClusterFlags, NetworkAccessDto, ProxyType, ProxyUserCredentialsDto, ProxyUserStatus, TargetUserDto,
++        XtreamCluster,
++    },
++};
++use std::{collections::HashMap, sync::Arc};
++use zeroize::Zeroize;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ProxyUserPermissionDenyReason {
++    Expired,
++    Disabled,
++    Banned,
++    ExpiredStatus,
++    Inactive,
++    UnresolvedPlan,
++    InvalidFilter,
++}
++
++#[derive(Debug, Clone, Default)]
++pub struct NetworkAccess {
++    pub allowed_countries: Vec<String>,
++    pub allowed_networks: Vec<ipnet::IpNet>,
++}
++
++impl NetworkAccess {
++    pub fn is_empty(&self) -> bool { self.allowed_countries.is_empty() && self.allowed_networks.is_empty() }
++}
++
++impl From<&NetworkAccessDto> for NetworkAccess {
++    fn from(dto: &NetworkAccessDto) -> Self {
++        let mut seen_countries = std::collections::HashSet::new();
++        let allowed_countries: Vec<String> = dto
++            .allowed_countries
++            .as_ref()
++            .map(|countries| {
++                countries
++                    .iter()
++                    .filter_map(|c| {
++                        let upper = c.trim().to_uppercase();
++                        if upper.is_empty() {
++                            None
++                        } else if seen_countries.insert(upper.clone()) {
++                            Some(upper)
++                        } else {
++                            None
++                        }
++                    })
++                    .collect()
++            })
++            .unwrap_or_default();
++
++        let allowed_networks: Vec<ipnet::IpNet> = dto
++            .allowed_networks
++            .as_ref()
++            .map(|networks| {
++                networks
++                    .iter()
++                    .filter_map(|n| match n.trim().parse::<ipnet::IpNet>() {
++                        Ok(net) => Some(net),
++                        Err(err) => {
++                            warn!("Skipping invalid CIDR '{n}': {err}");
++                            None
++                        }
++                    })
++                    .collect()
++            })
++            .unwrap_or_default();
++
++        Self { allowed_countries, allowed_networks }
++    }
++}
++
++impl From<&NetworkAccess> for NetworkAccessDto {
++    fn from(instance: &NetworkAccess) -> Self {
++        let allowed_countries =
++            if instance.allowed_countries.is_empty() { None } else { Some(instance.allowed_countries.clone()) };
++        let allowed_networks = if instance.allowed_networks.is_empty() {
++            None
++        } else {
++            Some(instance.allowed_networks.iter().map(std::string::ToString::to_string).collect())
++        };
++        Self { allowed_countries, allowed_networks }
++    }
++}
++
++#[derive(Debug, Clone, Default)]
++#[allow(clippy::struct_excessive_bools)]
++pub struct ProxyUserCredentials {
++    pub username: String,
++    pub password: String,
++    pub token: Option<String>,
++    pub proxy: ProxyType,
++    pub server: Option<String>,
++    pub epg_timeshift: Option<String>,
++    pub epg_request_timeshift: Option<String>,
++    pub created_at: Option<i64>,
++    pub exp_date: Option<i64>,
++    pub max_connections: u32,
++    pub status: Option<ProxyUserStatus>,
++    pub output_clusters: ClusterFlags,
++    pub ui_enabled: bool,
 +    pub hide_adult: bool,
-     pub comment: Option<String>,
-     pub priority: i8,
-     pub soft_connections: u16,
-@@ -149,6 +150,7 @@ impl From<&ProxyUserCredentialsDto> for ProxyUserCredentials {
-             status: dto.status,
-             output_clusters: dto.output_clusters.unwrap_or_else(ClusterFlags::all),
-             ui_enabled: dto.ui_enabled,
++    pub comment: Option<String>,
++    pub priority: i8,
++    pub soft_connections: u16,
++    pub soft_priority: i8,
++    pub t_is_api_user: bool,
++    pub network_access: Option<NetworkAccess>,
++    /// Capability tier name; resolved via `resolve_plan`.
++    pub plan: Option<String>,
++    /// Raw user-level content filter (DSL); AND-combined with the plan filter.
++    pub filter: Option<String>,
++    // Raw configured values (None/0 = inherit from plan). The sibling
++    // non-raw fields hold the resolved serving values after resolve_plan();
++    // persistence (YAML/DB) always writes the raw values so plan edits
++    // keep propagating to members.
++    pub raw_output_clusters: Option<ClusterFlags>,
++    pub raw_max_connections: u32,
++    pub raw_soft_connections: u16,
++    pub raw_proxy: Option<ProxyType>,
++    /// Compiled content filter (plan AND user), applied at serve time.
++    pub t_filter: Option<Arc<Filter>>,
++    /// True when `plan` references a plan that no longer exists; the user is denied.
++    pub t_has_unresolved_plan: bool,
++    /// True when the configured user filter failed to compile; the user is denied.
++    pub t_has_invalid_filter: bool,
++}
++
++macros::from_impl!(ProxyUserCredentials);
++impl From<&ProxyUserCredentialsDto> for ProxyUserCredentials {
++    fn from(dto: &ProxyUserCredentialsDto) -> Self {
++        Self {
++            username: dto.username.clone(),
++            password: dto.password.clone(),
++            token: dto.token.clone(),
++            proxy: dto.proxy,
++            server: dto.server.clone(),
++            epg_timeshift: dto.epg_timeshift.clone(),
++            epg_request_timeshift: dto.epg_request_timeshift.clone(),
++            created_at: dto.created_at,
++            exp_date: dto.exp_date,
++            max_connections: dto.max_connections,
++            status: dto.status,
++            output_clusters: dto.output_clusters.unwrap_or_else(ClusterFlags::all),
++            ui_enabled: dto.ui_enabled,
 +            hide_adult: dto.hide_adult,
-             comment: dto.comment.clone(),
-             priority: dto.priority,
-             soft_connections: dto.soft_connections,
-@@ -189,6 +191,7 @@ impl From<&ProxyUserCredentials> for ProxyUserCredentialsDto {
-             status: instance.status,
-             output_clusters: instance.raw_output_clusters.filter(|flags| !flags.is_all()),
-             ui_enabled: instance.ui_enabled,
++            comment: dto.comment.clone(),
++            priority: dto.priority,
++            soft_connections: dto.soft_connections,
++            soft_priority: dto.soft_priority,
++            t_is_api_user: false,
++            network_access: dto
++                .network_access
++                .as_ref()
++                .map(NetworkAccess::from)
++                .filter(|network_access| !network_access.is_empty()),
++            plan: dto.plan.clone(),
++            filter: dto.filter.clone(),
++            raw_output_clusters: dto.output_clusters,
++            raw_max_connections: dto.max_connections,
++            raw_soft_connections: dto.soft_connections,
++            raw_proxy: if dto.proxy == ProxyType::default() && dto.plan.is_some() { None } else { Some(dto.proxy) },
++            t_filter: None,
++            t_has_unresolved_plan: false,
++            t_has_invalid_filter: false,
++        }
++    }
++}
++
++impl From<&ProxyUserCredentials> for ProxyUserCredentialsDto {
++    fn from(instance: &ProxyUserCredentials) -> Self {
++        Self {
++            username: instance.username.clone(),
++            password: instance.password.clone(),
++            token: instance.token.clone(),
++            proxy: instance.raw_proxy.unwrap_or(instance.proxy),
++            server: instance.server.clone(),
++            epg_timeshift: instance.epg_timeshift.clone(),
++            epg_request_timeshift: instance.epg_request_timeshift.clone(),
++            created_at: instance.created_at,
++            exp_date: instance.exp_date,
++            // Persist raw (pre-plan-resolution) values so plan edits keep propagating.
++            max_connections: instance.raw_max_connections,
++            status: instance.status,
++            output_clusters: instance.raw_output_clusters.filter(|flags| !flags.is_all()),
++            ui_enabled: instance.ui_enabled,
 +            hide_adult: instance.hide_adult,
-             comment: instance.comment.clone(),
-             priority: instance.priority,
-             soft_connections: instance.raw_soft_connections,
-@@ -330,6 +333,48 @@ impl ProxyUserCredentials {
-     pub fn allows_item_type(&self, item_type: shared::model::PlaylistItemType) -> bool {
-         self.output_clusters.has_cluster(item_type)
-     }
++            comment: instance.comment.clone(),
++            priority: instance.priority,
++            soft_connections: instance.raw_soft_connections,
++            soft_priority: instance.soft_priority,
++            network_access: instance.network_access.as_ref().map(NetworkAccessDto::from),
++            plan: instance.plan.clone(),
++            filter: instance.filter.clone(),
++        }
++    }
++}
++
++impl ProxyUserCredentials {
++    /// Fill unset capability values from the referenced plan and compile the
++    /// combined content filter. Idempotent; call after any load/conversion.
++    pub fn resolve_plan(&mut self, plans: &HashMap<String, Arc<UserPlan>>) {
++        let plan = self.plan.as_ref().and_then(|name| plans.get(name));
++        self.t_has_unresolved_plan = self.plan.is_some() && plan.is_none();
++        if self.t_has_unresolved_plan {
++            error!(
++                "Unknown user plan {:?} for user {}; access is denied until the plan exists or the reference is removed",
++                self.plan, self.username
++            );
++        }
++        self.output_clusters =
++            self.raw_output_clusters.or_else(|| plan.and_then(|p| p.output_clusters)).unwrap_or_else(ClusterFlags::all);
++        if let Some(plan_proxy) = plan.and_then(|p| p.proxy) {
++            self.proxy = self.raw_proxy.unwrap_or(plan_proxy);
++        }
++        self.max_connections =
++            if self.raw_max_connections > 0 { self.raw_max_connections } else { plan.map_or(0, |p| p.max_connections) };
++        self.soft_connections = if self.raw_soft_connections > 0 {
++            self.raw_soft_connections
++        } else {
++            plan.map_or(0, |p| p.soft_connections)
++        };
++
++        let plan_filter = plan.and_then(|p| p.t_filter.as_ref().map(Arc::clone));
++        self.t_has_invalid_filter = false;
++        let user_filter = self.filter.as_ref().and_then(|raw| match get_filter(raw, None) {
++            Ok(filter) => Some(Arc::new(filter)),
++            Err(err) => {
++                error!(
++                    "Invalid filter for user {}; access is denied until the filter is fixed or removed: {err}",
++                    self.username
++                );
++                self.t_has_invalid_filter = true;
++                None
++            }
++        });
++        self.t_filter = match (plan_filter, user_filter) {
++            // Group both sides so OR expressions keep their intended precedence.
++            (Some(plan), Some(user)) => Some(Arc::new(Filter::BinaryExpression(
++                Box::new(Filter::Group(Box::new((*plan).clone()))),
++                BinaryOperator::And,
++                Box::new(Filter::Group(Box::new((*user).clone()))),
++            ))),
++            (Some(filter), None) | (None, Some(filter)) => Some(filter),
++            (None, None) => None,
++        };
++    }
++
++    /// True when the compiled content filter (plan AND user) permits this item.
++    /// Users without a filter see everything.
++    pub fn allows_content(&self, pli: &shared::model::PlaylistItem) -> bool {
++        self.t_filter.as_ref().is_none_or(|filter| {
++            let provider = shared::foundation::ValueProvider { pli, match_as_ascii: false };
++            filter.filter(&provider)
++        })
++    }
++
++    pub fn matches_token(&self, token: &str) -> bool {
++        if let Some(tkn) = &self.token {
++            return crate::utils::constant_time_eq(tkn.as_bytes(), token.as_bytes());
++        }
++        false
++    }
++
++    pub fn matches(&self, username: &str, password: &str) -> bool {
++        self.username.eq(username) && crate::utils::constant_time_eq(self.password.as_bytes(), password.as_bytes())
++    }
++
++    #[inline]
++    pub fn has_permissions(&self, app_config: &AppConfig) -> bool {
++        self.permission_denied_reason(app_config).is_none()
++    }
++
++    #[inline]
++    pub fn permission_denied(&self, app_config: &AppConfig) -> bool { !self.has_permissions(app_config) }
++
++    pub fn permission_denied_reason(&self, app_config: &AppConfig) -> Option<ProxyUserPermissionDenyReason> {
++        // A plan reference that cannot be resolved must never fall back to
++        // default clusters, unlimited connections and no filter.
++        if self.t_has_unresolved_plan {
++            debug!("User access denied, unresolved plan {:?}: {}", self.plan, self.username);
++            return Some(ProxyUserPermissionDenyReason::UnresolvedPlan);
++        }
++        // A filter that fails to compile must deny instead of serving unfiltered content.
++        if self.t_has_invalid_filter {
++            debug!("User access denied, invalid filter: {}", self.username);
++            return Some(ProxyUserPermissionDenyReason::InvalidFilter);
++        }
++        let config = <Arc<ArcSwap<Config>> as Access<Config>>::load(&app_config.config);
++        if config.user_access_control {
++            if let Some(exp_date) = self.exp_date.as_ref() {
++                let now = Local::now();
++                if (exp_date - now.timestamp()) < 0 {
++                    debug!("User access denied, expired: {}", self.username);
++                    return Some(ProxyUserPermissionDenyReason::Expired);
++                }
++            }
++
++            if let Some(status) = &self.status {
++                match status {
++                    ProxyUserStatus::Disabled => {
++                        debug!("User access denied, status disabled: {}", self.username);
++                        return Some(ProxyUserPermissionDenyReason::Disabled);
++                    }
++                    ProxyUserStatus::Banned => {
++                        debug!("User access denied, status banned: {}", self.username);
++                        return Some(ProxyUserPermissionDenyReason::Banned);
++                    }
++                    ProxyUserStatus::Expired => {
++                        debug!("User access denied, status expired: {}", self.username);
++                        return Some(ProxyUserPermissionDenyReason::ExpiredStatus);
++                    }
++                    ProxyUserStatus::Active | ProxyUserStatus::Trial => {}
++                    ProxyUserStatus::Pending => {
++                        debug!("User access denied, status pending: {}", self.username);
++                        return Some(ProxyUserPermissionDenyReason::Inactive);
++                    }
++                }
++            }
++        }
++        None
++    }
++
++    pub fn allows_cluster(&self, cluster: XtreamCluster) -> bool { self.output_clusters.has_cluster(cluster.into()) }
++
++    pub fn allows_item_type(&self, item_type: shared::model::PlaylistItemType) -> bool {
++        self.output_clusters.has_cluster(item_type)
++    }
 +
 +    /// True when the group/category name looks like Adult / 18+ / XXX content.
 +    ///
@@ -421,20 +1165,104 @@ index 60f59fcf..b0402c07 100644
 +        !Self::stream_props_marked_adult(props)
 +    }
 +
-+    pub(crate) fn stream_props_marked_adult(props: Option<&shared::model::StreamProperties>) -> bool {
++    pub fn stream_props_marked_adult(props: Option<&shared::model::StreamProperties>) -> bool {
 +        match props {
 +            Some(shared::model::StreamProperties::Live(live)) => live.is_adult != 0,
 +            Some(shared::model::StreamProperties::Video(video)) => video.is_adult != 0,
 +            _ => false,
 +        }
 +    }
- }
- 
- impl Drop for ProxyUserCredentials {
-@@ -421,4 +466,40 @@ mod tests {
-         user2.resolve_plan(&plans);
-         assert_eq!(user2.proxy, ProxyType::Reverse(Some(ClusterFlags::Vod)));
-     }
++}
++
++impl Drop for ProxyUserCredentials {
++    fn drop(&mut self) {
++        self.password.zeroize();
++        if let Some(mut token) = self.token.take() {
++            token.zeroize();
++        }
++    }
++}
++
++#[derive(Debug, Clone)]
++pub struct TargetUser {
++    pub target: String,
++    pub credentials: Vec<Arc<ProxyUserCredentials>>,
++}
++
++macros::from_impl!(TargetUser);
++impl From<&TargetUserDto> for TargetUser {
++    fn from(dto: &TargetUserDto) -> Self {
++        Self { target: dto.target.clone(), credentials: dto.credentials.iter().map(|c| Arc::new(c.into())).collect() }
++    }
++}
++
++impl From<&TargetUser> for TargetUserDto {
++    fn from(instance: &TargetUser) -> Self {
++        Self {
++            target: instance.target.clone(),
++            credentials: instance.credentials.iter().map(|c| c.as_ref().into()).collect(),
++        }
++    }
++}
++
++impl TargetUser {
++    pub fn get_target_name(&self, username: &str, password: &str) -> Option<(Arc<ProxyUserCredentials>, &str)> {
++        self.credentials
++            .iter()
++            .find(|c| c.matches(username, password))
++            .map(|credentials| (Arc::clone(credentials), self.target.as_str()))
++    }
++    pub fn get_target_name_by_token(&self, token: &str) -> Option<(Arc<ProxyUserCredentials>, &str)> {
++        self.credentials
++            .iter()
++            .find(|c| c.matches_token(token))
++            .map(|credentials| (Arc::clone(credentials), self.target.as_str()))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use shared::model::UserPlanDto;
++
++    #[test]
++    fn test_resolve_plan_inherits_proxy() {
++        let plan_dto = UserPlanDto {
++            name: "reverse_plan".to_string(),
++            proxy: Some(ProxyType::Reverse(Some(ClusterFlags::Live))),
++            max_connections: 3,
++            ..Default::default()
++        };
++        let plan = Arc::new(UserPlan::from(&plan_dto));
++        let mut plans = HashMap::new();
++        plans.insert("reverse_plan".to_string(), plan);
++
++        // User with plan, default redirect proxy (inherited from plan)
++        let user_dto = ProxyUserCredentialsDto {
++            username: "alice".to_string(),
++            password: "123".to_string(),
++            plan: Some("reverse_plan".to_string()),
++            proxy: ProxyType::Redirect,
++            ..Default::default()
++        };
++        let mut user = ProxyUserCredentials::from(&user_dto);
++        assert_eq!(user.proxy, ProxyType::Redirect);
++        user.resolve_plan(&plans);
++        assert_eq!(user.proxy, ProxyType::Reverse(Some(ClusterFlags::Live)));
++        assert_eq!(user.max_connections, 3);
++
++        // User with explicit reverse proxy override
++        let user_dto2 = ProxyUserCredentialsDto {
++            username: "bob".to_string(),
++            password: "456".to_string(),
++            plan: Some("reverse_plan".to_string()),
++            proxy: ProxyType::Reverse(Some(ClusterFlags::Vod)),
++            ..Default::default()
++        };
++        let mut user2 = ProxyUserCredentials::from(&user_dto2);
++        user2.resolve_plan(&plans);
++        assert_eq!(user2.proxy, ProxyType::Reverse(Some(ClusterFlags::Vod)));
++    }
 +
 +    #[test]
 +    fn adult_group_matcher_covers_bittv_style_names() {
@@ -471,7 +1299,19 @@ index 60f59fcf..b0402c07 100644
 +        assert!(user.allows_playlist_item("News", None));
 +        assert!(!user.allows_playlist_item("XXX", Some(&clean)));
 +    }
- }
++}
+diff --git a/backend/repository/Cargo.toml b/backend/repository/Cargo.toml
+index bd370275..962ed7d0 100644
+--- a/backend/repository/Cargo.toml
++++ b/backend/repository/Cargo.toml
+@@ -23,6 +23,7 @@ base64.workspace = true
+ bytes.workspace = true
+ chrono.workspace = true
+ crc32fast = "1.5.1"
++dashmap.workspace = true
+ env_logger = "0.11.11"
+ filetime = "0.2.29"
+ futures.workspace = true
 diff --git a/backend/repository/src/adult_epg_ids.rs b/backend/repository/src/adult_epg_ids.rs
 new file mode 100644
 index 00000000..cc0cec17
@@ -866,33 +1706,1560 @@ index e23630e1..44b2db74 100644
  pub use epg_repository::*;
  pub use geoip::*;
 diff --git a/backend/repository/src/m3u_playlist_iterator.rs b/backend/repository/src/m3u_playlist_iterator.rs
-index 04de72f7..b4b97f0e 100644
+index 04de72f7..54997fb8 100644
 --- a/backend/repository/src/m3u_playlist_iterator.rs
 +++ b/backend/repository/src/m3u_playlist_iterator.rs
-@@ -276,6 +276,7 @@ impl M3uPlaylistIterator {
-         let proxy_type = user.proxy;
-         let output_clusters = user.output_clusters;
-         let user_filter = user.t_filter.clone();
+@@ -1,770 +1,780 @@
+-use crate::{
+-    ensure_target_storage_path, get_file_path_for_db_index, m3u_get_file_path_for_db, open_playlist_reader,
+-    storage_const, user_get_bouquet_filter, LockedReceiverStream,
+-};
+-use futures::Stream;
+-use log::error;
+-use shared::{
+-    create_bitset,
+-    error::TuliproxError,
+-    model::{
+-        ConfigTargetOptions, M3uPlaylistItem, PlaylistItemType, ProxyType, StreamProperties, TargetType, XtreamCluster,
+-    },
+-    utils::{extract_extension_from_url, sanitize_sensitive_info, Internable, PROVIDER_SCHEME_PREFIX},
+-};
+-use std::{
+-    borrow::Cow,
+-    collections::HashMap,
+-    pin::Pin,
+-    sync::Arc,
+-    task::{Context, Poll},
+-};
+-use tokio::{sync::mpsc, task};
+-use tuliprox_core::model::{AppConfig, ConfigTarget, ProxyUserCredentials};
+-use tuliprox_parser::m3u_format::{build_m3u_catchup_rewrite, flussonic_proxy_live_file};
+-
+-create_bitset!(u8, M3uPlaylistIteratorFlags, MaskRedirectUrl, IncludeTypeInUrl, RewriteResource);
+-
+-pub struct M3uPlaylistIterator {
+-    inner: LockedReceiverStream<Result<(M3uPlaylistItem, bool), TuliproxError>>,
+-}
+-
+-struct UrlRewriteContext<'a> {
+-    base_url: &'a str,
+-    username: &'a str,
+-    password: &'a str,
+-}
+-
+-fn build_rewritten_url(
+-    ctx: &UrlRewriteContext<'_>,
+-    source_url: &str,
+-    m3u_pli: &M3uPlaylistItem,
+-    typed: bool,
+-    prefix_path: &str,
+-    append_extension: bool,
+-) -> String {
+-    // Build URL efficiently with a single allocation using concat_string! macro
+-    let stream_type: &str = if typed {
+-        match m3u_pli.item_type {
+-            PlaylistItemType::Live
+-            | PlaylistItemType::Catchup
+-            | PlaylistItemType::LiveUnknown
+-            | PlaylistItemType::LiveHls
+-            | PlaylistItemType::LiveDash => "live",
+-            PlaylistItemType::Video | PlaylistItemType::LocalVideo => "movie",
+-            PlaylistItemType::Series
+-            | PlaylistItemType::SeriesInfo
+-            | PlaylistItemType::LocalSeries
+-            | PlaylistItemType::LocalSeriesInfo => "series",
+-        }
+-    } else {
+-        ""
+-    };
+-
+-    let mut cap = ctx.base_url.len() + prefix_path.len() + ctx.username.len() + ctx.password.len() + 32; // separators and id
+-    if typed {
+-        cap += stream_type.len() + 1;
+-    }
+-
+-    let rewritten_url = if typed {
+-        shared::concat_string!(
+-            cap = cap;
+-            ctx.base_url, "/", prefix_path, "/", stream_type, "/",
+-            ctx.username, "/", ctx.password, "/", &m3u_pli.virtual_id.to_string()
+-        )
+-    } else {
+-        shared::concat_string!(
+-            cap = cap;
+-            ctx.base_url, "/", prefix_path, "/",
+-            ctx.username, "/", ctx.password, "/", &m3u_pli.virtual_id.to_string()
+-        )
+-    };
+-
+-    if append_extension {
+-        extract_extension_from_url(source_url)
+-            .map(|ext| shared::concat_string!(&rewritten_url, ext))
+-            .unwrap_or(rewritten_url)
+-    } else {
+-        rewritten_url
+-    }
+-}
+-
+-fn resolve_effective_source_url<'a>(
+-    m3u_pli: &'a M3uPlaylistItem,
+-    input_by_name: &HashMap<Arc<str>, Arc<tuliprox_core::model::ConfigInput>>,
+-) -> Cow<'a, str> {
+-    if !m3u_pli.url.starts_with(PROVIDER_SCHEME_PREFIX) {
+-        return Cow::Borrowed(m3u_pli.url.as_ref());
+-    }
+-
+-    input_by_name.get(&m3u_pli.input_name).map_or_else(
+-        || {
+-            error!(
+-                "Input '{}' not found while resolving provider URL '{}'",
+-                m3u_pli.input_name,
+-                sanitize_sensitive_info(&m3u_pli.url)
+-            );
+-            Cow::Borrowed(m3u_pli.url.as_ref())
+-        },
+-        |input| match input.resolve_url(&m3u_pli.url) {
+-            Ok(resolved) => match resolved {
+-                Cow::Borrowed(url) => Cow::Borrowed(url),
+-                Cow::Owned(url) => Cow::Owned(url),
+-            },
+-            Err(err) => {
+-                error!(
+-                    "Failed to resolve provider URL '{}' for input '{}': {}",
+-                    sanitize_sensitive_info(&m3u_pli.url),
+-                    m3u_pli.input_name,
+-                    sanitize_sensitive_info(&err.to_string())
+-                );
+-                Cow::Borrowed(m3u_pli.url.as_ref())
+-            }
+-        },
+-    )
+-}
+-
+-#[allow(clippy::too_many_arguments)]
+-fn apply_rewrite(
+-    mut m3u_pli: M3uPlaylistItem,
+-    ctx: &UrlRewriteContext<'_>,
+-    target_id: u16,
+-    encrypt_secret: &[u8; 16],
+-    input_by_name: &HashMap<Arc<str>, Arc<tuliprox_core::model::ConfigInput>>,
+-    target_options: Option<&ConfigTargetOptions>,
+-    flags: M3uPlaylistIteratorFlagsSet,
+-    proxy_type: ProxyType,
+-) -> M3uPlaylistItem {
+-    let is_redirect = proxy_type.is_redirect(m3u_pli.item_type)
+-        || target_options.and_then(|o| o.force_redirect.as_ref()).is_some_and(|f| f.has_cluster(m3u_pli.item_type));
+-    let should_rewrite_urls =
+-        if is_redirect { flags.contains(M3uPlaylistIteratorFlags::MaskRedirectUrl) } else { true };
+-
+-    let effective_source_url = resolve_effective_source_url(&m3u_pli, input_by_name);
+-    let catchup_rewrite = if should_rewrite_urls {
+-        if let Some(StreamProperties::Live(live)) = m3u_pli.additional_properties.as_ref() {
+-            if let Some(catchup) = live.catchup.as_ref() {
+-                build_m3u_catchup_rewrite(
+-                    encrypt_secret,
+-                    ctx.base_url,
+-                    ctx.username,
+-                    target_id,
+-                    m3u_pli.virtual_id.get(),
+-                    effective_source_url.as_ref(),
+-                    catchup,
+-                )
+-                .ok()
+-                .flatten()
+-            } else {
+-                None
+-            }
+-        } else {
+-            None
+-        }
+-    } else {
+-        None
+-    };
+-
+-    if should_rewrite_urls {
+-        let flussonic_live_file = m3u_pli
+-            .additional_properties
+-            .as_ref()
+-            .and_then(|properties| match properties {
+-                StreamProperties::Live(live) => live
+-                    .catchup
+-                    .as_ref()
+-                    .and_then(shared::model::CatchupProperties::native_flussonic_player_mode)
+-                    .map(flussonic_proxy_live_file),
+-                _ => None,
+-            })
+-            .or_else(|| {
+-                let has_no_explicit_catchup = m3u_pli.additional_properties.as_ref().is_none_or(|props| match props {
+-                    StreamProperties::Live(live) => {
+-                        live.catchup.as_ref().is_none_or(shared::model::CatchupProperties::is_empty)
+-                    }
+-                    _ => true,
+-                });
+-                (!m3u_pli.time_shift.trim().is_empty() && has_no_explicit_catchup)
+-                    .then_some(flussonic_proxy_live_file("flussonic"))
+-            });
+-        let stream_url = flussonic_live_file.map_or_else(
+-            || {
+-                build_rewritten_url(
+-                    ctx,
+-                    effective_source_url.as_ref(),
+-                    &m3u_pli,
+-                    flags.contains(M3uPlaylistIteratorFlags::IncludeTypeInUrl),
+-                    storage_const::M3U_STREAM_PATH,
+-                    true,
+-                )
+-            },
+-            |live_file| {
+-                let base = build_rewritten_url(
+-                    ctx,
+-                    effective_source_url.as_ref(),
+-                    &m3u_pli,
+-                    flags.contains(M3uPlaylistIteratorFlags::IncludeTypeInUrl),
+-                    storage_const::M3U_STREAM_PATH,
+-                    false,
+-                );
+-                shared::concat_string!(&base, "/", live_file)
+-            },
+-        );
+-        let resource_url = if flags.contains(M3uPlaylistIteratorFlags::RewriteResource) {
+-            let source_url = if m3u_pli.logo.is_empty() { m3u_pli.logo_small.as_ref() } else { m3u_pli.logo.as_ref() };
+-            Some(build_rewritten_url(ctx, source_url, &m3u_pli, false, storage_const::M3U_RESOURCE_PATH, false))
+-        } else {
+-            None
+-        };
+-        m3u_pli.t_stream_url = stream_url.intern();
+-        m3u_pli.t_resource_url = resource_url;
+-    } else {
+-        m3u_pli.t_stream_url = match effective_source_url {
+-            Cow::Borrowed(_) => Arc::clone(&m3u_pli.url),
+-            Cow::Owned(url) => url.intern(),
+-        };
+-        m3u_pli.t_resource_url = None;
+-    }
+-
+-    if let Some(rewrite) = catchup_rewrite {
+-        m3u_pli.t_catchup_mode = Some(rewrite.mode);
+-        m3u_pli.t_catchup_source = Some(rewrite.source);
+-    }
+-    if should_rewrite_urls {
+-        m3u_pli.upstream_user_agent = None;
+-    }
+-
+-    m3u_pli
+-}
+-
+-#[allow(clippy::too_many_lines)]
+-impl M3uPlaylistIterator {
+-    pub async fn new(
+-        cfg: &AppConfig,
+-        target: &ConfigTarget,
+-        user: &ProxyUserCredentials,
+-    ) -> Result<Self, TuliproxError> {
+-        // TODO use playlist memory cache, but be aware of sorting !
+-
+-        let m3u_output = target.get_m3u_output().ok_or_else(|| {
+-            TuliproxError::Config(format!("Unexpected failure, missing m3u target output for target {}", target.name))
+-        })?;
+-        let config = cfg.config.load();
+-        let target_path = ensure_target_storage_path(&config, target.name.as_str()).await?;
+-        let m3u_path = m3u_get_file_path_for_db(&target_path);
+-
+-        let iter_lock = cfg.file_locks.read_lock(&m3u_path).await;
+-        let bg_lock = cfg.file_locks.read_lock(&m3u_path).await;
+-
+-        let filter = user_get_bouquet_filter(&config, &user.username, None, TargetType::M3u, XtreamCluster::Live).await;
+-        let mut flags = M3uPlaylistIteratorFlagsSet::new();
+-        if m3u_output.include_type_in_url {
+-            flags.set(M3uPlaylistIteratorFlags::IncludeTypeInUrl);
+-        }
+-        if m3u_output.mask_redirect_url {
+-            flags.set(M3uPlaylistIteratorFlags::MaskRedirectUrl);
+-        }
+-        if cfg.is_reverse_proxy_resource_rewrite_enabled() {
+-            flags.set(M3uPlaylistIteratorFlags::RewriteResource);
+-        }
+-
+-        let base_url = cfg.get_user_server_info(user).map(|si| si.get_base_url()).unwrap_or_default();
+-        let encrypt_secret = cfg.get_reverse_proxy_rewrite_secret().unwrap_or(cfg.encrypt_secret);
+-        let username = user.username.clone();
+-        let password = user.password.clone();
+-        let target_id = target.id;
+-        let proxy_type = user.proxy;
+-        let output_clusters = user.output_clusters;
+-        let user_filter = user.t_filter.clone();
+-        let target_options = target.options.clone();
+-        let input_by_name: HashMap<Arc<str>, Arc<tuliprox_core::model::ConfigInput>> =
+-            cfg.sources.load().inputs.iter().map(|input| (Arc::clone(&input.name), Arc::clone(input))).collect();
+-
+-        let m3u_path = m3u_path.clone();
+-        let index_path = get_file_path_for_db_index(&m3u_path);
+-        let (tx, rx) = mpsc::channel::<Result<(M3uPlaylistItem, bool), TuliproxError>>(256);
+-
+-        let m3u_path_for_log = m3u_path.clone();
+-        let index_path_for_log = index_path.clone();
+-        let join_error_tx = tx.clone();
+-        let handle = task::spawn_blocking(move || {
+-            let _guard = bg_lock;
+-            let reader = match open_playlist_reader::<u32, M3uPlaylistItem, u32>(
+-                &m3u_path,
+-                &index_path,
+-                Some("Sorted index error for m3u, fallback"),
+-            ) {
+-                Ok(reader) => reader,
+-                Err(err) => {
+-                    error!("Failed to open M3U playlist DB {}: {err}", m3u_path.display());
+-                    let _ = tx.blocking_send(Err(err));
+-                    return;
+-                }
+-            };
+-
+-            let mut pending: Option<M3uPlaylistItem> = None;
+-            for entry in reader {
+-                let item = match entry {
+-                    Ok((_, item)) => item,
+-                    Err(err) => {
+-                        error!("Skipping unreadable M3U playlist entry: {err}");
+-                        continue;
+-                    }
+-                };
+-
+-                if !output_clusters.has_cluster(item.item_type) {
+-                    continue;
+-                }
+-
+-                if let Some(set) = &filter {
+-                    if !set.contains(item.group.as_ref()) {
+-                        continue;
+-                    }
+-                }
+-
+-                // per-user content filter (plan AND user), applied post-cache
+-                if let Some(user_filter) = &user_filter {
+-                    let pli = shared::model::PlaylistItem::from(&item);
+-                    let provider = shared::foundation::ValueProvider { pli: &pli, match_as_ascii: false };
+-                    if !user_filter.filter(&provider) {
+-                        continue;
+-                    }
+-                }
+-
+-                let rewrite_ctx = UrlRewriteContext { base_url: &base_url, username: &username, password: &password };
+-
+-                let item = apply_rewrite(
+-                    item,
+-                    &rewrite_ctx,
+-                    target_id,
+-                    &encrypt_secret,
+-                    &input_by_name,
+-                    target_options.as_ref(),
+-                    flags,
+-                    proxy_type,
+-                );
+-
+-                if let Some(prev) = pending.replace(item) {
+-                    if tx.blocking_send(Ok((prev, true))).is_err() {
+-                        return;
+-                    }
+-                }
+-            }
+-
+-            if let Some(last) = pending {
+-                let _ = tx.blocking_send(Ok((last, false)));
+-            }
+-        });
+-        tokio::spawn(async move {
+-            if let Err(err) = handle.await {
+-                error!(
+-                    "M3U playlist iterator task failed for {} (index {}): {err}",
+-                    m3u_path_for_log.display(),
+-                    index_path_for_log.display()
+-                );
+-                let _ = join_error_tx
+-                    .send(Err(TuliproxError::RepositoryM3u(format!(
+-                        "M3U playlist iterator task failed for {}: {err}",
+-                        m3u_path_for_log.display()
+-                    ))))
+-                    .await;
+-            }
+-        });
+-
+-        Ok(Self {
+-            inner: LockedReceiverStream::new(rx, iter_lock), // Save lock inside struct
+-        })
+-    }
+-}
+-
+-impl Stream for M3uPlaylistIterator {
+-    type Item = Result<(M3uPlaylistItem, bool), TuliproxError>;
+-
+-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+-        Pin::new(&mut self.inner).poll_next(cx)
+-    }
+-}
+-
+-fn build_proxy_xmltv_url_tvg(base_url: &str, username: &str, password: &str) -> Option<String> {
+-    let base = base_url.trim_end_matches('/');
+-    if base.is_empty() || username.is_empty() || password.is_empty() {
+-        return None;
+-    }
+-    let query = url::form_urlencoded::Serializer::new(String::new())
+-        .append_pair("username", username)
+-        .append_pair("password", password)
+-        .finish();
+-    Some(format!("{base}/xmltv.php?{query}"))
+-}
+-
+-pub struct M3uPlaylistM3uTextIterator {
+-    inner: M3uPlaylistIterator,
+-    started: bool,
+-    target_options: Option<ConfigTargetOptions>,
+-    url_tvg: Option<String>,
+-}
+-
+-impl M3uPlaylistM3uTextIterator {
+-    pub async fn new(
+-        cfg: &AppConfig,
+-        target: &ConfigTarget,
+-        user: &ProxyUserCredentials,
+-    ) -> Result<Self, TuliproxError> {
+-        let base_url = cfg.get_user_server_info(user).map(|server| server.get_base_url()).unwrap_or_default();
+-        Ok(Self {
+-            inner: M3uPlaylistIterator::new(cfg, target, user).await?,
+-            started: false,
+-            target_options: target.options.clone(),
+-            url_tvg: build_proxy_xmltv_url_tvg(&base_url, &user.username, &user.password),
+-        })
+-    }
+-}
+-
+-impl Stream for M3uPlaylistM3uTextIterator {
+-    type Item = Result<String, String>;
+-
+-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+-        if !self.started {
+-            self.started = true;
+-            let header = self
+-                .url_tvg
+-                .as_ref()
+-                .map_or_else(|| "#EXTM3U".to_string(), |url| format!("#EXTM3U url-tvg=\"{url}\" x-tvg-url=\"{url}\""));
+-            return Poll::Ready(Some(Ok(header)));
+-        }
+-
+-        match Pin::new(&mut self.inner).poll_next(cx) {
+-            Poll::Ready(Some(Ok((m3u_pli, _has_next)))) => {
+-                let target_options = self.target_options.as_ref();
+-                Poll::Ready(Some(Ok(m3u_pli.to_m3u(target_options, true))))
+-            }
+-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.to_string()))),
+-            Poll::Ready(None) => Poll::Ready(None),
+-            Poll::Pending => Poll::Pending,
+-        }
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::{
+-        apply_rewrite, build_proxy_xmltv_url_tvg, M3uPlaylistIterator, M3uPlaylistIteratorFlags,
+-        M3uPlaylistIteratorFlagsSet, M3uPlaylistM3uTextIterator, UrlRewriteContext,
+-    };
+-    use crate::LockedReceiverStream;
+-    use futures::StreamExt;
+-    use shared::{
+-        model::{
+-            CatchupProperties, LiveStreamProperties, M3uPlaylistItem, PlaylistItemType, ProviderUrlSelectionPolicy,
+-            ProxyType, StreamProperties, VirtualId,
+-        },
+-        utils::Internable,
+-    };
+-    use std::{
+-        collections::HashMap,
+-        sync::{atomic::AtomicUsize, Arc},
+-    };
+-    use tokio::sync::mpsc;
+-    use tuliprox_core::model::{ConfigInput, ConfigProvider, ProviderDnsCache};
+-
+-    fn provider_input() -> Arc<ConfigInput> {
+-        Arc::new(ConfigInput {
+-            name: "example1".intern(),
+-            provider_configs: Some(vec![Arc::new(ConfigProvider {
+-                name: "example".intern(),
+-                urls: vec!["http://example.com".intern()],
+-                provider_url_selection_policy: ProviderUrlSelectionPolicy::ResumeLastWorking,
+-                current_url_index: AtomicUsize::new(0),
+-                dns: None,
+-                dns_cache: Arc::new(ProviderDnsCache::default()),
+-            })]),
+-            ..ConfigInput::default()
+-        })
+-    }
+-
+-    fn m3u_item(url: &str) -> M3uPlaylistItem {
+-        M3uPlaylistItem {
+-            virtual_id: VirtualId::new(813_294),
+-            provider_id: "813294".intern(),
+-            name: "France 4K".intern(),
+-            chno: 0,
+-            logo: "".intern(),
+-            logo_small: "".intern(),
+-            group: "FR| FRANCE 4K".intern(),
+-            title: "France 4K".intern(),
+-            parent_code: "".intern(),
+-            audio_track: "".intern(),
+-            time_shift: "".intern(),
+-            rec: "".intern(),
+-            url: url.intern(),
+-            epg_channel_id: None,
+-            input_name: "example1".intern(),
+-            item_type: PlaylistItemType::Live,
+-            t_stream_url: "".intern(),
+-            t_resource_url: None,
+-            t_catchup_source: None,
+-            t_catchup_mode: None,
+-            source_ordinal: 0,
+-            additional_properties: None,
+-            input_stream_id: "813294".intern(),
+-            upstream_user_agent: None,
+-        }
+-    }
+-
+-    #[test]
+-    fn redirect_without_mask_resolves_provider_scheme_url() {
+-        let input = provider_input();
+-        let input_by_name = HashMap::from([(Arc::clone(&input.name), input)]);
+-        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
+-        let rewritten = apply_rewrite(
+-            m3u_item("provider://example/live/user/pass/813294.ts"),
+-            &ctx,
+-            1,
+-            &[7u8; 16],
+-            &input_by_name,
+-            None,
+-            M3uPlaylistIteratorFlagsSet::new(),
+-            ProxyType::Redirect,
+-        );
+-
+-        assert_eq!(rewritten.t_stream_url.as_ref(), "http://example.com/live/user/pass/813294.ts");
+-    }
+-
+-    #[test]
+-    fn redirect_without_mask_keeps_regular_url() {
+-        let input_by_name = HashMap::new();
+-        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
+-        let rewritten = apply_rewrite(
+-            m3u_item("http://example.com/live/user/pass/813294.ts"),
+-            &ctx,
+-            1,
+-            &[7u8; 16],
+-            &input_by_name,
+-            None,
+-            M3uPlaylistIteratorFlagsSet::new(),
+-            ProxyType::Redirect,
+-        );
+-
+-        assert_eq!(rewritten.t_stream_url.as_ref(), "http://example.com/live/user/pass/813294.ts");
+-    }
+-
+-    #[test]
+-    fn upstream_user_agent_is_only_exposed_for_direct_provider_urls() {
+-        let input_by_name = HashMap::new();
+-        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
+-        let mut direct_item = m3u_item("http://example.com/live/user/pass/813294.ts");
+-        direct_item.upstream_user_agent = Some("Provider-UA".intern());
+-
+-        let direct = apply_rewrite(
+-            direct_item.clone(),
+-            &ctx,
+-            1,
+-            &[7u8; 16],
+-            &input_by_name,
+-            None,
+-            M3uPlaylistIteratorFlagsSet::new(),
+-            ProxyType::Redirect,
+-        );
+-        let reverse = apply_rewrite(
+-            direct_item,
+-            &ctx,
+-            1,
+-            &[7u8; 16],
+-            &input_by_name,
+-            None,
+-            M3uPlaylistIteratorFlagsSet::new(),
+-            ProxyType::Reverse(None),
+-        );
+-        let mut masked_flags = M3uPlaylistIteratorFlagsSet::new();
+-        masked_flags.set(M3uPlaylistIteratorFlags::MaskRedirectUrl);
+-        let masked_redirect =
+-            apply_rewrite(direct.clone(), &ctx, 1, &[7u8; 16], &input_by_name, None, masked_flags, ProxyType::Redirect);
+-
+-        assert!(direct.to_m3u(None, false).contains("#EXTVLCOPT:http-user-agent=Provider-UA"));
+-        assert!(!reverse.to_m3u(None, true).contains("#EXTVLCOPT:http-user-agent"));
+-        assert!(!masked_redirect.to_m3u(None, true).contains("#EXTVLCOPT:http-user-agent"));
+-    }
+-
+-    #[test]
+-    fn redirect_without_mask_preserves_provider_scheme_url_when_input_is_missing() {
+-        let input_by_name = HashMap::new();
+-        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
+-        let rewritten = apply_rewrite(
+-            m3u_item("provider://example/live/user/pass/813294.ts"),
+-            &ctx,
+-            1,
+-            &[7u8; 16],
+-            &input_by_name,
+-            None,
+-            M3uPlaylistIteratorFlagsSet::new(),
+-            ProxyType::Redirect,
+-        );
+-
+-        assert_eq!(rewritten.t_stream_url.as_ref(), "provider://example/live/user/pass/813294.ts");
+-    }
+-
+-    #[test]
+-    fn masked_redirect_uses_resolved_provider_source_for_rewritten_url() {
+-        let input = provider_input();
+-        let input_by_name = HashMap::from([(Arc::clone(&input.name), input)]);
+-        let mut flags = M3uPlaylistIteratorFlagsSet::new();
+-        flags.set(M3uPlaylistIteratorFlags::MaskRedirectUrl);
+-        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
+-        let rewritten = apply_rewrite(
+-            m3u_item("provider://example/live/user/pass/813294.ts"),
+-            &ctx,
+-            1,
+-            &[7u8; 16],
+-            &input_by_name,
+-            None,
+-            flags,
+-            ProxyType::Redirect,
+-        );
+-
+-        assert_eq!(rewritten.t_stream_url.as_ref(), "https://example.com/m3u-stream/user/pass/813294.ts");
+-    }
+-
+-    #[test]
+-    fn explicit_flussonic_modes_use_native_hls_and_ts_live_paths() {
+-        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
+-        for (mode, source_url, expected_suffix) in [
+-            ("flussonic", "http://provider/ch/index.m3u8", "/813294/index.m3u8"),
+-            ("flussonic-ts", "http://provider/ch/channel.ts", "/813294/mpegts"),
+-        ] {
+-            let mut item = m3u_item(source_url);
+-            item.additional_properties = Some(StreamProperties::Live(Box::new(LiveStreamProperties {
+-                catchup: Some(CatchupProperties { catchup_type: Some(mode.intern()), ..CatchupProperties::default() }),
+-                ..LiveStreamProperties::default()
+-            })));
+-            let rewritten = apply_rewrite(
+-                item,
+-                &ctx,
+-                1,
+-                &[7u8; 16],
+-                &HashMap::new(),
+-                None,
+-                M3uPlaylistIteratorFlagsSet::new(),
+-                ProxyType::Reverse(None),
+-            );
+-            assert!(rewritten.t_stream_url.ends_with(expected_suffix));
+-            assert!(rewritten.t_catchup_source.is_none());
+-        }
+-    }
+-
+-    #[test]
+-    fn append_mode_keeps_existing_flat_live_path() {
+-        let mut item = m3u_item("http://provider/ch/index.m3u8");
+-        item.additional_properties = Some(StreamProperties::Live(Box::new(LiveStreamProperties {
+-            catchup: Some(CatchupProperties {
+-                mode: Some("append".intern()),
+-                source: Some("?utcstart=${timestamp}&offset=-${offset}".intern()),
+-                ..CatchupProperties::default()
+-            }),
+-            ..LiveStreamProperties::default()
+-        })));
+-        let rewritten = apply_rewrite(
+-            item,
+-            &UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" },
+-            1,
+-            &[7u8; 16],
+-            &HashMap::new(),
+-            None,
+-            M3uPlaylistIteratorFlagsSet::new(),
+-            ProxyType::Reverse(None),
+-        );
+-
+-        assert_eq!(rewritten.t_stream_url.as_ref(), "https://example.com/m3u-stream/user/pass/813294.m3u8");
+-        assert!(rewritten.t_catchup_source.is_some());
+-    }
+-
+-    #[test]
+-    fn append_mode_with_days_keeps_existing_flat_live_path() {
+-        let mut item = m3u_item("http://provider/ch/index.m3u8");
+-        item.additional_properties = Some(StreamProperties::Live(Box::new(LiveStreamProperties {
+-            catchup: Some(CatchupProperties {
+-                mode: Some("append".intern()),
+-                days: Some("7".intern()),
+-                source: Some("?utcstart=${timestamp}&offset=-${offset}".intern()),
+-                ..CatchupProperties::default()
+-            }),
+-            ..LiveStreamProperties::default()
+-        })));
+-        let rewritten = apply_rewrite(
+-            item,
+-            &UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" },
+-            1,
+-            &[7u8; 16],
+-            &HashMap::new(),
+-            None,
+-            M3uPlaylistIteratorFlagsSet::new(),
+-            ProxyType::Reverse(None),
+-        );
+-
+-        assert_eq!(rewritten.t_stream_url.as_ref(), "https://example.com/m3u-stream/user/pass/813294.m3u8");
+-        assert!(rewritten.t_catchup_source.is_some());
+-    }
+-
+-    #[test]
+-    fn proxy_xmltv_url_uses_user_server_path_and_encoded_credentials() {
+-        assert_eq!(
+-            build_proxy_xmltv_url_tvg("https://proxy.example/iptv/", "u ser", "p&ss").as_deref(),
+-            Some("https://proxy.example/iptv/xmltv.php?username=u+ser&password=p%26ss")
+-        );
+-        assert_eq!(build_proxy_xmltv_url_tvg("", "user", "pass"), None);
+-    }
+-
+-    // Regression lock: never forward the provider's source `url-tvg`. Without
+-    // configured Tuliprox server information, the header stays bare.
+-    #[tokio::test]
+-    async fn m3u_text_iterator_emits_bare_extm3u_header_without_proxying_source_url_tvg() {
+-        let (tx, rx) = mpsc::channel::<Result<(M3uPlaylistItem, bool), shared::error::TuliproxError>>(1);
+-        drop(tx);
+-        let inner_iter = M3uPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
+-        let mut text_iter =
+-            M3uPlaylistM3uTextIterator { inner: inner_iter, started: false, target_options: None, url_tvg: None };
+-
+-        let first = text_iter.next().await;
+-        assert_eq!(
+-            first.as_ref().and_then(|line| line.as_deref().ok()),
+-            Some("#EXTM3U"),
+-            "EXTM3U header must be bare, never contain url-tvg"
+-        );
+-
+-        let second = text_iter.next().await;
+-        assert_eq!(second, None, "inner channel is closed, so no item lines should follow");
+-    }
+-
+-    #[tokio::test]
+-    async fn m3u_text_iterator_emits_proxy_xmltv_header_when_configured() {
+-        let (tx, rx) = mpsc::channel::<Result<(M3uPlaylistItem, bool), shared::error::TuliproxError>>(1);
+-        drop(tx);
+-        let inner_iter = M3uPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
+-        let mut text_iter = M3uPlaylistM3uTextIterator {
+-            inner: inner_iter,
+-            started: false,
+-            target_options: None,
+-            url_tvg: Some("https://proxy.example/xmltv.php?username=user&password=pass".to_string()),
+-        };
+-
+-        let first = text_iter.next().await;
+-        assert_eq!(
+-            first.as_ref().and_then(|line| line.as_deref().ok()),
+-            Some(
+-                "#EXTM3U url-tvg=\"https://proxy.example/xmltv.php?username=user&password=pass\" x-tvg-url=\"https://proxy.example/xmltv.php?username=user&password=pass\""
+-            )
+-        );
+-    }
+-
+-    #[tokio::test]
+-    async fn iterator_forwards_one_storage_error_then_ends() {
+-        let (tx, rx) = mpsc::channel(2);
+-        assert!(tx.send(Ok((m3u_item("http://example.test/live.ts"), true))).await.is_ok());
+-        assert!(tx.send(Err(shared::error::TuliproxError::RepositoryM3u("corrupt page"))).await.is_ok());
+-        drop(tx);
+-
+-        let mut iterator = M3uPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
+-        assert!(iterator.next().await.is_some_and(|entry| entry.is_ok()));
+-        assert!(iterator.next().await.is_some_and(|entry| entry.is_err()));
+-        assert!(iterator.next().await.is_none());
+-    }
+-}
++use crate::{
++    ensure_target_storage_path, get_file_path_for_db_index, m3u_get_file_path_for_db, open_playlist_reader,
++    storage_const, user_get_bouquet_filter, LockedReceiverStream,
++};
++use futures::Stream;
++use log::error;
++use shared::{
++    create_bitset,
++    error::TuliproxError,
++    model::{
++        ConfigTargetOptions, M3uPlaylistItem, PlaylistItemType, ProxyType, StreamProperties, TargetType, XtreamCluster,
++    },
++    utils::{extract_extension_from_url, sanitize_sensitive_info, Internable, PROVIDER_SCHEME_PREFIX},
++};
++use std::{
++    borrow::Cow,
++    collections::HashMap,
++    pin::Pin,
++    sync::Arc,
++    task::{Context, Poll},
++};
++use tokio::{sync::mpsc, task};
++use tuliprox_core::model::{AppConfig, ConfigTarget, ProxyUserCredentials};
++use tuliprox_parser::m3u_format::{build_m3u_catchup_rewrite, flussonic_proxy_live_file};
++
++create_bitset!(u8, M3uPlaylistIteratorFlags, MaskRedirectUrl, IncludeTypeInUrl, RewriteResource);
++
++pub struct M3uPlaylistIterator {
++    inner: LockedReceiverStream<Result<(M3uPlaylistItem, bool), TuliproxError>>,
++}
++
++struct UrlRewriteContext<'a> {
++    base_url: &'a str,
++    username: &'a str,
++    password: &'a str,
++}
++
++fn build_rewritten_url(
++    ctx: &UrlRewriteContext<'_>,
++    source_url: &str,
++    m3u_pli: &M3uPlaylistItem,
++    typed: bool,
++    prefix_path: &str,
++    append_extension: bool,
++) -> String {
++    // Build URL efficiently with a single allocation using concat_string! macro
++    let stream_type: &str = if typed {
++        match m3u_pli.item_type {
++            PlaylistItemType::Live
++            | PlaylistItemType::Catchup
++            | PlaylistItemType::LiveUnknown
++            | PlaylistItemType::LiveHls
++            | PlaylistItemType::LiveDash => "live",
++            PlaylistItemType::Video | PlaylistItemType::LocalVideo => "movie",
++            PlaylistItemType::Series
++            | PlaylistItemType::SeriesInfo
++            | PlaylistItemType::LocalSeries
++            | PlaylistItemType::LocalSeriesInfo => "series",
++        }
++    } else {
++        ""
++    };
++
++    let mut cap = ctx.base_url.len() + prefix_path.len() + ctx.username.len() + ctx.password.len() + 32; // separators and id
++    if typed {
++        cap += stream_type.len() + 1;
++    }
++
++    let rewritten_url = if typed {
++        shared::concat_string!(
++            cap = cap;
++            ctx.base_url, "/", prefix_path, "/", stream_type, "/",
++            ctx.username, "/", ctx.password, "/", &m3u_pli.virtual_id.to_string()
++        )
++    } else {
++        shared::concat_string!(
++            cap = cap;
++            ctx.base_url, "/", prefix_path, "/",
++            ctx.username, "/", ctx.password, "/", &m3u_pli.virtual_id.to_string()
++        )
++    };
++
++    if append_extension {
++        extract_extension_from_url(source_url)
++            .map(|ext| shared::concat_string!(&rewritten_url, ext))
++            .unwrap_or(rewritten_url)
++    } else {
++        rewritten_url
++    }
++}
++
++fn resolve_effective_source_url<'a>(
++    m3u_pli: &'a M3uPlaylistItem,
++    input_by_name: &HashMap<Arc<str>, Arc<tuliprox_core::model::ConfigInput>>,
++) -> Cow<'a, str> {
++    if !m3u_pli.url.starts_with(PROVIDER_SCHEME_PREFIX) {
++        return Cow::Borrowed(m3u_pli.url.as_ref());
++    }
++
++    input_by_name.get(&m3u_pli.input_name).map_or_else(
++        || {
++            error!(
++                "Input '{}' not found while resolving provider URL '{}'",
++                m3u_pli.input_name,
++                sanitize_sensitive_info(&m3u_pli.url)
++            );
++            Cow::Borrowed(m3u_pli.url.as_ref())
++        },
++        |input| match input.resolve_url(&m3u_pli.url) {
++            Ok(resolved) => match resolved {
++                Cow::Borrowed(url) => Cow::Borrowed(url),
++                Cow::Owned(url) => Cow::Owned(url),
++            },
++            Err(err) => {
++                error!(
++                    "Failed to resolve provider URL '{}' for input '{}': {}",
++                    sanitize_sensitive_info(&m3u_pli.url),
++                    m3u_pli.input_name,
++                    sanitize_sensitive_info(&err.to_string())
++                );
++                Cow::Borrowed(m3u_pli.url.as_ref())
++            }
++        },
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++fn apply_rewrite(
++    mut m3u_pli: M3uPlaylistItem,
++    ctx: &UrlRewriteContext<'_>,
++    target_id: u16,
++    encrypt_secret: &[u8; 16],
++    input_by_name: &HashMap<Arc<str>, Arc<tuliprox_core::model::ConfigInput>>,
++    target_options: Option<&ConfigTargetOptions>,
++    flags: M3uPlaylistIteratorFlagsSet,
++    proxy_type: ProxyType,
++) -> M3uPlaylistItem {
++    let is_redirect = proxy_type.is_redirect(m3u_pli.item_type)
++        || target_options.and_then(|o| o.force_redirect.as_ref()).is_some_and(|f| f.has_cluster(m3u_pli.item_type));
++    let should_rewrite_urls =
++        if is_redirect { flags.contains(M3uPlaylistIteratorFlags::MaskRedirectUrl) } else { true };
++
++    let effective_source_url = resolve_effective_source_url(&m3u_pli, input_by_name);
++    let catchup_rewrite = if should_rewrite_urls {
++        if let Some(StreamProperties::Live(live)) = m3u_pli.additional_properties.as_ref() {
++            if let Some(catchup) = live.catchup.as_ref() {
++                build_m3u_catchup_rewrite(
++                    encrypt_secret,
++                    ctx.base_url,
++                    ctx.username,
++                    target_id,
++                    m3u_pli.virtual_id.get(),
++                    effective_source_url.as_ref(),
++                    catchup,
++                )
++                .ok()
++                .flatten()
++            } else {
++                None
++            }
++        } else {
++            None
++        }
++    } else {
++        None
++    };
++
++    if should_rewrite_urls {
++        let flussonic_live_file = m3u_pli
++            .additional_properties
++            .as_ref()
++            .and_then(|properties| match properties {
++                StreamProperties::Live(live) => live
++                    .catchup
++                    .as_ref()
++                    .and_then(shared::model::CatchupProperties::native_flussonic_player_mode)
++                    .map(flussonic_proxy_live_file),
++                _ => None,
++            })
++            .or_else(|| {
++                let has_no_explicit_catchup = m3u_pli.additional_properties.as_ref().is_none_or(|props| match props {
++                    StreamProperties::Live(live) => {
++                        live.catchup.as_ref().is_none_or(shared::model::CatchupProperties::is_empty)
++                    }
++                    _ => true,
++                });
++                (!m3u_pli.time_shift.trim().is_empty() && has_no_explicit_catchup)
++                    .then_some(flussonic_proxy_live_file("flussonic"))
++            });
++        let stream_url = flussonic_live_file.map_or_else(
++            || {
++                build_rewritten_url(
++                    ctx,
++                    effective_source_url.as_ref(),
++                    &m3u_pli,
++                    flags.contains(M3uPlaylistIteratorFlags::IncludeTypeInUrl),
++                    storage_const::M3U_STREAM_PATH,
++                    true,
++                )
++            },
++            |live_file| {
++                let base = build_rewritten_url(
++                    ctx,
++                    effective_source_url.as_ref(),
++                    &m3u_pli,
++                    flags.contains(M3uPlaylistIteratorFlags::IncludeTypeInUrl),
++                    storage_const::M3U_STREAM_PATH,
++                    false,
++                );
++                shared::concat_string!(&base, "/", live_file)
++            },
++        );
++        let resource_url = if flags.contains(M3uPlaylistIteratorFlags::RewriteResource) {
++            let source_url = if m3u_pli.logo.is_empty() { m3u_pli.logo_small.as_ref() } else { m3u_pli.logo.as_ref() };
++            Some(build_rewritten_url(ctx, source_url, &m3u_pli, false, storage_const::M3U_RESOURCE_PATH, false))
++        } else {
++            None
++        };
++        m3u_pli.t_stream_url = stream_url.intern();
++        m3u_pli.t_resource_url = resource_url;
++    } else {
++        m3u_pli.t_stream_url = match effective_source_url {
++            Cow::Borrowed(_) => Arc::clone(&m3u_pli.url),
++            Cow::Owned(url) => url.intern(),
++        };
++        m3u_pli.t_resource_url = None;
++    }
++
++    if let Some(rewrite) = catchup_rewrite {
++        m3u_pli.t_catchup_mode = Some(rewrite.mode);
++        m3u_pli.t_catchup_source = Some(rewrite.source);
++    }
++    if should_rewrite_urls {
++        m3u_pli.upstream_user_agent = None;
++    }
++
++    m3u_pli
++}
++
++#[allow(clippy::too_many_lines)]
++impl M3uPlaylistIterator {
++    pub async fn new(
++        cfg: &AppConfig,
++        target: &ConfigTarget,
++        user: &ProxyUserCredentials,
++    ) -> Result<Self, TuliproxError> {
++        // TODO use playlist memory cache, but be aware of sorting !
++
++        let m3u_output = target.get_m3u_output().ok_or_else(|| {
++            TuliproxError::Config(format!("Unexpected failure, missing m3u target output for target {}", target.name))
++        })?;
++        let config = cfg.config.load();
++        let target_path = ensure_target_storage_path(&config, target.name.as_str()).await?;
++        let m3u_path = m3u_get_file_path_for_db(&target_path);
++
++        let iter_lock = cfg.file_locks.read_lock(&m3u_path).await;
++        let bg_lock = cfg.file_locks.read_lock(&m3u_path).await;
++
++        let filter = user_get_bouquet_filter(&config, &user.username, None, TargetType::M3u, XtreamCluster::Live).await;
++        let mut flags = M3uPlaylistIteratorFlagsSet::new();
++        if m3u_output.include_type_in_url {
++            flags.set(M3uPlaylistIteratorFlags::IncludeTypeInUrl);
++        }
++        if m3u_output.mask_redirect_url {
++            flags.set(M3uPlaylistIteratorFlags::MaskRedirectUrl);
++        }
++        if cfg.is_reverse_proxy_resource_rewrite_enabled() {
++            flags.set(M3uPlaylistIteratorFlags::RewriteResource);
++        }
++
++        let base_url = cfg.get_user_server_info(user).map(|si| si.get_base_url()).unwrap_or_default();
++        let encrypt_secret = cfg.get_reverse_proxy_rewrite_secret().unwrap_or(cfg.encrypt_secret);
++        let username = user.username.clone();
++        let password = user.password.clone();
++        let target_id = target.id;
++        let proxy_type = user.proxy;
++        let output_clusters = user.output_clusters;
++        let user_filter = user.t_filter.clone();
 +        let hide_adult = user.hide_adult;
-         let target_options = target.options.clone();
-         let input_by_name: HashMap<Arc<str>, Arc<tuliprox_core::model::ConfigInput>> =
-             cfg.sources.load().inputs.iter().map(|input| (Arc::clone(&input.name), Arc::clone(input))).collect();
-@@ -316,6 +317,15 @@ impl M3uPlaylistIterator {
-                     continue;
-                 }
- 
++        let target_options = target.options.clone();
++        let input_by_name: HashMap<Arc<str>, Arc<tuliprox_core::model::ConfigInput>> =
++            cfg.sources.load().inputs.iter().map(|input| (Arc::clone(&input.name), Arc::clone(input))).collect();
++
++        let m3u_path = m3u_path.clone();
++        let index_path = get_file_path_for_db_index(&m3u_path);
++        let (tx, rx) = mpsc::channel::<Result<(M3uPlaylistItem, bool), TuliproxError>>(256);
++
++        let m3u_path_for_log = m3u_path.clone();
++        let index_path_for_log = index_path.clone();
++        let join_error_tx = tx.clone();
++        let handle = task::spawn_blocking(move || {
++            let _guard = bg_lock;
++            let reader = match open_playlist_reader::<u32, M3uPlaylistItem, u32>(
++                &m3u_path,
++                &index_path,
++                Some("Sorted index error for m3u, fallback"),
++            ) {
++                Ok(reader) => reader,
++                Err(err) => {
++                    error!("Failed to open M3U playlist DB {}: {err}", m3u_path.display());
++                    let _ = tx.blocking_send(Err(err));
++                    return;
++                }
++            };
++
++            let mut pending: Option<M3uPlaylistItem> = None;
++            for entry in reader {
++                let item = match entry {
++                    Ok((_, item)) => item,
++                    Err(err) => {
++                        error!("Skipping unreadable M3U playlist entry: {err}");
++                        continue;
++                    }
++                };
++
++                if !output_clusters.has_cluster(item.item_type) {
++                    continue;
++                }
++
 +                if hide_adult
-+                    && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
-+                        || crate::model::ProxyUserCredentials::stream_props_marked_adult(
++                    && (tuliprox_core::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
++                        || tuliprox_core::model::ProxyUserCredentials::stream_props_marked_adult(
 +                            item.additional_properties.as_ref(),
 +                        ))
 +                {
 +                    continue;
 +                }
 +
-                 if let Some(set) = &filter {
-                     if !set.contains(item.group.as_ref()) {
-                         continue;
++                if let Some(set) = &filter {
++                    if !set.contains(item.group.as_ref()) {
++                        continue;
++                    }
++                }
++
++                // per-user content filter (plan AND user), applied post-cache
++                if let Some(user_filter) = &user_filter {
++                    let pli = shared::model::PlaylistItem::from(&item);
++                    let provider = shared::foundation::ValueProvider { pli: &pli, match_as_ascii: false };
++                    if !user_filter.filter(&provider) {
++                        continue;
++                    }
++                }
++
++                let rewrite_ctx = UrlRewriteContext { base_url: &base_url, username: &username, password: &password };
++
++                let item = apply_rewrite(
++                    item,
++                    &rewrite_ctx,
++                    target_id,
++                    &encrypt_secret,
++                    &input_by_name,
++                    target_options.as_ref(),
++                    flags,
++                    proxy_type,
++                );
++
++                if let Some(prev) = pending.replace(item) {
++                    if tx.blocking_send(Ok((prev, true))).is_err() {
++                        return;
++                    }
++                }
++            }
++
++            if let Some(last) = pending {
++                let _ = tx.blocking_send(Ok((last, false)));
++            }
++        });
++        tokio::spawn(async move {
++            if let Err(err) = handle.await {
++                error!(
++                    "M3U playlist iterator task failed for {} (index {}): {err}",
++                    m3u_path_for_log.display(),
++                    index_path_for_log.display()
++                );
++                let _ = join_error_tx
++                    .send(Err(TuliproxError::RepositoryM3u(format!(
++                        "M3U playlist iterator task failed for {}: {err}",
++                        m3u_path_for_log.display()
++                    ))))
++                    .await;
++            }
++        });
++
++        Ok(Self {
++            inner: LockedReceiverStream::new(rx, iter_lock), // Save lock inside struct
++        })
++    }
++}
++
++impl Stream for M3uPlaylistIterator {
++    type Item = Result<(M3uPlaylistItem, bool), TuliproxError>;
++
++    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++        Pin::new(&mut self.inner).poll_next(cx)
++    }
++}
++
++fn build_proxy_xmltv_url_tvg(base_url: &str, username: &str, password: &str) -> Option<String> {
++    let base = base_url.trim_end_matches('/');
++    if base.is_empty() || username.is_empty() || password.is_empty() {
++        return None;
++    }
++    let query = url::form_urlencoded::Serializer::new(String::new())
++        .append_pair("username", username)
++        .append_pair("password", password)
++        .finish();
++    Some(format!("{base}/xmltv.php?{query}"))
++}
++
++pub struct M3uPlaylistM3uTextIterator {
++    inner: M3uPlaylistIterator,
++    started: bool,
++    target_options: Option<ConfigTargetOptions>,
++    url_tvg: Option<String>,
++}
++
++impl M3uPlaylistM3uTextIterator {
++    pub async fn new(
++        cfg: &AppConfig,
++        target: &ConfigTarget,
++        user: &ProxyUserCredentials,
++    ) -> Result<Self, TuliproxError> {
++        let base_url = cfg.get_user_server_info(user).map(|server| server.get_base_url()).unwrap_or_default();
++        Ok(Self {
++            inner: M3uPlaylistIterator::new(cfg, target, user).await?,
++            started: false,
++            target_options: target.options.clone(),
++            url_tvg: build_proxy_xmltv_url_tvg(&base_url, &user.username, &user.password),
++        })
++    }
++}
++
++impl Stream for M3uPlaylistM3uTextIterator {
++    type Item = Result<String, String>;
++
++    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++        if !self.started {
++            self.started = true;
++            let header = self
++                .url_tvg
++                .as_ref()
++                .map_or_else(|| "#EXTM3U".to_string(), |url| format!("#EXTM3U url-tvg=\"{url}\" x-tvg-url=\"{url}\""));
++            return Poll::Ready(Some(Ok(header)));
++        }
++
++        match Pin::new(&mut self.inner).poll_next(cx) {
++            Poll::Ready(Some(Ok((m3u_pli, _has_next)))) => {
++                let target_options = self.target_options.as_ref();
++                Poll::Ready(Some(Ok(m3u_pli.to_m3u(target_options, true))))
++            }
++            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.to_string()))),
++            Poll::Ready(None) => Poll::Ready(None),
++            Poll::Pending => Poll::Pending,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{
++        apply_rewrite, build_proxy_xmltv_url_tvg, M3uPlaylistIterator, M3uPlaylistIteratorFlags,
++        M3uPlaylistIteratorFlagsSet, M3uPlaylistM3uTextIterator, UrlRewriteContext,
++    };
++    use crate::LockedReceiverStream;
++    use futures::StreamExt;
++    use shared::{
++        model::{
++            CatchupProperties, LiveStreamProperties, M3uPlaylistItem, PlaylistItemType, ProviderUrlSelectionPolicy,
++            ProxyType, StreamProperties, VirtualId,
++        },
++        utils::Internable,
++    };
++    use std::{
++        collections::HashMap,
++        sync::{atomic::AtomicUsize, Arc},
++    };
++    use tokio::sync::mpsc;
++    use tuliprox_core::model::{ConfigInput, ConfigProvider, ProviderDnsCache};
++
++    fn provider_input() -> Arc<ConfigInput> {
++        Arc::new(ConfigInput {
++            name: "example1".intern(),
++            provider_configs: Some(vec![Arc::new(ConfigProvider {
++                name: "example".intern(),
++                urls: vec!["http://example.com".intern()],
++                provider_url_selection_policy: ProviderUrlSelectionPolicy::ResumeLastWorking,
++                current_url_index: AtomicUsize::new(0),
++                dns: None,
++                dns_cache: Arc::new(ProviderDnsCache::default()),
++            })]),
++            ..ConfigInput::default()
++        })
++    }
++
++    fn m3u_item(url: &str) -> M3uPlaylistItem {
++        M3uPlaylistItem {
++            virtual_id: VirtualId::new(813_294),
++            provider_id: "813294".intern(),
++            name: "France 4K".intern(),
++            chno: 0,
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "FR| FRANCE 4K".intern(),
++            title: "France 4K".intern(),
++            parent_code: "".intern(),
++            audio_track: "".intern(),
++            time_shift: "".intern(),
++            rec: "".intern(),
++            url: url.intern(),
++            epg_channel_id: None,
++            input_name: "example1".intern(),
++            item_type: PlaylistItemType::Live,
++            t_stream_url: "".intern(),
++            t_resource_url: None,
++            t_catchup_source: None,
++            t_catchup_mode: None,
++            source_ordinal: 0,
++            additional_properties: None,
++            input_stream_id: "813294".intern(),
++            upstream_user_agent: None,
++        }
++    }
++
++    #[test]
++    fn redirect_without_mask_resolves_provider_scheme_url() {
++        let input = provider_input();
++        let input_by_name = HashMap::from([(Arc::clone(&input.name), input)]);
++        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
++        let rewritten = apply_rewrite(
++            m3u_item("provider://example/live/user/pass/813294.ts"),
++            &ctx,
++            1,
++            &[7u8; 16],
++            &input_by_name,
++            None,
++            M3uPlaylistIteratorFlagsSet::new(),
++            ProxyType::Redirect,
++        );
++
++        assert_eq!(rewritten.t_stream_url.as_ref(), "http://example.com/live/user/pass/813294.ts");
++    }
++
++    #[test]
++    fn redirect_without_mask_keeps_regular_url() {
++        let input_by_name = HashMap::new();
++        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
++        let rewritten = apply_rewrite(
++            m3u_item("http://example.com/live/user/pass/813294.ts"),
++            &ctx,
++            1,
++            &[7u8; 16],
++            &input_by_name,
++            None,
++            M3uPlaylistIteratorFlagsSet::new(),
++            ProxyType::Redirect,
++        );
++
++        assert_eq!(rewritten.t_stream_url.as_ref(), "http://example.com/live/user/pass/813294.ts");
++    }
++
++    #[test]
++    fn upstream_user_agent_is_only_exposed_for_direct_provider_urls() {
++        let input_by_name = HashMap::new();
++        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
++        let mut direct_item = m3u_item("http://example.com/live/user/pass/813294.ts");
++        direct_item.upstream_user_agent = Some("Provider-UA".intern());
++
++        let direct = apply_rewrite(
++            direct_item.clone(),
++            &ctx,
++            1,
++            &[7u8; 16],
++            &input_by_name,
++            None,
++            M3uPlaylistIteratorFlagsSet::new(),
++            ProxyType::Redirect,
++        );
++        let reverse = apply_rewrite(
++            direct_item,
++            &ctx,
++            1,
++            &[7u8; 16],
++            &input_by_name,
++            None,
++            M3uPlaylistIteratorFlagsSet::new(),
++            ProxyType::Reverse(None),
++        );
++        let mut masked_flags = M3uPlaylistIteratorFlagsSet::new();
++        masked_flags.set(M3uPlaylistIteratorFlags::MaskRedirectUrl);
++        let masked_redirect =
++            apply_rewrite(direct.clone(), &ctx, 1, &[7u8; 16], &input_by_name, None, masked_flags, ProxyType::Redirect);
++
++        assert!(direct.to_m3u(None, false).contains("#EXTVLCOPT:http-user-agent=Provider-UA"));
++        assert!(!reverse.to_m3u(None, true).contains("#EXTVLCOPT:http-user-agent"));
++        assert!(!masked_redirect.to_m3u(None, true).contains("#EXTVLCOPT:http-user-agent"));
++    }
++
++    #[test]
++    fn redirect_without_mask_preserves_provider_scheme_url_when_input_is_missing() {
++        let input_by_name = HashMap::new();
++        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
++        let rewritten = apply_rewrite(
++            m3u_item("provider://example/live/user/pass/813294.ts"),
++            &ctx,
++            1,
++            &[7u8; 16],
++            &input_by_name,
++            None,
++            M3uPlaylistIteratorFlagsSet::new(),
++            ProxyType::Redirect,
++        );
++
++        assert_eq!(rewritten.t_stream_url.as_ref(), "provider://example/live/user/pass/813294.ts");
++    }
++
++    #[test]
++    fn masked_redirect_uses_resolved_provider_source_for_rewritten_url() {
++        let input = provider_input();
++        let input_by_name = HashMap::from([(Arc::clone(&input.name), input)]);
++        let mut flags = M3uPlaylistIteratorFlagsSet::new();
++        flags.set(M3uPlaylistIteratorFlags::MaskRedirectUrl);
++        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
++        let rewritten = apply_rewrite(
++            m3u_item("provider://example/live/user/pass/813294.ts"),
++            &ctx,
++            1,
++            &[7u8; 16],
++            &input_by_name,
++            None,
++            flags,
++            ProxyType::Redirect,
++        );
++
++        assert_eq!(rewritten.t_stream_url.as_ref(), "https://example.com/m3u-stream/user/pass/813294.ts");
++    }
++
++    #[test]
++    fn explicit_flussonic_modes_use_native_hls_and_ts_live_paths() {
++        let ctx = UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" };
++        for (mode, source_url, expected_suffix) in [
++            ("flussonic", "http://provider/ch/index.m3u8", "/813294/index.m3u8"),
++            ("flussonic-ts", "http://provider/ch/channel.ts", "/813294/mpegts"),
++        ] {
++            let mut item = m3u_item(source_url);
++            item.additional_properties = Some(StreamProperties::Live(Box::new(LiveStreamProperties {
++                catchup: Some(CatchupProperties { catchup_type: Some(mode.intern()), ..CatchupProperties::default() }),
++                ..LiveStreamProperties::default()
++            })));
++            let rewritten = apply_rewrite(
++                item,
++                &ctx,
++                1,
++                &[7u8; 16],
++                &HashMap::new(),
++                None,
++                M3uPlaylistIteratorFlagsSet::new(),
++                ProxyType::Reverse(None),
++            );
++            assert!(rewritten.t_stream_url.ends_with(expected_suffix));
++            assert!(rewritten.t_catchup_source.is_none());
++        }
++    }
++
++    #[test]
++    fn append_mode_keeps_existing_flat_live_path() {
++        let mut item = m3u_item("http://provider/ch/index.m3u8");
++        item.additional_properties = Some(StreamProperties::Live(Box::new(LiveStreamProperties {
++            catchup: Some(CatchupProperties {
++                mode: Some("append".intern()),
++                source: Some("?utcstart=${timestamp}&offset=-${offset}".intern()),
++                ..CatchupProperties::default()
++            }),
++            ..LiveStreamProperties::default()
++        })));
++        let rewritten = apply_rewrite(
++            item,
++            &UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" },
++            1,
++            &[7u8; 16],
++            &HashMap::new(),
++            None,
++            M3uPlaylistIteratorFlagsSet::new(),
++            ProxyType::Reverse(None),
++        );
++
++        assert_eq!(rewritten.t_stream_url.as_ref(), "https://example.com/m3u-stream/user/pass/813294.m3u8");
++        assert!(rewritten.t_catchup_source.is_some());
++    }
++
++    #[test]
++    fn append_mode_with_days_keeps_existing_flat_live_path() {
++        let mut item = m3u_item("http://provider/ch/index.m3u8");
++        item.additional_properties = Some(StreamProperties::Live(Box::new(LiveStreamProperties {
++            catchup: Some(CatchupProperties {
++                mode: Some("append".intern()),
++                days: Some("7".intern()),
++                source: Some("?utcstart=${timestamp}&offset=-${offset}".intern()),
++                ..CatchupProperties::default()
++            }),
++            ..LiveStreamProperties::default()
++        })));
++        let rewritten = apply_rewrite(
++            item,
++            &UrlRewriteContext { base_url: "https://example.com", username: "user", password: "pass" },
++            1,
++            &[7u8; 16],
++            &HashMap::new(),
++            None,
++            M3uPlaylistIteratorFlagsSet::new(),
++            ProxyType::Reverse(None),
++        );
++
++        assert_eq!(rewritten.t_stream_url.as_ref(), "https://example.com/m3u-stream/user/pass/813294.m3u8");
++        assert!(rewritten.t_catchup_source.is_some());
++    }
++
++    #[test]
++    fn proxy_xmltv_url_uses_user_server_path_and_encoded_credentials() {
++        assert_eq!(
++            build_proxy_xmltv_url_tvg("https://proxy.example/iptv/", "u ser", "p&ss").as_deref(),
++            Some("https://proxy.example/iptv/xmltv.php?username=u+ser&password=p%26ss")
++        );
++        assert_eq!(build_proxy_xmltv_url_tvg("", "user", "pass"), None);
++    }
++
++    // Regression lock: never forward the provider's source `url-tvg`. Without
++    // configured Tuliprox server information, the header stays bare.
++    #[tokio::test]
++    async fn m3u_text_iterator_emits_bare_extm3u_header_without_proxying_source_url_tvg() {
++        let (tx, rx) = mpsc::channel::<Result<(M3uPlaylistItem, bool), shared::error::TuliproxError>>(1);
++        drop(tx);
++        let inner_iter = M3uPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
++        let mut text_iter =
++            M3uPlaylistM3uTextIterator { inner: inner_iter, started: false, target_options: None, url_tvg: None };
++
++        let first = text_iter.next().await;
++        assert_eq!(
++            first.as_ref().and_then(|line| line.as_deref().ok()),
++            Some("#EXTM3U"),
++            "EXTM3U header must be bare, never contain url-tvg"
++        );
++
++        let second = text_iter.next().await;
++        assert_eq!(second, None, "inner channel is closed, so no item lines should follow");
++    }
++
++    #[tokio::test]
++    async fn m3u_text_iterator_emits_proxy_xmltv_header_when_configured() {
++        let (tx, rx) = mpsc::channel::<Result<(M3uPlaylistItem, bool), shared::error::TuliproxError>>(1);
++        drop(tx);
++        let inner_iter = M3uPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
++        let mut text_iter = M3uPlaylistM3uTextIterator {
++            inner: inner_iter,
++            started: false,
++            target_options: None,
++            url_tvg: Some("https://proxy.example/xmltv.php?username=user&password=pass".to_string()),
++        };
++
++        let first = text_iter.next().await;
++        assert_eq!(
++            first.as_ref().and_then(|line| line.as_deref().ok()),
++            Some(
++                "#EXTM3U url-tvg=\"https://proxy.example/xmltv.php?username=user&password=pass\" x-tvg-url=\"https://proxy.example/xmltv.php?username=user&password=pass\""
++            )
++        );
++    }
++
++    #[tokio::test]
++    async fn iterator_forwards_one_storage_error_then_ends() {
++        let (tx, rx) = mpsc::channel(2);
++        assert!(tx.send(Ok((m3u_item("http://example.test/live.ts"), true))).await.is_ok());
++        assert!(tx.send(Err(shared::error::TuliproxError::RepositoryM3u("corrupt page"))).await.is_ok());
++        drop(tx);
++
++        let mut iterator = M3uPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
++        assert!(iterator.next().await.is_some_and(|entry| entry.is_ok()));
++        assert!(iterator.next().await.is_some_and(|entry| entry.is_err()));
++        assert!(iterator.next().await.is_none());
++    }
++}
 diff --git a/backend/repository/src/startup_migration.rs b/backend/repository/src/startup_migration.rs
 index 89be17d7..b18d202f 100644
 --- a/backend/repository/src/startup_migration.rs
@@ -1007,53 +3374,639 @@ index 349273b3..13b821a7 100644
              priority: 0,
              soft_connections: 0,
 diff --git a/backend/repository/src/xtream_playlist_iterator.rs b/backend/repository/src/xtream_playlist_iterator.rs
-index 8bacf477..dc7465ca 100644
+index 8bacf477..09b26b3d 100644
 --- a/backend/repository/src/xtream_playlist_iterator.rs
 +++ b/backend/repository/src/xtream_playlist_iterator.rs
-@@ -71,6 +71,7 @@ impl XtreamPlaylistIterator {
-                     })
-                     .collect()
-             });
-+            let hide_adult = user.hide_adult;
- 
-             let xtream_path = xtream_path.clone();
-             let index_path = get_file_path_for_db_index(&xtream_path);
-@@ -107,7 +108,7 @@ impl XtreamPlaylistIterator {
-                         }
-                     };
- 
+@@ -1,336 +1,358 @@
+-use crate::{
+-    get_file_path_for_db_index, open_playlist_reader, user_get_bouquet_filter, xtream_get_file_path,
+-    xtream_get_storage_path, LockedReceiverStream,
+-};
+-use futures::Stream;
+-use log::error;
+-use shared::{
+-    error::TuliproxError,
+-    model::{PlaylistItemType, TargetType, XtreamCluster, XtreamMappingOptions, XtreamPlaylistItem},
+-};
+-use std::{
+-    collections::HashSet,
+-    pin::Pin,
+-    sync::Arc,
+-    task::{Context, Poll},
+-};
+-use tokio::{sync::mpsc, task};
+-use tuliprox_core::model::{xtream_mapping_option_from_target_options, AppConfig, ConfigTarget, ProxyUserCredentials};
+-
+-pub struct XtreamPlaylistIterator {
+-    inner: LockedReceiverStream<Result<(XtreamPlaylistItem, bool), TuliproxError>>,
+-}
+-
+-fn is_cluster_allowed_for_user(user: &ProxyUserCredentials, cluster: XtreamCluster) -> bool {
+-    user.allows_cluster(cluster)
+-}
+-
+-impl XtreamPlaylistIterator {
+-    fn empty() -> Self {
+-        // Ghost Channel pattern
+-        // When you immediately drop the sender with `_`, the channel is closed and receiver gets None.
+-        let (_tx, rx) = mpsc::channel::<Result<(XtreamPlaylistItem, bool), TuliproxError>>(1);
+-        Self { inner: LockedReceiverStream::new_empty(rx) }
+-    }
+-
+-    pub async fn new(
+-        cluster: XtreamCluster,
+-        app_config: &AppConfig,
+-        target: &ConfigTarget,
+-        category_id: Option<u32>,
+-        user: &ProxyUserCredentials,
+-    ) -> Result<Self, TuliproxError> {
+-        // TODO use playlist memory cache and keep sorted
+-        if !is_cluster_allowed_for_user(user, cluster) {
+-            return Ok(Self::empty());
+-        }
+-
+-        debug_assert!(target.get_xtream_output().is_some());
+-        let config = app_config.config.load();
+-        if let Some(storage_path) = xtream_get_storage_path(&config, target.name.as_str()) {
+-            let xtream_path = xtream_get_file_path(&storage_path, cluster);
+-            if !xtream_path.exists() {
+-                return Err(TuliproxError::Config(format!("No {cluster} entries found for target {}", target.name)));
+-            }
+-            // Hold iter_lock for the stream lifetime (LockedReceiverStream), and bg_lock for the background reader.
+-            let iter_lock = app_config.file_locks.read_lock(&xtream_path).await;
+-            let bg_lock = app_config.file_locks.read_lock(&xtream_path).await;
+-
+-            let filter =
+-                user_get_bouquet_filter(&config, &user.username, category_id, TargetType::Xtream, cluster).await;
+-            // Parse bouquet filter (strings) once into u32 set to minimize per-item allocations
+-            let filter_ids: Option<HashSet<u32>> = filter.as_ref().map(|set| {
+-                set.iter()
+-                    .filter_map(|s| {
+-                        s.parse::<u32>()
+-                            .map_err(|e| {
+-                                error!("Failed to parse bouquet filter id '{s}': {e}");
+-                                e
+-                            })
+-                            .ok()
+-                    })
+-                    .collect()
+-            });
+-
+-            let xtream_path = xtream_path.clone();
+-            let index_path = get_file_path_for_db_index(&xtream_path);
+-            let (tx, rx) = mpsc::channel::<Result<(XtreamPlaylistItem, bool), TuliproxError>>(256);
+-            let user_filter = user.t_filter.clone();
+-
+-            let xtream_path_for_log = xtream_path.clone();
+-            let join_error_tx = tx.clone();
+-            let handle = task::spawn_blocking(move || {
+-                let _guard = bg_lock;
+-                let reader = match open_playlist_reader::<u32, XtreamPlaylistItem, u32>(
+-                    &xtream_path,
+-                    &index_path,
+-                    Some("Sorted index error, falling back to unsorted"),
+-                ) {
+-                    Ok(reader) => reader,
+-                    Err(err) => {
+-                        error!(
+-                            "Failed to open Xtream playlist DB {} (cluster {cluster}): {err}",
+-                            xtream_path.display()
+-                        );
+-                        let _ = tx.blocking_send(Err(err));
+-                        return;
+-                    }
+-                };
+-
+-                let mut pending: Option<XtreamPlaylistItem> = None;
+-                for entry in reader {
+-                    let item = match entry {
+-                        Ok((_, item)) => item,
+-                        Err(err) => {
+-                            error!("Skipping unreadable Xtream playlist entry: {err}");
+-                            continue;
+-                        }
+-                    };
+-
 -                    if !Self::matches_filters(cluster, filter_ids.as_ref(), user_filter.as_ref(), &item) {
+-                        continue;
+-                    }
+-
+-                    if let Some(prev) = pending.replace(item) {
+-                        if tx.blocking_send(Ok((prev, true))).is_err() {
+-                            return;
+-                        }
+-                    }
+-                }
+-
+-                if let Some(last) = pending {
+-                    let _ = tx.blocking_send(Ok((last, false)));
+-                }
+-            });
+-            tokio::spawn(async move {
+-                if let Err(err) = handle.await {
+-                    error!(
+-                        "Xtream playlist iterator task failed for {} (cluster {cluster}): {err}",
+-                        xtream_path_for_log.display()
+-                    );
+-                    let _ = join_error_tx
+-                        .send(Err(TuliproxError::RepositoryXtream(format!(
+-                            "Xtream playlist iterator task failed for {}: {err}",
+-                            xtream_path_for_log.display()
+-                        ))))
+-                        .await;
+-                }
+-            });
+-
+-            Ok(Self { inner: LockedReceiverStream::new(rx, iter_lock) })
+-        } else {
+-            Err(TuliproxError::Config(format!("Failed to find xtream storage for target {}", target.name)))
+-        }
+-    }
+-
+-    fn matches_filters(
+-        cluster: XtreamCluster,
+-        filter_ids: Option<&HashSet<u32>>,
+-        user_filter: Option<&Arc<shared::foundation::Filter>>,
+-        item: &XtreamPlaylistItem,
+-    ) -> bool {
+-        // We can't serve episodes within series
+-        if cluster == XtreamCluster::Series
+-            && !matches!(item.item_type, PlaylistItemType::SeriesInfo | PlaylistItemType::LocalSeriesInfo)
+-        {
+-            return false;
+-        }
+-
+-        // category_id-Filter
+-        if let Some(set) = filter_ids {
+-            if !set.contains(&item.category_id) {
+-                return false;
+-            }
+-        }
+-
+-        // per-user content filter (plan AND user), applied post-cache
+-        if let Some(filter) = user_filter {
+-            let pli = shared::model::PlaylistItem::from(item);
+-            let provider = shared::foundation::ValueProvider { pli: &pli, match_as_ascii: false };
+-            if !filter.filter(&provider) {
+-                return false;
+-            }
+-        }
+-
+-        true
+-    }
+-}
+-
+-impl Stream for XtreamPlaylistIterator {
+-    type Item = Result<(XtreamPlaylistItem, bool), TuliproxError>;
+-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+-        Pin::new(&mut self.inner).poll_next(cx)
+-    }
+-}
+-
+-pub struct XtreamPlaylistJsonIterator {
+-    inner: XtreamPlaylistIterator,
+-    options: Option<XtreamMappingOptions>,
+-}
+-
+-impl XtreamPlaylistJsonIterator {
+-    pub async fn new(
+-        cluster: XtreamCluster,
+-        app_config: &Arc<AppConfig>,
+-        target: &ConfigTarget,
+-        category_id: Option<u32>,
+-        user: &ProxyUserCredentials,
+-    ) -> Result<Self, TuliproxError> {
+-        let xtream_output = target.get_xtream_output().ok_or_else(|| {
+-            TuliproxError::Config(format!("Unexpected: xtream output required for target {}", target.name))
+-        })?;
+-        if !is_cluster_allowed_for_user(user, cluster) {
+-            return Ok(Self { inner: XtreamPlaylistIterator::empty(), options: None });
+-        }
+-        let encrypt_secret = app_config.get_encrypt_secret();
+-        let options =
+-            xtream_mapping_option_from_target_options(target, xtream_output, app_config, user, encrypt_secret)?;
+-        Ok(Self {
+-            inner: XtreamPlaylistIterator::new(cluster, app_config, target, category_id, user).await?,
+-            options: Some(options),
+-        })
+-    }
+-}
+-
+-impl Stream for XtreamPlaylistJsonIterator {
+-    type Item = Result<(String, bool), TuliproxError>;
+-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+-        match Pin::new(&mut self.inner).poll_next(cx) {
+-            Poll::Ready(Some(Ok((pli, has_next)))) => {
+-                let Some(options) = self.options.as_ref() else {
+-                    return Poll::Ready(None);
+-                };
+-                let json = serde_json::to_string(&pli.to_document(options))
+-                    .map_err(|error| TuliproxError::RepositoryXtream(error.to_string()));
+-                Poll::Ready(Some(json.map(|json| (json, has_next))))
+-            }
+-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+-            Poll::Ready(None) => Poll::Ready(None),
+-            Poll::Pending => Poll::Pending,
+-        }
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::{is_cluster_allowed_for_user, XtreamPlaylistIterator};
+-    use crate::LockedReceiverStream;
+-    use futures::StreamExt;
+-    use shared::{
+-        model::{ClusterFlags, PlaylistItemType, VirtualId, XtreamCluster, XtreamPlaylistItem},
+-        utils::Internable,
+-    };
+-    use tokio::sync::mpsc;
+-    use tuliprox_core::model::ProxyUserCredentials;
+-
+-    #[test]
+-    fn cluster_guard_respects_user_cluster_flags() {
+-        let mut user = ProxyUserCredentials::default();
+-        user.output_clusters = ClusterFlags::Live | ClusterFlags::Series;
+-
+-        assert!(is_cluster_allowed_for_user(&user, XtreamCluster::Live));
+-        assert!(!is_cluster_allowed_for_user(&user, XtreamCluster::Video));
+-        assert!(is_cluster_allowed_for_user(&user, XtreamCluster::Series));
+-    }
+-
+-    #[test]
+-    fn matches_filters_applies_user_content_filter() {
+-        let make_item = |group: &str| XtreamPlaylistItem {
+-            virtual_id: VirtualId::new(1),
+-            provider_id: 1,
+-            name: "name".intern(),
+-            logo: "".intern(),
+-            logo_small: "".intern(),
+-            group: group.intern(),
+-            title: "title".intern(),
+-            parent_code: "".intern(),
+-            rec: "".intern(),
+-            url: "http://example.test/live.ts".intern(),
+-            epg_channel_id: None,
+-            xtream_cluster: XtreamCluster::Live,
+-            additional_properties: None,
+-            item_type: PlaylistItemType::Live,
+-            category_id: 1,
+-            input_name: "input".intern(),
+-            channel_no: 0,
+-            source_ordinal: 0,
+-            input_stream_id: "1".intern(),
+-            upstream_user_agent: None,
+-        };
+-        let filter = std::sync::Arc::new(
+-            shared::foundation::get_filter(r#"NOT Group ~ "^VIP.*""#, None).expect("filter parses"),
+-        );
+-
+-        // no filter: everything passes
+-        assert!(XtreamPlaylistIterator::matches_filters(XtreamCluster::Live, None, None, &make_item("VIP Sports")));
+-        // filter hides matching groups, keeps the rest
+-        assert!(!XtreamPlaylistIterator::matches_filters(
+-            XtreamCluster::Live,
+-            None,
+-            Some(&filter),
+-            &make_item("VIP Sports")
+-        ));
+-        assert!(XtreamPlaylistIterator::matches_filters(XtreamCluster::Live, None, Some(&filter), &make_item("News")));
+-    }
+-
+-    #[tokio::test]
+-    async fn empty_iterator_yields_no_items() {
+-        let mut iter = XtreamPlaylistIterator::empty();
+-        assert!(iter.next().await.is_none());
+-    }
+-
+-    #[tokio::test]
+-    async fn iterator_forwards_one_storage_error_then_ends() {
+-        let (tx, rx) = mpsc::channel(2);
+-        let item = XtreamPlaylistItem {
+-            virtual_id: VirtualId::new(1),
+-            provider_id: 1,
+-            name: "name".intern(),
+-            logo: "".intern(),
+-            logo_small: "".intern(),
+-            group: "group".intern(),
+-            title: "title".intern(),
+-            parent_code: "".intern(),
+-            rec: "".intern(),
+-            url: "http://example.test/live.ts".intern(),
+-            epg_channel_id: None,
+-            xtream_cluster: XtreamCluster::Live,
+-            additional_properties: None,
+-            item_type: PlaylistItemType::Live,
+-            category_id: 1,
+-            input_name: "input".intern(),
+-            channel_no: 0,
+-            source_ordinal: 0,
+-            input_stream_id: "1".intern(),
+-            upstream_user_agent: None,
+-        };
+-        assert!(tx.send(Ok((item, true))).await.is_ok());
+-        assert!(tx.send(Err(shared::error::TuliproxError::RepositoryXtream("corrupt page"))).await.is_ok());
+-        drop(tx);
+-
+-        let mut iterator = XtreamPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
+-        assert!(iterator.next().await.is_some_and(|entry| entry.is_ok()));
+-        assert!(iterator.next().await.is_some_and(|entry| entry.is_err()));
+-        assert!(iterator.next().await.is_none());
+-    }
+-}
++use crate::{
++    get_file_path_for_db_index, open_playlist_reader, user_get_bouquet_filter, xtream_get_file_path,
++    xtream_get_storage_path, LockedReceiverStream,
++};
++use futures::Stream;
++use log::error;
++use shared::{
++    error::TuliproxError,
++    model::{PlaylistItemType, TargetType, XtreamCluster, XtreamMappingOptions, XtreamPlaylistItem},
++};
++use std::{
++    collections::HashSet,
++    pin::Pin,
++    sync::Arc,
++    task::{Context, Poll},
++};
++use tokio::{sync::mpsc, task};
++use tuliprox_core::model::{xtream_mapping_option_from_target_options, AppConfig, ConfigTarget, ProxyUserCredentials};
++
++pub struct XtreamPlaylistIterator {
++    inner: LockedReceiverStream<Result<(XtreamPlaylistItem, bool), TuliproxError>>,
++}
++
++fn is_cluster_allowed_for_user(user: &ProxyUserCredentials, cluster: XtreamCluster) -> bool {
++    user.allows_cluster(cluster)
++}
++
++impl XtreamPlaylistIterator {
++    fn empty() -> Self {
++        // Ghost Channel pattern
++        // When you immediately drop the sender with `_`, the channel is closed and receiver gets None.
++        let (_tx, rx) = mpsc::channel::<Result<(XtreamPlaylistItem, bool), TuliproxError>>(1);
++        Self { inner: LockedReceiverStream::new_empty(rx) }
++    }
++
++    pub async fn new(
++        cluster: XtreamCluster,
++        app_config: &AppConfig,
++        target: &ConfigTarget,
++        category_id: Option<u32>,
++        user: &ProxyUserCredentials,
++    ) -> Result<Self, TuliproxError> {
++        // TODO use playlist memory cache and keep sorted
++        if !is_cluster_allowed_for_user(user, cluster) {
++            return Ok(Self::empty());
++        }
++
++        debug_assert!(target.get_xtream_output().is_some());
++        let config = app_config.config.load();
++        if let Some(storage_path) = xtream_get_storage_path(&config, target.name.as_str()) {
++            let xtream_path = xtream_get_file_path(&storage_path, cluster);
++            if !xtream_path.exists() {
++                return Err(TuliproxError::Config(format!("No {cluster} entries found for target {}", target.name)));
++            }
++            // Hold iter_lock for the stream lifetime (LockedReceiverStream), and bg_lock for the background reader.
++            let iter_lock = app_config.file_locks.read_lock(&xtream_path).await;
++            let bg_lock = app_config.file_locks.read_lock(&xtream_path).await;
++
++            let filter =
++                user_get_bouquet_filter(&config, &user.username, category_id, TargetType::Xtream, cluster).await;
++            // Parse bouquet filter (strings) once into u32 set to minimize per-item allocations
++            let filter_ids: Option<HashSet<u32>> = filter.as_ref().map(|set| {
++                set.iter()
++                    .filter_map(|s| {
++                        s.parse::<u32>()
++                            .map_err(|e| {
++                                error!("Failed to parse bouquet filter id '{s}': {e}");
++                                e
++                            })
++                            .ok()
++                    })
++                    .collect()
++            });
++            let hide_adult = user.hide_adult;
++
++            let xtream_path = xtream_path.clone();
++            let index_path = get_file_path_for_db_index(&xtream_path);
++            let (tx, rx) = mpsc::channel::<Result<(XtreamPlaylistItem, bool), TuliproxError>>(256);
++            let user_filter = user.t_filter.clone();
++
++            let xtream_path_for_log = xtream_path.clone();
++            let join_error_tx = tx.clone();
++            let handle = task::spawn_blocking(move || {
++                let _guard = bg_lock;
++                let reader = match open_playlist_reader::<u32, XtreamPlaylistItem, u32>(
++                    &xtream_path,
++                    &index_path,
++                    Some("Sorted index error, falling back to unsorted"),
++                ) {
++                    Ok(reader) => reader,
++                    Err(err) => {
++                        error!(
++                            "Failed to open Xtream playlist DB {} (cluster {cluster}): {err}",
++                            xtream_path.display()
++                        );
++                        let _ = tx.blocking_send(Err(err));
++                        return;
++                    }
++                };
++
++                let mut pending: Option<XtreamPlaylistItem> = None;
++                for entry in reader {
++                    let item = match entry {
++                        Ok((_, item)) => item,
++                        Err(err) => {
++                            error!("Skipping unreadable Xtream playlist entry: {err}");
++                            continue;
++                        }
++                    };
++
 +                    if !Self::matches_filters(cluster, filter_ids.as_ref(), hide_adult, user_filter.as_ref(), &item) {
-                         continue;
-                     }
- 
-@@ -146,6 +147,7 @@ impl XtreamPlaylistIterator {
-     fn matches_filters(
-         cluster: XtreamCluster,
-         filter_ids: Option<&HashSet<u32>>,
++                        continue;
++                    }
++
++                    if let Some(prev) = pending.replace(item) {
++                        if tx.blocking_send(Ok((prev, true))).is_err() {
++                            return;
++                        }
++                    }
++                }
++
++                if let Some(last) = pending {
++                    let _ = tx.blocking_send(Ok((last, false)));
++                }
++            });
++            tokio::spawn(async move {
++                if let Err(err) = handle.await {
++                    error!(
++                        "Xtream playlist iterator task failed for {} (cluster {cluster}): {err}",
++                        xtream_path_for_log.display()
++                    );
++                    let _ = join_error_tx
++                        .send(Err(TuliproxError::RepositoryXtream(format!(
++                            "Xtream playlist iterator task failed for {}: {err}",
++                            xtream_path_for_log.display()
++                        ))))
++                        .await;
++                }
++            });
++
++            Ok(Self { inner: LockedReceiverStream::new(rx, iter_lock) })
++        } else {
++            Err(TuliproxError::Config(format!("Failed to find xtream storage for target {}", target.name)))
++        }
++    }
++
++    fn matches_filters(
++        cluster: XtreamCluster,
++        filter_ids: Option<&HashSet<u32>>,
 +        hide_adult: bool,
-         user_filter: Option<&Arc<shared::foundation::Filter>>,
-         item: &XtreamPlaylistItem,
-     ) -> bool {
-@@ -163,6 +165,13 @@ impl XtreamPlaylistIterator {
-             }
-         }
- 
-+        if hide_adult
-+            && (crate::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
-+                || crate::model::ProxyUserCredentials::stream_props_marked_adult(item.additional_properties.as_ref()))
++        user_filter: Option<&Arc<shared::foundation::Filter>>,
++        item: &XtreamPlaylistItem,
++    ) -> bool {
++        // We can't serve episodes within series
++        if cluster == XtreamCluster::Series
++            && !matches!(item.item_type, PlaylistItemType::SeriesInfo | PlaylistItemType::LocalSeriesInfo)
 +        {
 +            return false;
 +        }
 +
-         // per-user content filter (plan AND user), applied post-cache
-         if let Some(filter) = user_filter {
-             let pli = shared::model::PlaylistItem::from(item);
-@@ -282,15 +291,28 @@ mod tests {
-         );
- 
-         // no filter: everything passes
--        assert!(XtreamPlaylistIterator::matches_filters(XtreamCluster::Live, None, None, &make_item("VIP Sports")));
++        // category_id-Filter
++        if let Some(set) = filter_ids {
++            if !set.contains(&item.category_id) {
++                return false;
++            }
++        }
++
++        if hide_adult
++            && (tuliprox_core::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
++                || tuliprox_core::model::ProxyUserCredentials::stream_props_marked_adult(item.additional_properties.as_ref()))
++        {
++            return false;
++        }
++
++        // per-user content filter (plan AND user), applied post-cache
++        if let Some(filter) = user_filter {
++            let pli = shared::model::PlaylistItem::from(item);
++            let provider = shared::foundation::ValueProvider { pli: &pli, match_as_ascii: false };
++            if !filter.filter(&provider) {
++                return false;
++            }
++        }
++
++        true
++    }
++}
++
++impl Stream for XtreamPlaylistIterator {
++    type Item = Result<(XtreamPlaylistItem, bool), TuliproxError>;
++    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++        Pin::new(&mut self.inner).poll_next(cx)
++    }
++}
++
++pub struct XtreamPlaylistJsonIterator {
++    inner: XtreamPlaylistIterator,
++    options: Option<XtreamMappingOptions>,
++}
++
++impl XtreamPlaylistJsonIterator {
++    pub async fn new(
++        cluster: XtreamCluster,
++        app_config: &Arc<AppConfig>,
++        target: &ConfigTarget,
++        category_id: Option<u32>,
++        user: &ProxyUserCredentials,
++    ) -> Result<Self, TuliproxError> {
++        let xtream_output = target.get_xtream_output().ok_or_else(|| {
++            TuliproxError::Config(format!("Unexpected: xtream output required for target {}", target.name))
++        })?;
++        if !is_cluster_allowed_for_user(user, cluster) {
++            return Ok(Self { inner: XtreamPlaylistIterator::empty(), options: None });
++        }
++        let encrypt_secret = app_config.get_encrypt_secret();
++        let options =
++            xtream_mapping_option_from_target_options(target, xtream_output, app_config, user, encrypt_secret)?;
++        Ok(Self {
++            inner: XtreamPlaylistIterator::new(cluster, app_config, target, category_id, user).await?,
++            options: Some(options),
++        })
++    }
++}
++
++impl Stream for XtreamPlaylistJsonIterator {
++    type Item = Result<(String, bool), TuliproxError>;
++    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++        match Pin::new(&mut self.inner).poll_next(cx) {
++            Poll::Ready(Some(Ok((pli, has_next)))) => {
++                let Some(options) = self.options.as_ref() else {
++                    return Poll::Ready(None);
++                };
++                let json = serde_json::to_string(&pli.to_document(options))
++                    .map_err(|error| TuliproxError::RepositoryXtream(error.to_string()));
++                Poll::Ready(Some(json.map(|json| (json, has_next))))
++            }
++            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
++            Poll::Ready(None) => Poll::Ready(None),
++            Poll::Pending => Poll::Pending,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{is_cluster_allowed_for_user, XtreamPlaylistIterator};
++    use crate::LockedReceiverStream;
++    use futures::StreamExt;
++    use shared::{
++        model::{ClusterFlags, PlaylistItemType, VirtualId, XtreamCluster, XtreamPlaylistItem},
++        utils::Internable,
++    };
++    use tokio::sync::mpsc;
++    use tuliprox_core::model::ProxyUserCredentials;
++
++    #[test]
++    fn cluster_guard_respects_user_cluster_flags() {
++        let mut user = ProxyUserCredentials::default();
++        user.output_clusters = ClusterFlags::Live | ClusterFlags::Series;
++
++        assert!(is_cluster_allowed_for_user(&user, XtreamCluster::Live));
++        assert!(!is_cluster_allowed_for_user(&user, XtreamCluster::Video));
++        assert!(is_cluster_allowed_for_user(&user, XtreamCluster::Series));
++    }
++
++    #[test]
++    fn matches_filters_applies_user_content_filter() {
++        let make_item = |group: &str| XtreamPlaylistItem {
++            virtual_id: VirtualId::new(1),
++            provider_id: 1,
++            name: "name".intern(),
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: group.intern(),
++            title: "title".intern(),
++            parent_code: "".intern(),
++            rec: "".intern(),
++            url: "http://example.test/live.ts".intern(),
++            epg_channel_id: None,
++            xtream_cluster: XtreamCluster::Live,
++            additional_properties: None,
++            item_type: PlaylistItemType::Live,
++            category_id: 1,
++            input_name: "input".intern(),
++            channel_no: 0,
++            source_ordinal: 0,
++            input_stream_id: "1".intern(),
++            upstream_user_agent: None,
++        };
++        let filter = std::sync::Arc::new(
++            shared::foundation::get_filter(r#"NOT Group ~ "^VIP.*""#, None).expect("filter parses"),
++        );
++
++        // no filter: everything passes
 +        assert!(XtreamPlaylistIterator::matches_filters(
 +            XtreamCluster::Live,
 +            None,
@@ -1061,15 +4014,14 @@ index 8bacf477..dc7465ca 100644
 +            None,
 +            &make_item("VIP Sports")
 +        ));
-         // filter hides matching groups, keeps the rest
-         assert!(!XtreamPlaylistIterator::matches_filters(
-             XtreamCluster::Live,
-             None,
++        // filter hides matching groups, keeps the rest
++        assert!(!XtreamPlaylistIterator::matches_filters(
++            XtreamCluster::Live,
++            None,
 +            false,
-             Some(&filter),
-             &make_item("VIP Sports")
-         ));
--        assert!(XtreamPlaylistIterator::matches_filters(XtreamCluster::Live, None, Some(&filter), &make_item("News")));
++            Some(&filter),
++            &make_item("VIP Sports")
++        ));
 +        assert!(XtreamPlaylistIterator::matches_filters(
 +            XtreamCluster::Live,
 +            None,
@@ -1077,9 +4029,49 @@ index 8bacf477..dc7465ca 100644
 +            Some(&filter),
 +            &make_item("News")
 +        ));
-     }
- 
-     #[tokio::test]
++    }
++
++    #[tokio::test]
++    async fn empty_iterator_yields_no_items() {
++        let mut iter = XtreamPlaylistIterator::empty();
++        assert!(iter.next().await.is_none());
++    }
++
++    #[tokio::test]
++    async fn iterator_forwards_one_storage_error_then_ends() {
++        let (tx, rx) = mpsc::channel(2);
++        let item = XtreamPlaylistItem {
++            virtual_id: VirtualId::new(1),
++            provider_id: 1,
++            name: "name".intern(),
++            logo: "".intern(),
++            logo_small: "".intern(),
++            group: "group".intern(),
++            title: "title".intern(),
++            parent_code: "".intern(),
++            rec: "".intern(),
++            url: "http://example.test/live.ts".intern(),
++            epg_channel_id: None,
++            xtream_cluster: XtreamCluster::Live,
++            additional_properties: None,
++            item_type: PlaylistItemType::Live,
++            category_id: 1,
++            input_name: "input".intern(),
++            channel_no: 0,
++            source_ordinal: 0,
++            input_stream_id: "1".intern(),
++            upstream_user_agent: None,
++        };
++        assert!(tx.send(Ok((item, true))).await.is_ok());
++        assert!(tx.send(Err(shared::error::TuliproxError::RepositoryXtream("corrupt page"))).await.is_ok());
++        drop(tx);
++
++        let mut iterator = XtreamPlaylistIterator { inner: LockedReceiverStream::new_empty(rx) };
++        assert!(iterator.next().await.is_some_and(|entry| entry.is_ok()));
++        assert!(iterator.next().await.is_some_and(|entry| entry.is_err()));
++        assert!(iterator.next().await.is_none());
++    }
++}
 diff --git a/backend/session/src/active_user_manager.rs b/backend/session/src/active_user_manager.rs
 index 4c9675a5..aca01e29 100644
 --- a/backend/session/src/active_user_manager.rs
