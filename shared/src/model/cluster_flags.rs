@@ -22,11 +22,11 @@ impl Default for ClusterFlags {
 
 impl ClusterFlags {
     pub fn has_cluster(&self, item_type: PlaylistItemType) -> bool {
-        XtreamCluster::try_from(item_type).ok().is_some_and(|cluster| match cluster {
+        match item_type.cluster() {
             XtreamCluster::Live => self.contains(ClusterFlags::Live),
             XtreamCluster::Video => self.contains(ClusterFlags::Vod),
             XtreamCluster::Series => self.contains(ClusterFlags::Series),
-        })
+        }
     }
 
     pub fn has_full_flags(&self) -> bool { self.is_all() }

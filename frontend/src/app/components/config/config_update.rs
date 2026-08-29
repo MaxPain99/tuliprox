@@ -120,7 +120,9 @@ pub fn update_config(config: &mut ConfigDto, forms: Vec<ConfigForm>) {
             ConfigForm::Api(_, api_cfg) => config.api = api_cfg,
             ConfigForm::Log(_, mut log_cfg) => set_config_field!(config, log_cfg, log),
             ConfigForm::Schedules(_, schedules_cfg) => {
-                if schedules_cfg.schedules.is_none() || schedules_cfg.schedules.as_ref().is_some_and(|s| s.is_empty()) {
+                if schedules_cfg.schedules.is_none()
+                    || schedules_cfg.schedules.as_ref().is_some_and(std::vec::Vec::is_empty)
+                {
                     config.schedules = None;
                 } else {
                     config.schedules = schedules_cfg.schedules.clone();
@@ -128,12 +130,12 @@ pub fn update_config(config: &mut ConfigDto, forms: Vec<ConfigForm>) {
             }
             ConfigForm::Video(_, mut video_cfg) => set_config_field!(config, video_cfg, video),
             ConfigForm::MetadataUpdate(_, mut metadata_update_cfg) => {
-                set_config_field!(config, metadata_update_cfg, metadata_update)
+                set_config_field!(config, metadata_update_cfg, metadata_update);
             }
             ConfigForm::Messaging(_, mut messaging_cfg) => set_config_field!(config, messaging_cfg, messaging),
             ConfigForm::WebUi(modified, web_ui_cfg) => update_webui_field(config, web_ui_cfg, modified),
             ConfigForm::ReverseProxy(_, mut reverse_proxy_cfg) => {
-                set_config_field!(config, reverse_proxy_cfg, reverse_proxy)
+                set_config_field!(config, reverse_proxy_cfg, reverse_proxy);
             }
             ConfigForm::HdHomerun(_, hdhr_cfg) => update_hdhomerun_field(config, hdhr_cfg),
             ConfigForm::Proxy(_, mut proxy_cfg) => set_config_field!(config, proxy_cfg, proxy),
@@ -157,7 +159,7 @@ mod tests {
     use shared::model::{
         view_type::ViewType, ConfigDto, ContentSecurityPolicyConfigDto, DiskAlertConfigDto, HdHomeRunConfigDto,
         HdHomeRunDeviceConfigDto, LibraryConfigDto, LibraryScanDirectoryDto, MessagingConfigDto,
-        MetadataUpdateConfigDto, MsgKind, ProxyConfigDto, RecordingConfigDto, RecordingDiskConfigDto,
+        MetadataUpdateConfigDto, ProxyConfigDto, RecordingConfigDto, RecordingDiskConfigDto,
         RecordingNotificationConfigDto, RecordingQuotaConfigDto, RecordingRetentionConfigDto, StreamInfoConfigDto,
         VideoConfigDto, VideoDownloadConfigDto, WebAuthConfigDto, WebUiConfigDto,
     };
@@ -538,7 +540,7 @@ mod tests {
             vec![ConfigForm::Messaging(
                 true,
                 MessagingConfigDto {
-                    notify_on: vec![MsgKind::DiskAlert],
+                    notify_on: vec!["system.disk.alert".to_string()],
                     disk_alert: Some(DiskAlertConfigDto::default()),
                     ..Default::default()
                 },
@@ -561,7 +563,7 @@ mod tests {
             vec![ConfigForm::Messaging(
                 true,
                 MessagingConfigDto {
-                    notify_on: vec![MsgKind::DiskAlert],
+                    notify_on: vec!["system.disk.alert".to_string()],
                     disk_alert: Some(disk_alert.clone()),
                     ..Default::default()
                 },

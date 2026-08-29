@@ -5,10 +5,9 @@ use crate::{
     },
     error::TuliproxError,
     foundation::{get_filter, Filter},
-    handle_tuliprox_error_result_list,
     model::{
         ClusterFlags, ConfigFavouritesDto, ConfigRenameDto, ConfigSortDto, HdHomeRunDeviceOverview, PatternTemplate,
-        ProcessingOrder, StrmExportStyle, TargetType, TraktConfigDto,
+        Prepare, PrepareAll, ProcessingOrder, StrmExportStyle, TargetType, TraktConfigDto,
     },
     utils::is_blank_optional_string,
 };
@@ -95,6 +94,8 @@ pub struct DeduplicateConfig {
 pub struct ConfigTargetOptions {
     #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_logo: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required_epg: bool,
     #[serde(
         default,
         deserialize_with = "deserialize_share_live_streams",
@@ -114,17 +115,19 @@ pub struct ConfigTargetOptions {
 impl ConfigTargetOptions {
     pub fn is_empty(&self) -> bool {
         !self.ignore_logo
+            && !self.required_epg
             && self.share_live_streams.is_empty()
             && !self.remove_duplicates
             && self.deduplicate.is_none()
             && self.epg_output.is_empty()
-            && (self.force_redirect.is_none()
-                || self.force_redirect.is_some_and(|f| f.has_full_flags() || f.is_empty()))
+            && self.force_redirect.is_none_or(|f| f.has_full_flags() || f.is_empty())
     }
 
     pub const fn lowercase_epg_ids(&self) -> bool { self.epg_output.lowercase_ids }
 
     pub const fn lowercase_xmltv_display_names(&self) -> bool { self.epg_output.lowercase_xmltv_display_names }
+
+    pub const fn required_epg(&self) -> bool { self.required_epg }
 
     pub fn share_live_hls_enabled(&self) -> bool { self.share_live_streams.hls }
 
@@ -165,7 +168,19 @@ impl Default for XtreamTargetOutputDto {
 }
 
 impl XtreamTargetOutputDto {
-    pub fn prepare(&mut self, templates: Option<&[PatternTemplate]>) -> Result<(), TuliproxError> {
+    pub fn has_any_option(&self) -> bool {
+        self.skip_live_direct_source
+            || self.skip_video_direct_source
+            || self.skip_series_direct_source
+            || self.trakt.is_some()
+            || self.filter.is_some()
+    }
+}
+
+impl Prepare for XtreamTargetOutputDto {
+    type Ctx<'a> = Option<&'a [PatternTemplate]>;
+
+    fn prepare(&mut self, templates: Self::Ctx<'_>) -> Result<(), TuliproxError> {
         if let Some(raw_filter) = &self.filter {
             self.t_filter = Some(get_filter(raw_filter, templates)?);
         }
@@ -173,14 +188,6 @@ impl XtreamTargetOutputDto {
             trakt.prepare();
         }
         Ok(())
-    }
-
-    pub fn has_any_option(&self) -> bool {
-        self.skip_live_direct_source
-            || self.skip_video_direct_source
-            || self.skip_series_direct_source
-            || self.trakt.is_some()
-            || self.filter.is_some()
     }
 }
 
@@ -200,15 +207,19 @@ pub struct M3uTargetOutputDto {
 }
 
 impl M3uTargetOutputDto {
-    pub fn prepare(&mut self, templates: Option<&[PatternTemplate]>) -> Result<(), TuliproxError> {
+    pub fn has_any_option(&self) -> bool {
+        self.filename.is_some() || self.include_type_in_url || self.mask_redirect_url || self.filter.is_some()
+    }
+}
+
+impl Prepare for M3uTargetOutputDto {
+    type Ctx<'a> = Option<&'a [PatternTemplate]>;
+
+    fn prepare(&mut self, templates: Self::Ctx<'_>) -> Result<(), TuliproxError> {
         if let Some(raw_filter) = &self.filter {
             self.t_filter = Some(get_filter(raw_filter, templates)?);
         }
         Ok(())
-    }
-
-    pub fn has_any_option(&self) -> bool {
-        self.filename.is_some() || self.include_type_in_url || self.mask_redirect_url || self.filter.is_some()
     }
 }
 
@@ -245,8 +256,10 @@ pub struct StrmTargetOutputDto {
     pub t_filter: Option<Filter>,
 }
 
-impl StrmTargetOutputDto {
-    pub fn prepare(&mut self, templates: Option<&[PatternTemplate]>) -> Result<(), TuliproxError> {
+impl Prepare for StrmTargetOutputDto {
+    type Ctx<'a> = Option<&'a [PatternTemplate]>;
+
+    fn prepare(&mut self, templates: Self::Ctx<'_>) -> Result<(), TuliproxError> {
         if let Some(raw_filter) = &self.filter {
             self.t_filter = Some(get_filter(raw_filter, templates)?);
         }
@@ -276,8 +289,10 @@ pub enum TargetOutputDto {
     HdHomeRun(HdHomeRunTargetOutputDto),
 }
 
-impl TargetOutputDto {
-    pub fn prepare(&mut self, templates: Option<&[PatternTemplate]>) -> Result<(), TuliproxError> {
+impl Prepare for TargetOutputDto {
+    type Ctx<'a> = Option<&'a [PatternTemplate]>;
+
+    fn prepare(&mut self, templates: Self::Ctx<'_>) -> Result<(), TuliproxError> {
         match self {
             TargetOutputDto::Xtream(output) => output.prepare(templates),
             TargetOutputDto::M3u(output) => output.prepare(templates),
@@ -498,11 +513,7 @@ impl ConfigTargetDto {
             }
         }
 
-        if let Some(favourites) = self.favourites.as_mut() {
-            for favourite in favourites {
-                favourite.prepare(templates)?;
-            }
-        }
+        self.favourites.prepare(templates)?;
 
         if let Some(watch) = &self.watch {
             for pat in watch {
@@ -516,9 +527,7 @@ impl ConfigTargetDto {
             Ok(fltr) => {
                 // debug!("Filter: {}", fltr);
                 self.t_filter = Some(fltr);
-                if let Some(renames) = self.rename.as_mut() {
-                    handle_tuliprox_error_result_list!(renames.iter_mut().map(|cr| cr.prepare(templates)));
-                }
+                self.rename.prepare_all(templates)?;
                 if let Some(sort) = self.sort.as_mut() {
                     sort.prepare(templates)?;
                 }
@@ -605,11 +614,11 @@ mod tests {
 
     #[test]
     fn target_options_deserialize_structured_share_live_streams() {
-        let yaml = r#"
+        let yaml = r"
 share_live_streams:
   hls: true
   mpeg_ts: true
-"#;
+";
 
         let options: ConfigTargetOptions =
             serde_saphyr::from_str(yaml).expect("structured share_live_streams should deserialize");
@@ -621,9 +630,9 @@ share_live_streams:
 
     #[test]
     fn target_options_maps_legacy_true_share_live_streams_to_both_modes() {
-        let yaml = r#"
+        let yaml = r"
 share_live_streams: true
-"#;
+";
 
         let options = serde_saphyr::from_str::<ConfigTargetOptions>(yaml);
 
@@ -635,9 +644,9 @@ share_live_streams: true
 
     #[test]
     fn target_options_maps_legacy_false_share_live_streams_to_both_modes() {
-        let yaml = r#"
+        let yaml = r"
 share_live_streams: false
-"#;
+";
 
         let options: ConfigTargetOptions =
             serde_saphyr::from_str(yaml).expect("legacy false share_live_streams should deserialize");
@@ -650,6 +659,7 @@ share_live_streams: false
         let options = ConfigTargetOptions::default();
 
         assert!(options.is_empty());
+        assert!(!options.required_epg());
 
         let serialized = serde_saphyr::to_string(&options).expect("default options should serialize");
         assert!(
@@ -673,6 +683,18 @@ share_live_streams: false
     }
 
     #[test]
+    fn target_options_required_epg_roundtrips_and_makes_options_nonempty() {
+        let options = serde_saphyr::from_str::<ConfigTargetOptions>("required_epg: true\n")
+            .expect("required_epg should deserialize");
+
+        assert!(options.required_epg());
+        assert!(!options.is_empty());
+
+        let serialized = serde_saphyr::to_string(&options).expect("required_epg should serialize");
+        assert!(serialized.contains("required_epg: true"));
+    }
+
+    #[test]
     fn target_options_default_epg_output_is_disabled_and_omitted() {
         let options = serde_saphyr::from_str::<ConfigTargetOptions>("{}")
             .expect("target options without epg_output should deserialize");
@@ -688,11 +710,11 @@ share_live_streams: false
 
     #[test]
     fn target_options_epg_output_roundtrips() {
-        let yaml = r#"
+        let yaml = r"
 epg_output:
   lowercase_ids: true
   lowercase_xmltv_display_names: true
-"#;
+";
 
         let options =
             serde_saphyr::from_str::<ConfigTargetOptions>(yaml).expect("configured epg_output should deserialize");
@@ -724,10 +746,10 @@ epg_output:
 
     #[test]
     fn target_options_reject_unknown_epg_output_fields() {
-        let yaml = r#"
+        let yaml = r"
 epg_output:
   lowercase_id: true
-"#;
+";
 
         let result = serde_saphyr::from_str::<ConfigTargetOptions>(yaml);
 
