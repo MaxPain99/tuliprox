@@ -69,10 +69,10 @@ jobs:
 
       - name: Test MaxPain deltas
         run: |
-          cargo test -p tuliprox adult_group_matcher_covers_bittv_style_names --locked
-          cargo test -p tuliprox allows_group_respects_hide_adult_flag --locked
-          cargo test -p tuliprox allows_playlist_item_honors_xtream_is_adult_flag --locked
-          cargo test -p tuliprox proxy_user_credentials_roundtrip_preserves_hide_adult --locked
+          cargo test -p tuliprox-core adult_group_matcher_covers_bittv_style_names --locked
+          cargo test -p tuliprox-core allows_group_respects_hide_adult_flag --locked
+          cargo test -p tuliprox-core allows_playlist_item_honors_xtream_is_adult_flag --locked
+          cargo test -p shared proxy_user_credentials_roundtrip_preserves_hide_adult --locked
 
       - name: Build frontend
         run: |
