@@ -1229,7 +1229,7 @@ checksum = "431a4c31778fde52b4400de34975f219eeca55cc829a9de157cd743a5b230ecb"
 
 [[package]]
 name = "frontend"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "base64 0.23.1",
  "brotli",
@@ -3720,7 +3720,7 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "base64 0.23.1",
  "bitflags 2.13.1",
@@ -4323,7 +4323,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tuliprox"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "aes",
  "arc-swap",
@@ -4412,7 +4412,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-auth"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "arc-swap",
  "axum",
@@ -4427,6 +4427,7 @@ dependencies = [
  "rust-argon2",
  "serde_json",
  "shared",
+ "thiserror 2.0.20",
  "tuliprox-core",
  "tuliprox-repository",
  "zeroize",
@@ -4434,7 +4435,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-btree"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "crc32fast",
  "log",
@@ -4446,14 +4447,16 @@ dependencies = [
  "serde",
  "smallvec",
  "tempfile",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
 [[package]]
 name = "tuliprox-config-loader"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "arc-swap",
+ "blake3",
  "chrono",
  "log",
  "serde",
@@ -4470,7 +4473,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-core"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "aes",
  "arc-swap",
@@ -4520,7 +4523,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-dvr"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -4534,6 +4537,7 @@ dependencies = [
  "serde_json",
  "shared",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tuliprox-auth",
@@ -4546,7 +4550,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-hls"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "arc-swap",
  "async-compression",
@@ -4585,7 +4589,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-iptv"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4610,7 +4614,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-library"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "blake3",
  "bytes",
@@ -4628,6 +4632,7 @@ dependencies = [
  "shared",
  "strsim",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tuliprox-core",
  "url",
@@ -4636,7 +4641,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-media-server"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "bytes",
  "futures",
@@ -4649,13 +4654,14 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
+ "thiserror 2.0.20",
  "tokio",
  "url",
 ]
 
 [[package]]
 name = "tuliprox-messaging"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -4677,7 +4683,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-metadata"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -4701,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-mpegts"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "aes",
  "bytes",
@@ -4715,7 +4721,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-parser"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "aes",
  "base64 0.23.1",
@@ -4738,7 +4744,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-processing"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -4774,7 +4780,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-repository"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -4795,6 +4801,7 @@ dependencies = [
  "serde_json",
  "shared",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -4808,7 +4815,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-session"
-version = "3.3.96"
+version = "3.3.102"
 dependencies = [
  "arc-swap",
  "axum",

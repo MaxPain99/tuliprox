@@ -610,7 +610,7 @@ mod tests {
             name: "target".to_string(),
             options: None,
             sort: None,
-            filter: Filter::default(),
+            filter: Filter::default().into(),
             output: vec![TargetOutput::Xtream(XtreamTargetOutput {
                 flags: XtreamTargetFlagsSet::default(),
                 trakt: None,
@@ -729,6 +729,7 @@ mod tests {
             shared_stream_manager,
             hls_proxy: Arc::new(HlsProxyManager::new()),
             hls_provisioning: Arc::new(HlsProvisioningState::new()),
+            stalker_resolve_coordinator: Arc::default(),
             active_users,
             active_provider,
             connection_manager,

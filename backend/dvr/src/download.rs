@@ -35,51 +35,54 @@ static DOWNLOAD_TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Reason a persisted entry cannot be converted back to its in-memory
 /// form during the commit step. Surfaced to the caller so a corrupt
 /// persisted file fails closed instead of silently dropping entries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PersistedError {
     /// The persisted URL could not be parsed.
+    #[error("persisted url is invalid: {0}")]
     InvalidUrl(String),
     /// A plain download claimed a recording metadata block, or a
     /// recording was missing its metadata in a way that the legacy
     /// normalizer cannot repair.
+    #[error("persisted task {uuid} violates the kind/metadata invariant")]
     KindMetadataInvariant { uuid: String },
 }
-
-impl std::fmt::Display for PersistedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidUrl(s) => write!(f, "persisted url is invalid: {s}"),
-            Self::KindMetadataInvariant { uuid } => {
-                write!(f, "persisted task {uuid} violates the kind/metadata invariant")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PersistedError {}
 
 /// Typed error returned from the queue mutation boundary. Every
 /// `mutate` closure that fails must return a known variant; the
 /// `Other` variant is an escape hatch for dynamically-formatted
 /// messages that have no stable wire code.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum QueueMutationError {
+    #[error("recording unknown")]
     UnknownRecording,
+    #[error("recording state not editable")]
     StateNotEditable,
+    #[error("recording forbidden")]
     Forbidden,
+    #[error("recording invalid interval")]
     InvalidInterval,
+    #[error("recording invalid quota pool")]
     InvalidQuotaPool,
+    #[error("recording invalid path")]
     InvalidPath,
+    #[error("recording_padding_limit_exceeded")]
     PaddingLimitExceeded,
+    #[error("recording quota exceeded")]
     QuotaExceeded,
+    #[error("recording duplicate")]
     Duplicate,
+    #[error("recording not in terminal state")]
     NotInTerminalState,
+    #[error("disk full")]
     DiskFull,
+    #[error("mutation unexpectedly skipped")]
     MutationSkipped,
     /// Escape hatch for dynamically-formatted validation messages
     /// that have no stable wire code. Prefer the typed variants.
+    #[error("{0}")]
     Other(String),
-    Io(std::io::Error),
+    #[error("queue mutation persistence failed")]
+    Io(#[from] std::io::Error),
 }
 
 impl QueueMutationError {
@@ -115,25 +118,6 @@ impl QueueMutationError {
     pub fn source_io(&self) -> Option<&std::io::Error> {
         match self {
             Self::Io(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for QueueMutationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Other(s) => f.write_str(s),
-            Self::Io(e) => std::fmt::Display::fmt(e, f),
-            other => f.write_str(other.message()),
-        }
-    }
-}
-
-impl std::error::Error for QueueMutationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err as &(dyn std::error::Error + 'static)),
             _ => None,
         }
     }
@@ -1174,74 +1158,70 @@ impl DownloadQueue {
         self.finished.read().await.iter().find(|download| download.matches_existing_task(candidate)).cloned()
     }
 
-    /// Pause the active download. Persists the new state through the
-    /// transactional boundary. The runtime-only control signal is published
-    /// after the commit while the mutation guard still preserves ordering.
-    pub async fn pause_active(&self, uuid: &str) -> Result<bool, QueueMutationError> {
+    async fn transition_active_matching(
+        &self,
+        uuid: &str,
+        signal: DownloadControl,
+        mutate_fn: impl FnOnce(&mut PersistedFileDownload) -> bool,
+    ) -> Result<bool, QueueMutationError> {
         let _mutation = self.mutation_guard.lock().await;
         let changed = mutate_optional_locked(self, |candidate| {
             let Some(active) = candidate.active.as_mut().filter(|active| active.uuid == uuid) else {
                 return Ok(None);
             };
-            active.paused = true;
-            active.state = DownloadState::Paused;
-            active.next_retry_at = None;
-            Ok(Some(true))
+            if mutate_fn(active) {
+                active.next_retry_at = None;
+                Ok(Some(true))
+            } else {
+                Ok(None)
+            }
         })
         .await?
         .unwrap_or(false);
         if !changed {
             return Ok(false);
         }
-        *self.control_signal.write().await = DownloadControl::Pause;
+        *self.control_signal.write().await = signal;
         self.control_notify.notify_waiters();
         Ok(true)
+    }
+
+    /// Pause the active download. Persists the new state through the
+    /// transactional boundary. The runtime-only control signal is published
+    /// after the commit while the mutation guard still preserves ordering.
+    pub async fn pause_active(&self, uuid: &str) -> Result<bool, QueueMutationError> {
+        self.transition_active_matching(uuid, DownloadControl::Pause, |active| {
+            active.paused = true;
+            active.state = DownloadState::Paused;
+            true
+        })
+        .await
     }
 
     /// Resume the active download. Persists the new state through the
     /// transactional boundary.
     pub async fn resume_active(&self, uuid: &str) -> Result<bool, QueueMutationError> {
-        let _mutation = self.mutation_guard.lock().await;
-        let changed = mutate_optional_locked(self, |candidate| {
-            let Some(active) = candidate.active.as_mut().filter(|active| active.uuid == uuid && active.paused) else {
-                return Ok(None);
-            };
-            active.paused = false;
-            active.state = DownloadState::Downloading;
-            active.next_retry_at = None;
-            Ok(Some(true))
+        self.transition_active_matching(uuid, DownloadControl::None, |active| {
+            if active.paused {
+                active.paused = false;
+                active.state = DownloadState::Downloading;
+                true
+            } else {
+                false
+            }
         })
-        .await?
-        .unwrap_or(false);
-        if !changed {
-            return Ok(false);
-        }
-        *self.control_signal.write().await = DownloadControl::None;
-        self.control_notify.notify_waiters();
-        Ok(true)
+        .await
     }
 
     /// Cancel the active download. Persists the new state through the
     /// transactional boundary.
     pub async fn cancel_active_matching(&self, uuid: &str) -> Result<bool, QueueMutationError> {
-        let _mutation = self.mutation_guard.lock().await;
-        let changed = mutate_optional_locked(self, |candidate| {
-            let Some(active) = candidate.active.as_mut().filter(|active| active.uuid == uuid) else {
-                return Ok(None);
-            };
+        self.transition_active_matching(uuid, DownloadControl::Cancel, |active| {
             active.state = DownloadState::Cancelled;
             active.error = Some("Cancelled by user".to_string());
-            active.next_retry_at = None;
-            Ok(Some(true))
+            true
         })
-        .await?
-        .unwrap_or(false);
-        if !changed {
-            return Ok(false);
-        }
-        *self.control_signal.write().await = DownloadControl::Cancel;
-        self.control_notify.notify_waiters();
-        Ok(true)
+        .await
     }
 
     pub async fn cancel_active(&self) -> Result<bool, QueueMutationError> {
@@ -2684,7 +2664,9 @@ mod tests {
 
         let result: Result<(), QueueMutationError> = mutate(&queue, |_candidate| Ok(())).await;
         assert!(result.is_err(), "persist failure should propagate");
-        assert!(result.unwrap_err().source_io().is_some(), "should carry io::Error");
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "queue mutation persistence failed");
+        assert!(std::error::Error::source(&err).is_some(), "should carry io::Error as its source");
         // State stays unchanged: the in-memory queue is intact.
         assert_eq!(queue.queue.lock().await.len(), original_len, "in-memory state must be unchanged");
         assert_eq!(queue.revision.load(Ordering::SeqCst), original_revision);
