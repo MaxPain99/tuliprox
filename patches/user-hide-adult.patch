@@ -1,8 +1,8 @@
-diff --git a/backend/app/src/api/api_utils.rs b/backend/app/src/api/api_utils.rs
-index 235681a4..c83dd08a 100644
---- a/backend/app/src/api/api_utils.rs
-+++ b/backend/app/src/api/api_utils.rs
-@@ -3906,6 +3906,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
+diff --git a/backend/app/src/api/api_utils/mod.rs b/backend/app/src/api/api_utils/mod.rs
+index 075691f4..084ad3a0 100644
+--- a/backend/app/src/api/api_utils/mod.rs
++++ b/backend/app/src/api/api_utils/mod.rs
+@@ -4014,6 +4014,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
          status: None,
          output_clusters: shared::model::ClusterFlags::all(),
          ui_enabled: false,
@@ -10,14 +10,18 @@ index 235681a4..c83dd08a 100644
          comment: None,
          priority: 0,
          soft_connections: 0,
-@@ -9184,6 +9185,7 @@ mod tests {
-             status: None,
-             output_clusters: ClusterFlags::all(),
-             ui_enabled: true,
-+            hide_adult: false,
-             comment: None,
-             priority: 0,
-             soft_connections: 0,
+diff --git a/backend/app/src/api/api_utils/tests.rs b/backend/app/src/api/api_utils/tests.rs
+index da245b27..4486c3ab 100644
+--- a/backend/app/src/api/api_utils/tests.rs
++++ b/backend/app/src/api/api_utils/tests.rs
+@@ -5423,6 +5423,7 @@ fn user_with_network_access(network_access: Option<NetworkAccess>) -> ProxyUserC
+         status: None,
+         output_clusters: ClusterFlags::all(),
+         ui_enabled: true,
++        hide_adult: false,
+         comment: None,
+         priority: 0,
+         soft_connections: 0,
 diff --git a/backend/app/src/api/endpoints/hdhomerun_api.rs b/backend/app/src/api/endpoints/hdhomerun_api.rs
 index 5a635221..4af6d296 100644
 --- a/backend/app/src/api/endpoints/hdhomerun_api.rs
@@ -33,10 +37,10 @@ index 5a635221..4af6d296 100644
                          })
                          .count()
 diff --git a/backend/app/src/api/endpoints/m3u_api.rs b/backend/app/src/api/endpoints/m3u_api.rs
-index 621276d6..796405cd 100644
+index 4af034b0..3eda3357 100644
 --- a/backend/app/src/api/endpoints/m3u_api.rs
 +++ b/backend/app/src/api/endpoints/m3u_api.rs
-@@ -606,8 +606,8 @@ fn resolve_loaded_m3u_catchup(
+@@ -607,8 +607,8 @@ fn resolve_loaded_m3u_catchup(
      Ok((catchup_item, resolved.discriminator))
  }
  
@@ -47,7 +51,7 @@ index 621276d6..796405cd 100644
  }
  
  #[allow(clippy::too_many_lines)]
-@@ -844,7 +844,7 @@ async fn m3u_api_catchup(
+@@ -845,7 +845,7 @@ async fn m3u_api_catchup(
              return axum::http::StatusCode::BAD_REQUEST.into_response();
          }
      };
@@ -56,7 +60,7 @@ index 621276d6..796405cd 100644
          return axum::http::StatusCode::FORBIDDEN.into_response();
      }
  
-@@ -1130,10 +1130,74 @@ mod tests {
+@@ -1131,10 +1131,74 @@ mod tests {
  
      #[test]
      fn resolved_catchup_item_requires_rechecked_permissions() {
@@ -133,19 +137,23 @@ index 621276d6..796405cd 100644
  
      #[test]
 diff --git a/backend/app/src/api/endpoints/xmltv_api.rs b/backend/app/src/api/endpoints/xmltv_api.rs
-index 5c8a0339..68449f3c 100644
+index 8fa80ce4..ebd61945 100644
 --- a/backend/app/src/api/endpoints/xmltv_api.rs
 +++ b/backend/app/src/api/endpoints/xmltv_api.rs
-@@ -14,7 +14,8 @@ use crate::{
+@@ -14,9 +14,10 @@ use crate::{
          EPG_TAG_CATEGORY, EPG_TAG_CHANNEL, EPG_TAG_LIVE, EPG_TAG_NEW,
      },
      repository::{
--        epg_query_channels_by_storage_key, get_target_storage_path, m3u_get_epg_file_path_for_target, storage_const,
+-        epg_query_channels_by_storage_key, get_file_path_for_db_index, get_target_storage_path,
+-        m3u_get_epg_file_path_for_target, open_playlist_reader, storage_const, xtream_get_epg_file_path_for_target,
+-        xtream_get_storage_path, BPlusTreeQuery, LockedReceiverStream, XML_PREAMBLE,
 +        adult_epg_id_blocklist, epg_channel_hidden_by_adult_blocklist, epg_query_channels_by_storage_key,
-+        get_target_storage_path, m3u_get_epg_file_path_for_target, storage_const,
-         xtream_get_epg_file_path_for_target, xtream_get_storage_path, BPlusTreeQuery, LockedReceiverStream,
-         XML_PREAMBLE,
++        get_file_path_for_db_index, get_target_storage_path, m3u_get_epg_file_path_for_target, open_playlist_reader,
++        storage_const, xtream_get_epg_file_path_for_target, xtream_get_storage_path, BPlusTreeQuery,
++        LockedReceiverStream, XML_PREAMBLE,
      },
+     utils,
+     utils::{
 @@ -38,7 +39,7 @@ use shared::{
      utils::{concat_path, concat_path_leading_slash, obfuscate_text, Internable},
  };
@@ -155,7 +163,7 @@ index 5c8a0339..68449f3c 100644
      path::{Path, PathBuf},
      sync::Arc,
  };
-@@ -254,6 +255,19 @@ async fn serve_epg_with_rewrites(
+@@ -255,6 +256,19 @@ async fn serve_epg_with_rewrites(
      let lowercase_display_names =
          target.options.as_ref().is_some_and(ConfigTargetOptions::lowercase_xmltv_display_names);
  
@@ -175,15 +183,15 @@ index 5c8a0339..68449f3c 100644
      let server_info = app_state.app_config.get_user_server_info(user);
      let base_url =
          if !matches!(epg_processing_options.time_shift, EpgTimeShift::None) || epg_processing_options.rewrite_urls {
-@@ -287,6 +301,7 @@ async fn serve_epg_with_rewrites(
+@@ -288,6 +302,7 @@ async fn serve_epg_with_rewrites(
  
      let epg_path_for_log = epg_path.clone();
      let join_error_tx = channel_tx.clone();
 +    let adult_epg_ids_for_scan = adult_epg_ids.clone();
      let spawn_handle = task::spawn_blocking(move || {
          let _guard = bg_lock;
-         let mut query = match BPlusTreeQuery::<Arc<str>, EpgChannel>::try_new(&epg_path) {
-@@ -309,6 +324,11 @@ async fn serve_epg_with_rewrites(
+         let index_path = get_file_path_for_db_index(&epg_path);
+@@ -311,6 +326,11 @@ async fn serve_epg_with_rewrites(
                      break;
                  }
              };
@@ -195,7 +203,7 @@ index 5c8a0339..68449f3c 100644
              if channel_tx.blocking_send(Ok(channel)).is_err() {
                  break;
              }
-@@ -941,8 +961,8 @@ mod tests {
+@@ -943,8 +963,8 @@ mod tests {
      use shared::{
          foundation::Filter,
          model::{
@@ -206,7 +214,7 @@ index 5c8a0339..68449f3c 100644
          },
          utils::{concat_path, obfuscate_text, Internable},
      };
-@@ -1410,6 +1430,115 @@ mod tests {
+@@ -1413,6 +1433,115 @@ mod tests {
          assert_eq!(xml, "<display-name>café network &amp; &lt;hd&gt;</display-name>");
      }
  
@@ -322,10 +330,10 @@ index 5c8a0339..68449f3c 100644
      #[tokio::test]
      async fn xmltv_output_uses_canonical_channel_ids_and_only_lowercases_display_names() {
          let dir = tempdir().expect("temp dir");
-diff --git a/backend/app/src/api/endpoints/xtream_api.rs b/backend/app/src/api/endpoints/xtream_api.rs
-index 81036a84..d15bf3ca 100644
---- a/backend/app/src/api/endpoints/xtream_api.rs
-+++ b/backend/app/src/api/endpoints/xtream_api.rs
+diff --git a/backend/app/src/api/endpoints/xtream_api/mod.rs b/backend/app/src/api/endpoints/xtream_api/mod.rs
+index 84f5b420..6f39831d 100644
+--- a/backend/app/src/api/endpoints/xtream_api/mod.rs
++++ b/backend/app/src/api/endpoints/xtream_api/mod.rs
 @@ -321,7 +321,8 @@ async fn xtream_player_api_stream(
      } else {
          user.allows_item_type(pli.item_type)
@@ -1289,7 +1297,7 @@ index 60f59fcf..d3295b0a 100644
 +    }
 +}
 diff --git a/backend/repository/Cargo.toml b/backend/repository/Cargo.toml
-index bd370275..962ed7d0 100644
+index b4159d61..458e86fc 100644
 --- a/backend/repository/Cargo.toml
 +++ b/backend/repository/Cargo.toml
 @@ -23,6 +23,7 @@ base64.workspace = true
@@ -1675,17 +1683,18 @@ index 00000000..cc0cec17
 +    }
 +}
 diff --git a/backend/repository/src/lib.rs b/backend/repository/src/lib.rs
-index e23630e1..44b2db74 100644
+index 3b5a77f3..4e6895ea 100644
 --- a/backend/repository/src/lib.rs
 +++ b/backend/repository/src/lib.rs
-@@ -1,5 +1,6 @@
+@@ -1,6 +1,7 @@
+ mod error_macros;
  mod storage;
  mod target_id_mapping;
 +mod adult_epg_ids;
  // A B+Tree-backed IPv4 lookup and a CLI dumper for the repository's databases.
  // Both read repository storage directly, so they belong here rather than in
  // `utils`, which must not depend on this layer.
-@@ -37,6 +38,7 @@ mod xtream_playlist_iterator;
+@@ -38,6 +39,7 @@ mod xtream_playlist_iterator;
  mod xtream_repository;
  
  pub use alias_repository::*;
@@ -4060,33 +4069,20 @@ index 8bacf477..09b26b3d 100644
 +        assert!(iterator.next().await.is_none());
 +    }
 +}
-diff --git a/backend/session/src/active_user_manager.rs b/backend/session/src/active_user_manager.rs
-index 4c9675a5..aca01e29 100644
---- a/backend/session/src/active_user_manager.rs
-+++ b/backend/session/src/active_user_manager.rs
-@@ -4591,6 +4591,7 @@ mod tests {
-             status: None,
-             output_clusters: shared::model::ClusterFlags::all(),
-             ui_enabled: true,
-+            hide_adult: false,
-             comment: None,
-             priority: 0,
-             soft_connections,
-diff --git a/frontend/Cargo.toml b/frontend/Cargo.toml
-index b9cd2a71..fce9a8e3 100644
---- a/frontend/Cargo.toml
-+++ b/frontend/Cargo.toml
-@@ -8,7 +8,7 @@ rust-version.workspace = true
- workspace = true
- 
- [dependencies]
--shared = { version = "3.3.96", path = "../shared" }
-+shared = { version = "3.3.95", path = "../shared" }
- chrono.workspace = true
- yew = "0.23.0"
- yew-router = "0.20.0"
+diff --git a/backend/session/src/active_user_manager/tests.rs b/backend/session/src/active_user_manager/tests.rs
+index 7593b719..69fdaaa0 100644
+--- a/backend/session/src/active_user_manager/tests.rs
++++ b/backend/session/src/active_user_manager/tests.rs
+@@ -1190,6 +1190,7 @@ fn test_user_credentials(username: &str, max_connections: u32, soft_connections:
+         status: None,
+         output_clusters: shared::model::ClusterFlags::all(),
+         ui_enabled: true,
++        hide_adult: false,
+         comment: None,
+         priority: 0,
+         soft_connections,
 diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
-index 6d42def5..36a02fc0 100644
+index cf488ab5..203b2489 100644
 --- a/frontend/public/assets/i18n/ar.json
 +++ b/frontend/public/assets/i18n/ar.json
 @@ -674,6 +674,7 @@
@@ -4097,7 +4093,7 @@ index 6d42def5..36a02fc0 100644
        "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
      },
      "USER_PLAN": {
-@@ -1587,6 +1588,7 @@
+@@ -1637,6 +1638,7 @@
      "USER_STATUS_TRIAL": "تجريبي",
      "USER_UI": "واجهة المستخدم",
      "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
@@ -4106,7 +4102,7 @@ index 6d42def5..36a02fc0 100644
      "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
      "USE_OUTPUT": "استخدام المخرج",
 diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
-index 506f0f34..b5ec37d5 100644
+index ef57c3db..1eaa8f4f 100644
 --- a/frontend/public/assets/i18n/en.json
 +++ b/frontend/public/assets/i18n/en.json
 @@ -678,6 +678,7 @@
@@ -4117,7 +4113,7 @@ index 506f0f34..b5ec37d5 100644
        "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
      },
      "USER_PLAN": {
-@@ -1674,6 +1675,7 @@
+@@ -1724,6 +1725,7 @@
      "USER_STATUS_TRIAL": "Trial",
      "USER_UI": "User UI",
      "USER_UI_ENABLED": "User-UI Enabled",
@@ -4126,7 +4122,7 @@ index 506f0f34..b5ec37d5 100644
      "USE_MEMORY_CACHE": "Mem-Cache",
      "USE_OUTPUT": "Use output",
 diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
-index 9c5599dd..8105e772 100644
+index 9bbe1f7c..30adf0ac 100644
 --- a/frontend/public/assets/i18n/ru.json
 +++ b/frontend/public/assets/i18n/ru.json
 @@ -637,6 +637,7 @@
@@ -4137,7 +4133,7 @@ index 9c5599dd..8105e772 100644
        "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
      },
      "USER_PLAN": {
-@@ -1484,6 +1485,7 @@
+@@ -1534,6 +1535,7 @@
      "USER_STATUS_TRIAL": "Пробный",
      "USER_UI": "Пользовательский UI",
      "USER_UI_ENABLED": "User-UI включен",
@@ -4146,26 +4142,26 @@ index 9c5599dd..8105e772 100644
      "USE_MEMORY_CACHE": "Mem-кэш",
      "USE_OUTPUT": "Использовать вывод",
 diff --git a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-index 357e112a..afd86532 100644
+index 434b5c10..014c1efc 100644
 --- a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
 +++ b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-@@ -122,6 +122,7 @@ generate_form_reducer!(
-         SoftPriority => soft_priority: i8,
+@@ -159,6 +159,7 @@ generate_form_reducer!(
+         OutputClusters => output_clusters: Option<ClusterFlags>,
          ExpDate => exp_date: Option<i64>,
          UiEnabled => ui_enabled: bool,
 +        HideAdult => hide_adult: bool,
          EpgTimeshift => epg_timeshift: Option<String>,
          EpgRequestTimeshift => epg_request_timeshift: Option<String>,
          Comment => comment: Option<String>,
-@@ -234,6 +235,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
-                 user.status = Some(ProxyUserStatus::Active);
-                 user.output_clusters = None;
-                 user.ui_enabled = true;
-+                user.hide_adult = false;
-                 let now = Utc::now();
-                 user.created_at = Some(now.timestamp());
-                 let in_one_year = now + Duration::days(DEFAULT_EXPIRATION_DAYS);
-@@ -523,6 +525,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
+@@ -302,6 +303,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
+                         user.status = Some(ProxyUserStatus::Active);
+                         user.output_clusters = None;
+                         user.ui_enabled = true;
++                        user.hide_adult = false;
+                         let now = Utc::now();
+                         user.created_at = Some(now.timestamp());
+                         let in_one_year = now + Duration::days(DEFAULT_EXPIRATION_DAYS);
+@@ -720,6 +722,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
              { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_TIMESHIFT"), epg_timeshift, UserFormAction::EpgTimeshift) }
              { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_REQUEST_TIMESHIFT"), epg_request_timeshift, UserFormAction::EpgRequestTimeshift) }
              { edit_field_bool!(form_state,  translate.t("LABEL.USER_UI_ENABLED"), ui_enabled, UserFormAction::UiEnabled) }
@@ -4237,10 +4233,10 @@ index 93ba95c1..4a49b94e 100644
 +    }
  }
 diff --git a/Cargo.lock b/Cargo.lock
-index 232b70c2..1fc269d5 100644
+index 144a310f..93975059 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -4781,6 +4781,7 @@ dependencies = [
+@@ -4787,6 +4787,7 @@ dependencies = [
   "bytes",
   "chrono",
   "crc32fast",
