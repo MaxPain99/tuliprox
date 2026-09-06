@@ -665,7 +665,9 @@ pub(super) async fn try_reserve_hls_entry_origin_account_for_redirect(
         app_state.connection_manager.release_provider_handle(Some(provider_handle)).await;
         return None;
     };
-    let Some(stream_url) = get_stream_alternative_url(request_url, input, &provider_config) else {
+    let Some((_provider_name, stream_url)) =
+        select_provider_stream_url(request_url, input, &provider_config, false, &app_state.app_config).await
+    else {
         app_state.connection_manager.release_provider_handle(Some(provider_handle)).await;
         return None;
     };
@@ -1460,6 +1462,27 @@ pub(super) async fn prepare_hls_canonical_manifest_origin_runtime(
     }
 }
 
+pub(super) async fn apply_hls_user_agent_stream_index(
+    session: &HlsSessionHandle,
+    headers: &mut HeaderMap,
+    enabled: bool,
+    active_users: &crate::api::model::ActiveUserManager,
+) {
+    if !enabled {
+        return;
+    }
+    let stream_index = {
+        let mut session = session.write().await;
+        if session.user_agent_stream_index.is_none() {
+            session.user_agent_stream_index = Some(active_users.next_user_agent_stream_index());
+        }
+        session.user_agent_stream_index
+    };
+    if let Some(stream_index) = stream_index {
+        request::append_user_agent_stream_index(headers, stream_index);
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) async fn try_hls_cache_canonical_manifest_response(
     app_state: &Arc<AppState>,
@@ -1469,7 +1492,7 @@ pub(super) async fn try_hls_cache_canonical_manifest_response(
     access_lease_id: &HlsAccessLeaseId,
     access_lease_state: HlsAccessLeaseState,
     origin: HlsCacheManifestOrigin<'_>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     server_path: Option<&str>,
     _original_hls_entry_path: &str,
     refresh_ordering: HlsManifestRefreshOrdering,
@@ -1557,6 +1580,13 @@ pub(super) async fn try_hls_cache_canonical_manifest_response(
         Ok(prepared) => prepared,
         Err(response) => return Some(*response),
     };
+    apply_hls_user_agent_stream_index(
+        &session,
+        &mut headers,
+        origin.input.has_flag(ConfigInputFlags::UserAgentStreamIndex),
+        &app_state.active_users,
+    )
+    .await;
     let url_failover_provider = effective_hls_url_failover_provider_for_fetch_url(
         &prepared_origin.fetch_url,
         prepared_origin.url_failover_provider.clone(),

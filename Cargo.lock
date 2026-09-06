@@ -118,7 +118,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -129,7 +129,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -152,12 +152,6 @@ name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
-
-[[package]]
-name = "arrayref"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
 
 [[package]]
 name = "arrayvec"
@@ -389,11 +383,10 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "blake2b_simd"
-version = "1.0.4"
+version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b79834656f71332577234b50bfc009996f7449e0c056884e6a02492ded0ca2f3"
+checksum = "3560a7b1951efe814fcd721938313adc56753ca39f4b23847d7e9a2402f5dbff"
 dependencies = [
- "arrayref",
  "arrayvec",
  "constant_time_eq",
 ]
@@ -1135,7 +1128,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1229,10 +1222,9 @@ checksum = "431a4c31778fde52b4400de34975f219eeca55cc829a9de157cd743a5b230ecb"
 
 [[package]]
 name = "frontend"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "base64 0.23.1",
- "brotli",
  "bytes",
  "chrono",
  "cron",
@@ -2518,7 +2510,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3393,7 +3385,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3451,7 +3443,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3720,7 +3712,7 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "base64 0.23.1",
  "bitflags 2.13.1",
@@ -3740,7 +3732,6 @@ dependencies = [
  "log",
  "lz4_flex",
  "paste",
- "path-clean",
  "pest",
  "pest_derive",
  "regex",
@@ -3820,7 +3811,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3965,7 +3956,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4323,7 +4314,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tuliprox"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "aes",
  "arc-swap",
@@ -4346,26 +4337,20 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iana-time-zone",
- "indexmap",
  "jsonwebtoken",
  "libc",
  "log",
  "lol_html",
- "lru",
  "mime",
  "mime_guess",
  "notify",
- "parking_lot",
  "paste",
- "path-clean",
  "pest",
  "quick-xml",
  "rand 0.9.5",
  "rcgen",
  "regex",
  "reqwest",
- "rmp-serde",
- "rphonetic",
  "rustls",
  "serde",
  "serde-saphyr",
@@ -4375,7 +4360,6 @@ dependencies = [
  "shared",
  "smallvec",
  "socket2",
- "strsim",
  "strum",
  "sysinfo",
  "tempfile",
@@ -4399,20 +4383,17 @@ dependencies = [
  "tuliprox-messaging",
  "tuliprox-metadata",
  "tuliprox-mpegts",
- "tuliprox-parser",
  "tuliprox-processing",
  "tuliprox-repository",
  "tuliprox-session",
  "url",
- "uuid",
  "vergen",
  "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]
 name = "tuliprox-auth"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "arc-swap",
  "axum",
@@ -4435,7 +4416,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-btree"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "crc32fast",
  "log",
@@ -4453,7 +4434,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-config-loader"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -4473,7 +4454,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-core"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "aes",
  "arc-swap",
@@ -4486,12 +4467,12 @@ dependencies = [
  "chrono-tz",
  "ctr",
  "env_logger",
+ "fastrand",
  "flate2",
  "futures",
  "http-body-util",
  "indexmap",
  "ipnet",
- "jsonwebtoken",
  "libc",
  "log",
  "mime",
@@ -4518,18 +4499,17 @@ dependencies = [
  "tuliprox-media-server",
  "tuliprox-mpegts",
  "url",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
 [[package]]
 name = "tuliprox-dvr"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "arc-swap",
- "bytes",
  "chrono",
  "chrono-tz",
- "futures",
  "libc",
  "log",
  "reqwest",
@@ -4550,7 +4530,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-hls"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "arc-swap",
  "async-compression",
@@ -4560,7 +4540,6 @@ dependencies = [
  "brotli",
  "bytes",
  "chrono",
- "dashmap",
  "fastrand",
  "filetime",
  "flate2",
@@ -4577,7 +4556,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tuliprox-core",
  "tuliprox-mpegts",
@@ -4589,7 +4567,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-iptv"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4614,7 +4592,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-library"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "blake3",
  "bytes",
@@ -4641,7 +4619,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-media-server"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "bytes",
  "futures",
@@ -4654,14 +4632,13 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
- "thiserror 2.0.20",
  "tokio",
  "url",
 ]
 
 [[package]]
 name = "tuliprox-messaging"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -4683,7 +4660,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-metadata"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -4694,7 +4671,6 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "serde",
- "serde_json",
  "shared",
  "tempfile",
  "tokio",
@@ -4707,7 +4683,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-mpegts"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "aes",
  "bytes",
@@ -4721,13 +4697,10 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-parser"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
- "aes",
- "base64 0.23.1",
  "chrono",
  "chrono-tz",
- "ctr",
  "indexmap",
  "log",
  "rand 0.9.5",
@@ -4744,7 +4717,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-processing"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -4780,10 +4753,11 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-repository"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
+ "blake3",
  "bytes",
  "chrono",
  "crc32fast",
@@ -4798,6 +4772,7 @@ dependencies = [
  "paste",
  "rmp-serde",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "shared",
  "tempfile",
@@ -4815,7 +4790,7 @@ dependencies = [
 
 [[package]]
 name = "tuliprox-session"
-version = "3.3.102"
+version = "3.3.108"
 dependencies = [
  "arc-swap",
  "axum",
@@ -4829,7 +4804,6 @@ dependencies = [
  "lru",
  "rand 0.9.5",
  "reqwest",
- "serde",
  "shared",
  "tempfile",
  "thiserror 2.0.20",
@@ -5182,7 +5156,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

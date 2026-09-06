@@ -367,6 +367,7 @@
       "XTREAM_LIVE_STREAM_USE_PREFIX": "If true, adds /live/ prefix to Xtream stream links (default true).",
       "XTREAM_LIVE_STREAM_WITHOUT_EXTENSION": "If true, removes .ts extension from Xtream stream links (default false).",
       "DISABLE_HLS_STREAMING": "Replaces live Xtream .m3u8 requests with .ts. Enable only when the provider supports MPEG-TS endpoints; this does not transcode HLS.",
+      "USER_AGENT_STREAM_INDEX": "Appends a process-local numeric index to the configured User-Agent. The index stays stable for one playback session across manifests, segments, seeks, reconnects, and provider failover.",
       "XTREAM_SKIP_LIVE": "If true, the live section of the Xtream provider is skipped during update.",
       "XTREAM_SKIP_SERIES": "If true, the series section of the Xtream provider is skipped during update.",
       "XTREAM_SKIP_VOD": "If true, the VOD section of the Xtream provider is skipped during update."
@@ -772,6 +773,7 @@
       "USERNAME": "The user whose credentials will be embedded in the .strm URLs."
     },
     "TARGET_FORM": {
+      "BOUQUETS": "Opens this target's bouquet editor. A whitelist keeps only selected groups; a blacklist excludes selected groups. Changes take effect with the next playlist update.",
       "PERSIST_FILTER": "Optional final filter applied after EPG processing and all mappings, immediately before persistence.",
       "FILTER": "Global filter expression applied to the target before creating explicit outputs.",
       "FORCE_REDIRECT": "Forces streams directly to the proxy or the provider instead of resolving individually.",
@@ -954,6 +956,7 @@
     "API_CONFIG": "API",
     "API_CONFIGURATION": "API Configuration",
     "API_KEY": "API-Key",
+    "TRAKT_CLIENT_ID": "Trakt Client ID",
     "API_PROXY": "Api-Proxy",
     "API_PROXY_CONFIG": "Api Proxy Config",
     "API_URL": "API-URL",
@@ -965,10 +968,12 @@
     "BACKOFF_MILLIS": "Backoff (ms)",
     "BACKOFF_MULTIPLIER": "Backoff multiplier",
     "BANDWIDTH": "Bandwidth",
+    "BACK": "Back",
     "BACKUP_DIR": "Backup dir",
     "BEST_MATCH_THRESHOLD": "Best Match Threshold",
     "BODY_TEMPLATE": "Body Template",
     "BOT_TOKEN": "Bot Token",
+    "BOUQUETS": "Bouquets",
     "BUFFER_ENABLED": "Buffer Enabled",
     "BUFFER_SIZE": "Buffer Size",
     "BUILD_TIME": "Build time",
@@ -1147,6 +1152,9 @@
     "INCLUDE_TYPE_IN_URL": "Include type in url",
     "INFINITE": "Infinite",
     "INPUTS": "Inputs",
+    "SELECTION_MODE": "Selection mode",
+    "WHITELIST_INCLUDE_SELECTED": "Whitelist (include selected)",
+    "BLACKLIST_EXCLUDE_SELECTED": "Blacklist (exclude selected)",
     "INTERVAL_SECS": "Interval secs",
     "INPUT_TYPE": "Input Type",
     "IP_CHECK": "IP Check",
@@ -1171,6 +1179,7 @@
     "LIVE_STREAM_USE_PREFIX": "Use prefix",
     "LIVE_STREAM_WITHOUT_EXTENSION": "Without ext.",
     "DISABLE_HLS_STREAMING": "Force MPEG-TS",
+    "USER_AGENT_STREAM_INDEX": "Append stream index to User-Agent",
     "LOG": "Log",
     "LOGS": "Logs",
     "LIVE_LOGS": "Live Logs",
@@ -1521,6 +1530,7 @@
     "RESOURCE_REWRITE_DISABLE": "Resource Rewrite disable",
     "RESOURCE_REWRITE_DISABLED": "Resource Rewrite Disabled",
     "RESERVE_SLOTS_FOR_USERS": "Reserve slots for users",
+    "RESET": "Reset",
     "REST": "Rest",
     "RETRY": "Retry",
     "REVERSE": "Reverse",
@@ -1592,6 +1602,7 @@
     "SOURCE": "Source",
     "SOURCES": "Sources",
     "SOURCE_EDITOR": "Sources",
+    "TARGET_BOUQUETS": "Target Bouquets",
     "SOURCE_PICKER": "Source Picker",
     "SPECIFIC_TEMPLATES": "Specific Templates",
     "SSDP_DISCOVERY": "SSDP Discovery",
@@ -1986,6 +1997,21 @@
       "SUCCESS_FINISH": "Successfully updated playlist!",
       "URL_MANDATORY": "Url is mandatory!",
       "USERNAME_PASSWORD_MANDATORY": "Username and Password are mandatory!"
+    },
+    "RESET": {
+      "BOUQUET": {
+        "SUCCESS": "Bouquet reset successfully"
+      }
+    },
+    "TARGET_BOUQUET": {
+      "CHANGES_APPLY_ON_UPDATE": "Changes are applied by the next playlist update.",
+      "NO_FILTER": "No bouquet filter",
+      "NO_TARGETS": "No targets configured.",
+      "SAVE_TARGET_FIRST": "Save the target before configuring bouquets",
+      "STATUS_BLACKLIST": "Blacklist · {count} groups",
+      "STATUS_UNAVAILABLE": "Bouquet status unavailable",
+      "STATUS_WHITELIST": "Whitelist · {count} groups",
+      "UNAVAILABLE_GROUPS": "Configured groups currently unavailable:"
     },
     "SAVE": {
       "API_PROXY_CONFIG": {

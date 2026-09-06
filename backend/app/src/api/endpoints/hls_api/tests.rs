@@ -3,8 +3,8 @@ use super::{
         hls_manifest_terminal_preflight, hls_terminal_endpoint_action, hls_terminal_failed_closed_response,
         HlsManifestTerminalPreflight, HlsTerminalEndpointAction,
     },
-    build_hls_manifest_request_headers, extract_hls_provider_session_headers, hls_api_register,
-    hls_availability_reevaluation_registration_failure_response, hls_canonical_owner_registration,
+    apply_hls_user_agent_stream_index, build_hls_manifest_request_headers, extract_hls_provider_session_headers,
+    hls_api_register, hls_availability_reevaluation_registration_failure_response, hls_canonical_owner_registration,
     hls_temporary_resource_unavailable_response, m3u_archive_epg_reference_ts,
     m3u_catchup_epg_reference_from_session_token, resolve_leaked_hls_relative_origin, HlsCanonicalOwnerRegistration,
     HlsCanonicalOwnerRegistrationFailure, HlsCanonicalOwnerRegistrationKind, MAX_HLS_MANIFEST_BYTES,
@@ -157,6 +157,17 @@ fn append_catchup_session_hint_keeps_m3u_catchup_token_without_shared_hls_cache(
     assert!(from_archive.contains("|archive|1717200000|0"));
     assert!(super::is_m3u_catchup_session_token(&from_archive));
     assert!(super::is_m3u_catchup_session_token("m3u-catchup|fp|alice|42|timeshift_abs|1717200000|0"));
+}
+
+#[test]
+fn live_hls_entry_tokens_separate_parallel_playbacks_with_the_same_fingerprint() {
+    let fingerprint = test_fingerprint();
+    let first = super::hls_entry_user_session_token(&fingerprint, "alice", 42, None, None);
+    let second = super::hls_entry_user_session_token(&fingerprint, "alice", 42, None, None);
+
+    assert_ne!(first, second);
+    assert!(first.contains("|hls|"));
+    assert!(second.contains("|hls|"));
 }
 
 #[test]
@@ -3138,6 +3149,32 @@ fn hls_manifest_headers_apply_disabled_headers_and_default_user_agent_policy() {
     assert!(!headers.contains_key("x-origin-secret"));
     assert!(!headers.contains_key("x-blocked"));
     assert!(!headers.contains_key("cf-ray"));
+}
+
+#[tokio::test]
+async fn hls_user_agent_stream_index_is_stable_for_the_session() {
+    let app_state = test_app_state();
+    let session = Arc::new(tokio::sync::RwLock::new(HlsSession::new(HlsSessionKey::new(1, "stream-1"), b"secret", 0)));
+    let mut manifest_headers = HeaderMap::new();
+    manifest_headers.insert(header::USER_AGENT, HeaderValue::from_static("VLC/3.0"));
+
+    apply_hls_user_agent_stream_index(&session, &mut manifest_headers, true, &app_state.active_users).await;
+    let stream_index = session.read().await.user_agent_stream_index.unwrap_or_default();
+    assert_ne!(stream_index, 0);
+    assert_eq!(
+        manifest_headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok()),
+        Some(format!("VLC/3.0 {stream_index}").as_str())
+    );
+
+    let mut segment_headers = HeaderMap::new();
+    segment_headers.insert(header::USER_AGENT, HeaderValue::from_static("VLC/3.0"));
+    apply_hls_user_agent_stream_index(&session, &mut segment_headers, true, &app_state.active_users).await;
+
+    assert_eq!(
+        segment_headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok()),
+        Some(format!("VLC/3.0 {stream_index}").as_str())
+    );
+    assert_eq!(session.read().await.user_agent_stream_index, Some(stream_index));
 }
 
 #[tokio::test]
@@ -7989,6 +8026,106 @@ async fn hls_entry_origin_reservation_sets_owner_reservation_before_redirect() {
 }
 
 #[tokio::test]
+async fn hls_entry_origin_reservation_uses_persisted_alias_manifest_url() {
+    use shared::model::PlaylistGroup;
+    use tuliprox_repository::{get_input_m3u_playlist_file_path, get_input_storage_path, persist_input_m3u_playlist};
+
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let input = ConfigInput {
+        id: 1,
+        name: Arc::from("primary-account"),
+        input_type: InputType::M3u,
+        url: "http://playlist.example/list.m3u?access_key=primary-playlist-key".to_string(),
+        enabled: true,
+        max_connections: 1,
+        aliases: Some(vec![crate::model::ConfigInputAlias {
+            id: 2,
+            name: Arc::from("alias-account"),
+            url: "http://playlist.example/list.m3u?access_key=alias-playlist-key".to_string(),
+            username: None,
+            password: None,
+            max_connections: 0,
+            priority: 0,
+            exp_date: None,
+            enabled: true,
+            stalker: None,
+        }]),
+        ..ConfigInput::default()
+    };
+    let app_state = test_app_state_with_inputs(vec![Arc::new(input.clone())]);
+    let mut config = (*app_state.app_config.config.load_full()).clone();
+    config.storage_dir = temp.path().to_string_lossy().into_owned();
+    app_state.app_config.config.store(Arc::new(config));
+
+    let alias_name = "alias-account".intern();
+    let storage_path = get_input_storage_path(&alias_name, &app_state.app_config.config.load().storage_dir)
+        .await
+        .expect("alias storage should be created");
+    let playlist_path = get_input_m3u_playlist_file_path(&storage_path, &alias_name);
+    let alias_playlist = vec![PlaylistGroup {
+        id: 1,
+        title: "Live".intern(),
+        channels: vec![PlaylistItem {
+            header: PlaylistItemHeader {
+                id: "news24hd".intern(),
+                input_stream_id: "news24hd".intern(),
+                url: "http://stream.example:4000/news24hd/mono.m3u8?token=alias-stream-token".intern(),
+                item_type: PlaylistItemType::Live,
+                xtream_cluster: XtreamCluster::Live,
+                ..PlaylistItemHeader::default()
+            },
+        }],
+        xtream_cluster: XtreamCluster::Live,
+    }];
+    persist_input_m3u_playlist(&app_state.app_config, &playlist_path, &alias_playlist)
+        .await
+        .expect("alias playlist should persist");
+
+    let primary_handle = app_state
+        .active_provider
+        .acquire_exact_connection_with_grace_for_session(
+            &input.name,
+            &test_fingerprint().addr,
+            false,
+            0,
+            ConnectionKind::Normal,
+            Some("primary-session"),
+        )
+        .await
+        .expect("primary account should be allocated");
+
+    let reservation = super::try_reserve_hls_entry_origin_account_for_redirect(
+        &app_state,
+        &test_fingerprint(),
+        &{
+            let mut creds = ProxyUserCredentials::default();
+            creds.username = "hls-user".to_string();
+            creds
+        },
+        &input,
+        12345,
+        "http://stream.example:4000/news24hd/mono.m3u8?token=primary-stream-token",
+        "alias-session-token",
+        "alias-session-owner",
+        super::hls_origin_account_reservation_ttl_secs_fallback(),
+        UserConnectionPermission::Allowed,
+        ConnectionKind::Normal,
+        false,
+    )
+    .await
+    .expect("alias provider reservation should succeed");
+
+    assert_eq!(
+        reservation.selected_provider_config.as_ref().map(|provider| provider.name.as_ref()),
+        Some("alias-account")
+    );
+    assert_eq!(reservation.request_url, "http://stream.example:4000/news24hd/mono.m3u8?token=alias-stream-token");
+
+    app_state.connection_manager.release_provider_handle(reservation.provider_handle).await;
+    app_state.connection_manager.release_provider_handle(Some(primary_handle)).await;
+}
+
+#[tokio::test]
 async fn hls_virtual_entry_reservation_uses_input_stream_id_for_shared_session_owner() {
     let input = single_hls_provider_input("origin-id-reservation-input");
     let app_state = test_app_state_with_inputs(vec![Arc::new(input.clone())]);
@@ -10668,6 +10805,7 @@ fn stats_provider_test_user_session(provider: &str) -> UserSession {
         provider: Arc::from(provider),
         stream_url: Arc::from("http://origin.example.com/live/12345.m3u8"),
         provider_session_headers: HashMap::new(),
+        user_agent_stream_index: None,
         addr: test_addr(),
         socket_bound: false,
         active_addrs: Vec::new(),

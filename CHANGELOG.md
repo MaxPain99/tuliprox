@@ -106,6 +106,12 @@
 
 ## 🌟 New Features
 
+- **Target-specific bouquet filters are now managed directly from the Source Editor.** Each target shows its current
+  bouquet status below the regular filter settings and opens a full-size editor for selecting Live, VOD, and Series
+  groups. Bouquet filters support both whitelist and blacklist mode, are stored by the target's unique name, and take
+  effect on the next playlist update. Leaving every cluster unselected means no bouquet restriction; an individual
+  cluster may intentionally have no selected groups while another cluster remains configured.
+
 - **Target filters can run during processing or immediately before persistence.** The existing scalar `filter` syntax
   remains the `processing` stage. The staged map accepts optional `processing` and `persist` filters; `persist` sees
   the fully finalized state after EPG processing, mappings, merge, deduplication, sorting, numbering, and counters.
@@ -927,6 +933,18 @@
   the `shared` crate, so `/ready` and the banner can no longer drift apart in how they group inputs and aliases.
 
 ## 🐛 Fixes
+
+- **Trakt curation now requires an explicitly configured Client ID.** Tuliprox no longer bundles or falls back to a
+  shared Client ID. Blank or header-invalid `trakt.api.api_key` values now produce one target-scoped warning and skip
+  only optional Trakt curation without making an HTTP request; other target processing continues. Trakt `401`, `403`,
+  `404`, and `429` responses now have actionable, resource-aware messages, while independently successful lists and
+  charts remain available.
+
+- **Empty playlist updates no longer replace previously published input or target data.** A completely empty refresh is
+  treated as a failed update and keeps the last usable playlist and its virtual-ID mapping intact. This prevents
+  transient provider/download failures from making channels disappear or assigning different IDs when service
+  recovers. An intentionally empty target must therefore be disabled or filtered operationally instead of being
+  published as an empty refresh.
 
 - **M3U alias failover now uses the allocated provider's opaque query credentials.** When capacity allocation moved a
   stream from the primary input to an alias, a playlist URL carrying credentials such as `token` or `api_key` could
@@ -1960,7 +1978,7 @@ and assigns it to the variable `station_prefix`.
             resolve_vod: false
             trakt:
               api:
-                key: <my private trakt api key>
+                key: <my Trakt Client ID>
                 version: 2
               lists:
                 - user: "linaspurinis"
