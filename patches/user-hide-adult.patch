@@ -1264,3 +1264,15 @@ index 93ba95c1..4a49b94e 100644
 +        assert!(!user.hide_adult);
 +    }
  }
+diff --git a/Cargo.lock b/Cargo.lock
+index 525f7368..48db4cf5 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4761,6 +4761,7 @@ dependencies = [
+  "bytes",
+  "chrono",
+  "crc32fast",
++ "dashmap",
+  "env_logger",
+  "filetime",
+  "futures",
